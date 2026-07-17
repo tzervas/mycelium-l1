@@ -1,0 +1,54 @@
+//! In-crate white-box test modules (test layout rule: no tests in logic files; one submodule per
+//! source module under test). Extracted as-touched from the logic files (M-797); these modules use
+//! `use crate::<mod>::*` for white-box access to the logic module's `pub(crate)` items.
+
+mod affine;
+mod affine_stage3;
+mod ambient;
+mod ast;
+mod checkty;
+mod compiler_stage5_classify;
+mod compiler_stage5_elab;
+mod compiler_stage5_evalmatch;
+mod compiler_stage5_freevars;
+mod compiler_stage5_mangle;
+mod compiler_stage5_normpat;
+mod compiler_stage5_register;
+mod compiler_stage5_semcore;
+mod compiler_stage5_typealg;
+mod compiler_stage5_tyref;
+mod compiler_stage5_unify;
+mod cross_phylum;
+mod decision;
+mod defsite_resolution_stage2;
+mod elab;
+mod error;
+mod eval;
+mod facility_stage1_hygiene;
+mod fault;
+mod fuse;
+mod hygiene_affine_expanded;
+mod hygiene_defsite_resolution;
+mod hygiene_expr_sugar;
+mod init;
+mod lexer;
+mod lib_root;
+mod marshal_support;
+mod mono;
+mod mono_tag;
+mod nodule;
+mod ord3;
+mod parse;
+mod prelude_instance_seed;
+mod preseed;
+mod reachability_stage1b;
+mod reveal;
+mod reveal_roundtrip_e3;
+mod show;
+mod substrate;
+mod totality;
+mod type_strictness;
+mod usefulness;
+mod vec_prelude_seed;
+mod via_ordering;
+mod wrapping;
