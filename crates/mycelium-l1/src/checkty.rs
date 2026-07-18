@@ -223,7 +223,9 @@ impl From<AmbientError> for CheckError {
             | AmbientError::ParadigmShapeMismatch { site, .. }
             | AmbientError::BareDecimalNoEncoding { site, .. }
             | AmbientError::DepthExceeded { site, .. } => site.clone(),
-            AmbientError::MultipleDefaults { .. } => "<nodule>".to_owned(),
+            AmbientError::MultipleDefaults { .. } | AmbientError::MultiplePolicyDefaults { .. } => {
+                "<nodule>".to_owned()
+            }
         };
         CheckError {
             site,
@@ -1257,7 +1259,7 @@ fn collect_tuple_arities_item(
                 collect_tuple_arities_expr(&m.body, out);
             }
         }
-        Item::Use(_) | Item::Default(_) | Item::Derive(_) => {}
+        Item::Use(_) | Item::Default(_) | Item::DefaultPolicy(_) | Item::Derive(_) => {}
     }
 }
 
@@ -1336,6 +1338,7 @@ fn item_mentions_named_type(item: &Item, target: &str) -> bool {
         }
         Item::Use(_)
         | Item::Default(_)
+        | Item::DefaultPolicy(_)
         | Item::Object(_)
         | Item::Lower(_)
         | Item::Derive(_)
@@ -3703,6 +3706,17 @@ fn check_nodule_with(
         seed.seed_instance_for_nodule(&mut instances, effective_nodule);
     }
 
+    // DN-142 §3.2: this nodule's `default policy <name>;` declaration, if any. Uniqueness (at most
+    // one per nodule) is already enforced by `crate::ambient::resolve`'s `MultiplePolicyDefaults`
+    // refusal (Pass 1, above `check_phylum_inner`'s caller), so a plain `find_map` is sufficient here
+    // — threaded into Pass 3 so `check_swap` can resolve a `policy: ambient` swap spelling once the
+    // swap's `(src, target)` pair is known (the checker is the earliest point that pair is available).
+    let nodule_ambient_policy: Option<&crate::ast::Path> =
+        effective_nodule.items.iter().find_map(|item| match item {
+            Item::DefaultPolicy(p) => Some(p),
+            _ => None,
+        });
+
     // Pass 3: type every (own) body **against** its declared return type (bidirectional, RFC-0012
     // §4.3), with imports available, and resolve any ambient bare-decimal widths from context —
     // rewriting each body so the downstream evaluator/elaborator see only concrete literals. Only this
@@ -3722,6 +3736,7 @@ fn check_nodule_with(
             imports,
             &lower_rules,
             nodule.std_sys,
+            nodule_ambient_policy,
             fd,
             strictness,
         )?;
@@ -3762,6 +3777,7 @@ fn check_nodule_with(
                 imports,
                 &lower_rules,
                 effective_nodule.std_sys,
+                nodule_ambient_policy,
                 id,
                 strictness,
             )?;
@@ -4087,6 +4103,12 @@ fn infer_expr_rule_rhs_type(
         tyvars: &ld.params,
         bounds: &[],
         std_sys: false,
+        // A `lower` rule's RHS has no nodule-ambient-policy plumbing today (it is checked
+        // standalone, not via `check_fn_body`) — a `swap`'s `policy: ambient` inside a rule RHS is
+        // therefore always `UnresolvedAmbientPolicy` (never a silent guess) until this is threaded
+        // through; a flagged, disclosed v0 scope boundary (DN-142 §3.2 is nodule-level-at-minimum
+        // for ordinary fn bodies — this is the one checked context that does not yet reach it).
+        ambient_policy: None,
         depth: Cell::new(0),
         affine: Tracker::seeded(&scope),
         // DN-126: a `lower` rule's RHS is language-extension machinery (the generative-lowering
@@ -5162,6 +5184,7 @@ fn check_impl_methods(
     imports: &NoduleImports,
     lower_rules: &BTreeMap<String, LowerDecl>,
     std_sys: bool,
+    ambient_policy: Option<&Path>,
     id: &ImplDecl,
     strictness: crate::type_strictness::TypeStrictness,
 ) -> Result<(Vec<FnDecl>, Vec<crate::type_strictness::TypeFlag>), CheckError> {
@@ -5269,6 +5292,7 @@ fn check_impl_methods(
             imports,
             lower_rules,
             std_sys,
+            ambient_policy,
             method,
             strictness,
         )?;
@@ -5308,6 +5332,7 @@ fn check_fn_body(
     imports: &NoduleImports,
     lower_rules: &BTreeMap<String, LowerDecl>,
     std_sys: bool,
+    ambient_policy: Option<&Path>,
     fd: &FnDecl,
     strictness: crate::type_strictness::TypeStrictness,
 ) -> Result<(Expr, Ty, Vec<crate::type_strictness::TypeFlag>), CheckError> {
@@ -5334,6 +5359,7 @@ fn check_fn_body(
         tyvars: &tyvars,
         bounds: &bounds,
         std_sys,
+        ambient_policy,
         depth: Cell::new(0),
         // The one whole-function-body walk — seed the active affine tracker from the parameter
         // scope so a `Substrate`-typed parameter is already tracked as the body starts (M-903;
@@ -5481,6 +5507,15 @@ struct Cx<'a> {
     /// `true`; in a non-`@std-sys` nodule a `wild` is a hard [`CheckError`] (never a silent escape —
     /// G2). Threaded down from the nodule header through [`check_fn_body`] / [`check_impl_methods`].
     std_sys: bool,
+    /// The nodule's **ambient-policy declaration** (DN-142 §3.2; `default policy <name>;`), if any —
+    /// `crate::ambient_policy`'s `Nodule`-scope [`crate::ambient_policy::PolicyDecl`]. Consulted by
+    /// [`Self::check_swap`] to resolve a `policy: ambient` swap spelling once the swap's `(src,
+    /// target)` pair is known (the checker is the earliest point that pair is available — ambient
+    /// resolution proper, `crate::ambient`, runs pre-type-checking and cannot see it). `None` in every
+    /// re-inference/rule-RHS `Cx` context (those run over an already-checked term in which any
+    /// `policy: ambient` was already resolved by the original [`check_fn_body`] pass — see each such
+    /// site's own comment).
+    ambient_policy: Option<&'a crate::ast::Path>,
     /// Live expression-nesting depth for the explicit [`MAX_CHECK_DEPTH`] budget (interior
     /// mutability so [`Self::check`] stays `&self`). Reset per body; accounted by [`DepthGuard`].
     depth: Cell<u32>,
@@ -6403,12 +6438,76 @@ impl Cx<'_> {
                 "swap target must be a representation type, got {tty}"
             ));
         }
+
+        // A1 — the RFC-0002 §5 legal-pair matrix (DN-142 §7): early, never-silent refusal of a pair
+        // RFC-0002 §5 marks illegal, before any policy resolution runs (checker refusal, not a
+        // runtime one — DN-142 §7: "any pair RFC-0002 §5 marks... never silent must refuse at the
+        // checker, not later at runtime"). `repr_kind_of` is total over the two representation types
+        // just gated above (`.expect` documents that invariant, never a blind unwrap of user input).
+        let src_kind = crate::legal_pair::repr_kind_of(&vty)
+            .expect("vty was just gated to Binary/Ternary/Dense above");
+        let target_kind = crate::legal_pair::repr_kind_of(&tty)
+            .expect("tty was just gated to Binary/Ternary/Dense above");
+        if let crate::legal_pair::PairVerdict::Refuse { reason } =
+            crate::legal_pair::classify_swap_pair(src_kind, target_kind)
+        {
+            // W-C X5: the refusal is an INSTANCE of the RFC-0013 first-fault envelope
+            // (`site_kind: legal_pair_refuse`), never a second, parallel diagnostic system (G-9) —
+            // the `Diag`'s rendered text (which carries the same reason string as before) backs the
+            // `CheckError`, so there is one source of truth for the refusal's wording.
+            let diag = crate::legal_pair::legal_pair_refuse_diag(
+                &vty.to_string(),
+                &tty.to_string(),
+                reason,
+                mycelium_diag::EventId::new(format!("{}:legal_pair_refuse", self.site)),
+                mycelium_diag::CertMode::Fast,
+            );
+            return self.err(diag.human());
+        }
+
+        // DN-142 §3.1/§3.2: `policy: ambient` resolves through the nodule's declared ambient policy
+        // (falling through to the `std.swap.policy` catalog default for this pair — the least-
+        // specific/`catalog` origin), never the literal token `ambient` — "resolve-and-record": the
+        // checked (and so the elaborated L0) tree always carries the **resolved** `Path`, byte-
+        // identical to writing the resolved name longhand (RFC-0012 §4.3 I1: no `Swap` is ever
+        // inserted by this — only the policy *name* is filled, mirroring the paradigm ambient's own
+        // "fills tags, never conversions" invariant). Any other spelling (an explicit catalog name)
+        // is untouched.
+        let resolved_policy = if crate::ambient_policy::is_ambient_spelling(policy) {
+            let decls: Vec<crate::ambient_policy::PolicyDecl> = self
+                .ambient_policy
+                .map(|p| crate::ambient_policy::PolicyDecl {
+                    scope: crate::ambient_policy::PolicyScope::Nodule,
+                    policy: p.clone(),
+                })
+                .into_iter()
+                .collect();
+            let catalog_default = crate::legal_pair::catalog_default_policy(src_kind, target_kind);
+            match crate::ambient_policy::resolve_policy(&decls, catalog_default) {
+                Ok(resolved) => resolved.policy,
+                Err(_unresolved) => {
+                    // W-C X5: the refusal is an INSTANCE of the RFC-0013 first-fault envelope
+                    // (`site_kind: policy_resolve`, `decision: refuse`) — same posture as the
+                    // legal-pair refusal above.
+                    let diag = crate::ambient_policy::policy_resolve_refuse_diag(
+                        &vty.to_string(),
+                        &tty.to_string(),
+                        mycelium_diag::EventId::new(format!("{}:policy_resolve", self.site)),
+                        mycelium_diag::CertMode::Fast,
+                    );
+                    return self.err(diag.human());
+                }
+            }
+        } else {
+            policy.clone()
+        };
+
         Ok((
             tty,
             Expr::Swap {
                 value: Box::new(value2),
                 target: target.clone(),
-                policy: policy.clone(),
+                policy: resolved_policy,
             },
         ))
     }
@@ -10323,6 +10422,13 @@ pub(crate) fn infer_type(
         // (it would never spuriously refuse a `wild` that the program already validated) without
         // re-litigating the gate — the gate is the checker's job, done once.
         std_sys: true,
+        // DN-142 §3.2: re-inference runs over an **already-checked** term, so any `swap`'s
+        // `policy: ambient` was already resolved to a concrete catalog name by the original
+        // `check_fn_body`/`check_swap` pass (never a bare `["ambient"]` `Path` survives checking) —
+        // `check_swap`'s ambient-resolution branch is therefore unreachable here regardless of this
+        // value; `None` is honest, not a functional gap (mirrors the `std_sys: true` comment above:
+        // the gate already ran, this is not re-litigating it).
+        ambient_policy: None,
         depth: Cell::new(0),
         // Post-check re-inference over an already-validated term, invoked repeatedly over
         // partial/overlapping fragments with a scope the elaborator threads itself — not the one
@@ -10395,6 +10501,9 @@ fn infer_type_with_active_affine_inner(
         tyvars: &[],
         bounds: &[],
         std_sys: true,
+        // Same rationale as `infer_type`'s own `ambient_policy: None` (DN-142 §3.2): this test-only
+        // harness re-infers over an already-checked term too.
+        ambient_policy: None,
         depth: Cell::new(0),
         affine: Tracker::seeded(scope),
         // DN-126: this test-only harness re-infers over an already-checked term, exactly like

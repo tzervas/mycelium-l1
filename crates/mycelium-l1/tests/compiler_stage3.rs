@@ -611,6 +611,14 @@ mod fp {
             Item::Lower(l) => lowerdecl(tag(fp, 104), l),
             Item::Derive(d) => derivedecl(tag(fp, 105), d),
             Item::InherentImpl(i3) => inherentimpldecl(tag(fp, 106), i3),
+            // DN-142 §3.2 (W-B): `default policy <name>;` — new Rust-side grammar with **no**
+            // self-hosted `parse.myc` counterpart yet (a flagged, disclosed residual — the
+            // self-hosted port is a separate, not-yet-scheduled follow-on; `lib/compiler/parse.myc`
+            // is untouched by this leaf). Tag `111` (the next free slot after the M-1027 ctor-sealed
+            // tag `110`) is exhaustiveness-only: no conformance-corpus fixture constructs this
+            // variant today, so this arm is currently unreachable in the differential, not
+            // lock-step-verified against a `.myc` mirror. Flagged, not silently omitted (G2).
+            Item::DefaultPolicy(p) => path(tag(fp, 111), p),
         }
     }
 

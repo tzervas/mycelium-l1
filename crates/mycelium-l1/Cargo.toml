@@ -14,9 +14,18 @@ workspace = true
 [dependencies]
 # The L1 evaluator produces L0 values and reuses the trusted primitive/swap semantics — the same
 # registries the reference interpreter and the AOT path share (RFC-0007 §4.6).
-mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "781d3fcceba82acfe6b0eb46650513bd78a2416b" }
-mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
-mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
+mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "487b1e7049ff521b1a6fa33f376245089e7dc1e1" }
+mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "487b1e7049ff521b1a6fa33f376245089e7dc1e1" }
+# W-C X5 (RFC-0013 Amendment A1 first-fault envelope): mycelium-l1 already transitively depends on
+# mycelium-diag via mycelium-cert (mode.rs's swap_check emitter, W-A) — this makes that dependency
+# DIRECT so the checker itself can build envelope instances (`policy_resolve`/`legal_pair_refuse`/
+# `regime_type_lie`) at check_swap's own refuse sites, instead of a second, parallel diagnostic
+# system (G-9). Architecturally clean: both crates are `core`-tier (xtask/deps-strata.toml), the
+# edge is strictly downward (mycelium-l1 stratum 4 -> mycelium-diag stratum 1, well under l1's
+# existing stratum), and no new node enters the workspace dependency graph (mycelium-diag was
+# already pulled in transitively).
+mycelium-diag = { git = "https://github.com/tzervas/mycelium-runtime", rev = "487b1e7049ff521b1a6fa33f376245089e7dc1e1" }
 # `forage` activation (M-906, DN-70 D1/DN-63 §3.5): reuses the existing RFC-0005 SelectionPolicy
 # machinery verbatim ("no new mechanism", DN-70) for the D-lite single-node placement decision +
 # its mandatory EXPLAIN. FLAG (M-906 kickoff-note deviation): the task brief's file-ownership list
@@ -27,25 +36,25 @@ mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab
 # established pattern for five other crates (`mycelium-lsp`/`mlir`/`std-runtime`/`vsa`/
 # `std-select`). Reusing the *existing* mechanism (DN-70's explicit mandate) outweighs the default
 # swarm-hygiene caution here; flagged for integrator review rather than silently applied.
-mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
+mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "487b1e7049ff521b1a6fa33f376245089e7dc1e1" }
 # Host-stack management for the recursive checker/elaborator, kept OUTSIDE this trusted kernel so the
 # kernel stays `#![forbid(unsafe_code)]` (ADR-014). The kernel calls only its safe `with_deep_stack`.
-mycelium-stack = { git = "https://github.com/tzervas/mycelium-core", rev = "781d3fcceba82acfe6b0eb46650513bd78a2416b" }
+mycelium-stack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
 # RFC-0041 (Wave-1): the shared never-silent recursion budget the frontend's recursive checker passes
 # charge against (usefulness / decision-tree / grade / list-literal spine), so a pathological input is
 # refused with an explicit `BudgetError` — never a host-stack overflow (§4.7). Leaf crate (DN-68
 # acyclic, downward-only): depends only on `std` + `mycelium-stack`, never upward on `l1`.
-mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "781d3fcceba82acfe6b0eb46650513bd78a2416b" }
+mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
 
 [dev-dependencies]
 # The RFC-0007 §4.6 differential: L1-eval vs elaborate→L0-interp vs elaborate→AOT, validated
 # through the M-210 shared TV checker.
-mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "f144d635e970257aee5b618f8cdfaa736e2c391d" }
-mycelium-numerics = { git = "https://github.com/tzervas/mycelium-value", rev = "fce92daed05e9f10202c202648ec43fb0a6991d7" }
+mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "505448cbfb5553a34aca726f0d1b884981a83631" }
+mycelium-numerics = { git = "https://github.com/tzervas/mycelium-value", rev = "6d230ad2023a716704c697ac6812a2062624b4eb" }
 # M-890 (kickoff `enb`, Gap C): the dense elementwise prim group's conformance/three-way tests
 # build their `Dense` input values through the kernel's own constructor (`DenseSpace::value`) —
 # the only dense value-construction form until a surface literal lands (Gap A). Test scope only.
-mycelium-dense = { git = "https://github.com/tzervas/mycelium-value", rev = "fce92daed05e9f10202c202648ec43fb0a6991d7" }
+mycelium-dense = { git = "https://github.com/tzervas/mycelium-value", rev = "6d230ad2023a716704c697ac6812a2062624b4eb" }
 # NOTE (M-971): the retained Rust std oracles (`mycelium-std-{core,diag,error,recover,select,spore,
 # swap,ternary,testing}`) for the `lib/std/*.myc` port-differentials are NO LONGER dev-deps of this
 # crate. `mycelium-l1` is a `core`-tier crate; those are `std`-tier — a `core -> std` dev edge that
