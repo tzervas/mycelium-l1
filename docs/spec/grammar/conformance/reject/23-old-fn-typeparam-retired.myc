@@ -1,0 +1,6 @@
+// rejected: the old angle-bracket type-parameter form `fn f<T>(…)` is RETIRED (RFC-0037 D1 — type
+// parameters/arguments now use `[…]`, e.g. `fn f[T](…)`). With `<` demoted to the operator-only
+// `LAngle` glyph, a `<` where the parameter list `(` is expected is a never-silent parse refusal,
+// never a silent re-interpretation of the old form (G2).
+nodule bad;
+fn f<T>(x: T) => T = x

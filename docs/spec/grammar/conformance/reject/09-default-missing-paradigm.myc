@@ -1,0 +1,5 @@
+// rejected: `default` must be followed by `paradigm` (RFC-0012 §4.2) — `default Binary` omits the
+// granularity keyword, so it is an explicit parse error, never a silent accept
+nodule bad;
+default Binary
+fn main() => Binary{8} = 0b1011_0010

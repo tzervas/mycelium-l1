@@ -1,0 +1,4 @@
+// exercises: nodule header + use import
+nodule signals.demo;
+
+use core.binary;

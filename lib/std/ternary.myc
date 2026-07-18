@@ -1,0 +1,890 @@
+// nodule: std.ternary
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted balanced-ternary value surface — Trit/Bit digit primitives, the exact
+nodule std.ternary;
+
+//   int <-> trits codec (base conversion over the landed div_u/rem_u prims), fixed-width
+//   balanced-ternary add/sub/mul/neg with explicit Option fallibility, the I2S/TL1/TL2 packed
+//   codecs with inspectable EXPLAIN records, and the RFC-0016 §4.5 guarantee matrix as CHECKED
+//   DATA (M-933, E29-1, RFC-0031 §5 D5; kickoff opp; ports crates/mycelium-std-ternary;
+//   docs/spec/stdlib/ternary.md; docs/spec/swaps/binary-ternary.md §1).
+//
+// ── Surface-check (D5 row 1, Empirical, 2026-07-02) ─────────────────────────────────────────────
+//
+// crates/mycelium-std-ternary's public surface is the 18-op guarantee matrix (guarantee_matrix.rs
+// MATRIX) plus the wire-glyph pair (to_wire_char/from_wire_char) and the Display impls. Checked
+// against today's `.myc` surface (parser/checker in crates/mycelium-l1/src):
+//
+// PORTED (all 18 matrix ops, under renames documented below): trit_new, bit_new, trit_digit,
+// trit_neg, bit_digit, bit_and, bit_or, bit_xor, trits_to_int, int_to_trits (+ max_magnitude),
+// trits_neg, trits_add, trits_sub, trits_mul, pack, unpack, scheme_of, explain. The wire-glyph
+// pair is ported as trit_to_wire_byte/trit_from_wire_byte (ASCII-byte substitution — see
+// FLAG-ternary-1). The base conversion (int_to_trits / TL1-TL2 byte codecs) composes the landed
+// never-silent unsigned `div_u`/`rem_u` prims (M-888; checkty.rs surface names) — the enabler
+// this port was gated on.
+//
+// FLAGGED — NOT expressible today, no enabler landed (never forced, VR-5/G2):
+// - FLAG-ternary-1 (`to_wire_char`/`from_wire_char`): `.myc` has no `char` type or char literal.
+//   Ported instead as `trit_to_wire_byte`/`trit_from_wire_byte` over the glyphs' ASCII bytes
+//   (`-` = 45, `0` = 48, `+` = 43) at Binary{8} — an honest representation substitution, not the
+//   Rust char-typed API. The char-typed form waits on a char/text-literal enabler (route to enb
+//   if wave demand justifies it).
+// - FLAG-ternary-2 (`i64`): `.myc` has no signed-integer surface type, and `sub_u` refuses a
+//   borrow-out (never a two's-complement wrap), so signed arithmetic cannot be built on raw
+//   `Binary{N}`. The integer side of the codec is ported as the sign-magnitude sum `SInt`
+//   (SPos/SNeg over Binary{16}) — same explicit-None out-of-range discipline. The width ceiling
+//   moves accordingly: Rust's `m <= 40` i64 ceiling becomes `m <= 10` here
+//   ((3^10-1)/2 = 29524 <= 65535; 3^11 overflows Binary{16}) — `max_magnitude` returns None past
+//   it, exactly mirroring the Rust `m >= 41 => None` contract shape (spec FLAG Q4 carried over).
+// - FLAG-ternary-3 (`Vec<u8>` packed bytes): no surface prim constructs a kernel `Bytes` from
+//   computed Binary{8} values (`bytes_slice`/`bytes_concat` only reshape existing Bytes; string
+//   literals are static). Packed bytes are ported as `ByteList` (a cons-list of Binary{8}) — the
+//   same byte values the Rust codecs produce, differentially checked byte-for-byte.
+// - FLAG-ternary-4 (`Packed.bytes` privacy): `.myc` has no field-visibility surface, so the Rust
+//   "a Packed can only originate from pack" invariant is not enforceable by construction. `unpack`
+//   therefore widens from total to `Result[Trits, PackError]`: a forged/corrupt `Packed` is an
+//   explicit `Err(OffGrid)` (incl. a defensive trit-count check), never a panic or a silent wrong
+//   value. A fallibility WIDENING stated openly — not a tag upgrade (VR-5); on every
+//   pack-produced value `unpack` still succeeds (the Rust totality, differentially checked).
+// - FLAG-ternary-5 (matrix name-keyed assertions): no `bytes_eq`/substring prim (same gap
+//   std.diag FLAGged), so the Rust tests keyed on op NAMES (uniqueness; "pack ops are the
+//   explainable ones") are not portable. Substituted: a structural count check
+//   (`count_explainable(matrix()) == 4`) plus the portable all-rows invariants below.
+// - Display impls (Trit/Bit/Scheme/PackError/ExplainRecord): presentational; `.myc` has no trait/
+//   Display surface for local sums. Not ported (std.fmt owns rendering); no logic is lost.
+//
+// SUBSTITUTIONS made honestly (never a silent signature change — VR-5/G2):
+// - Constructor renames — one constructor namespace per nodule: `Trit` variants are TNeg/TZero/
+//   TPos and `Bit` variants BZero/BOne (bare `Zero` would collide across the two types); the
+//   guarantee-lattice tag constructors are GExact/GProven/GEmpirical/GDeclared
+//   (`Exact`/`Proven`/`Empirical`/`Declared` are RESERVED words — std.diag precedent).
+// - Fn renames — `add`/`sub`/`mul`/`neg` are the kernel prim surface names (trit.* over
+//   Ternary{M}), so the slice-arithmetic ops are `trits_add`/`trits_sub`/`trits_mul`/`trits_neg`.
+// - `&[Trit]` is ported as the recursive cons-list `Trits` (MSB-first), NOT the native
+//   `Ternary{M}`: the Rust surface is genuinely slice-of-digit (digit-indexable), and the list
+//   form carries the crate's exact Option fallibility (None on fixed-width overflow AND on
+//   unequal widths) — the native-`Ternary{M}` prim wrappers (whose overflow is a runtime refusal,
+//   not an Option, and whose width mismatch is a static type error) already live in std.math.
+// - `Result`/`Option` are redeclared locally (single-nodule harness — same resolution as
+//   std.error/std.text; semantics identical to std.result/std.option).
+// - No `mul_s` anywhere: `bin.mul` reads Binary{N} as SIGNED two's-complement (M-887), so e.g.
+//   a TL1 byte value 243 > i8::MAX would refuse. All by-3 scalings use the unsigned
+//   `add_u(add_u(v, v), v)` tripling instead (std.text's repeated-doubling precedent).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as mycelium-std-ternary, never upgraded):
+// - The balanced-ternary algebra and the I2S/TL1/TL2 codecs are Exact in the Rust crate (exact
+//   integer identity, Knuth 4.1; lossless re-encodings — its C2 justification). The ported ops'
+//   per-op rows carry that same Exact claim AS DATA (the matrix below); the row data itself is
+//   Declared (hand-transcribed), and three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT)
+//   plus the live Rust-oracle differential are Empirical (trials, std_ternary.rs).
+// - Never-silent floor (C1/G2) carried intact: every fallible op returns Option/Result; overflow,
+//   off-domain, off-grid, and misalignment are explicit — never a sentinel, clamp, wrap, or
+//   silent truncation.
+//
+// Open questions carried over from the crate (do not silently resolve): Q1 spelling (DN-02/06),
+// Q2 lossy-scheme exclusion, Q3 caller-names-scheme vs RFC-0005 selector, Q4 width ceiling.
+// ── Local Option / Result (redeclared; single-nodule harness — see the substitution note) ───────
+type Option[A] = Some(A) | None;
+
+type Result[A, E] = Ok(A) | Err(E);
+
+// ── SInt — sign-magnitude signed integer over Binary{16} (FLAG-ternary-2) ───────────────────────
+// SPos(m) denotes +m; SNeg(m) denotes -m with m >= 1 (canonical: zero is SPos(0), never SNeg(0) —
+// every constructor below produces canonical values). Substitutes Rust's i64.
+type SInt = SPos(Binary{16}) | SNeg(Binary{16});
+
+// ── Trit — a balanced trit in {-1, 0, +1} (FR-M2; M-111) ────────────────────────────────────────
+type Trit = TNeg | TZero | TPos;
+
+// trit_new: construct a Trit from a signed integer. Guarantee: Exact. Returns None if
+// d is outside {-1, 0, +1} — an explicit off-domain error, never a silent clamp (C1/G2).
+// (SNeg(0) — non-canonical negative zero — reads as 0, mirroring Rust new(-0) == new(0).)
+fn trit_new(d: SInt) => Option[Trit] =
+  match d {
+    SPos(m) => match eq(m, 0b0000_0000_0000_0000) {
+      0b1 => Some(TZero),
+      _ => match eq(m, 0b0000_0000_0000_0001) { 0b1 => Some(TPos), _ => None }
+    },
+    SNeg(m) => match eq(m, 0b0000_0000_0000_0001) {
+      0b1 => Some(TNeg),
+      _ => match eq(m, 0b0000_0000_0000_0000) { 0b1 => Some(TZero), _ => None }
+    }
+  };
+
+// trit_digit: the signed integer value of a trit (TNeg -> -1, TZero -> 0, TPos -> +1).
+// Guarantee: Exact. Total — every trit has a unique integer value (C2).
+fn trit_digit(t: Trit) => SInt =
+  match t {
+    TNeg => SNeg(0b0000_0000_0000_0001),
+    TZero => SPos(0b0000_0000_0000_0000),
+    TPos => SPos(0b0000_0000_0000_0001)
+  };
+
+// trit_neg: digit-wise negation — value(trit_neg(t)) = -value(t) exactly. Guarantee: Exact.
+// Total — the balanced range is symmetric (no two's-complement asymmetry; binary-ternary.md §1).
+fn trit_neg(t: Trit) => Trit =
+  match t { TNeg => TPos, TZero => TZero, TPos => TNeg };
+
+// trit_to_wire_byte: the MSB-first wire glyph as its ASCII byte — '-' = 45, '0' = 48, '+' = 43
+// (binary-ternary.md §1; FLAG-ternary-1 substitution for Rust's char). Guarantee: Exact. Total.
+fn trit_to_wire_byte(t: Trit) => Binary{8} =
+  match t { TNeg => 0b0010_1101, TZero => 0b0011_0000, TPos => 0b0010_1011 };
+
+// trit_from_wire_byte: parse an ASCII wire glyph back into a Trit. Guarantee: Exact. Returns
+// None for any byte outside {45, 48, 43} (C1) — never a guessed digit.
+fn trit_from_wire_byte(b: Binary{8}) => Option[Trit] =
+  match eq(b, 0b0010_1101) {
+    0b1 => Some(TNeg),
+    _ => match eq(b, 0b0011_0000) {
+      0b1 => Some(TZero),
+      _ => match eq(b, 0b0010_1011) { 0b1 => Some(TPos), _ => None }
+    }
+  };
+
+// ── Bit — a binary digit in {0, 1} (FR-M2) ──────────────────────────────────────────────────────
+type Bit = BZero | BOne;
+
+// bit_new: construct a Bit from a signed integer. Guarantee: Exact. Returns None if d is
+// outside {0, 1} — explicit off-domain error (C1/G2); a negative input (SNeg with m >= 1) is None.
+fn bit_new(d: SInt) => Option[Bit] =
+  match d {
+    SPos(m) => match eq(m, 0b0000_0000_0000_0000) {
+      0b1 => Some(BZero),
+      _ => match eq(m, 0b0000_0000_0000_0001) { 0b1 => Some(BOne), _ => None }
+    },
+    SNeg(m) => match eq(m, 0b0000_0000_0000_0000) { 0b1 => Some(BZero), _ => None }
+  };
+
+// bit_digit: the unsigned integer value of a bit (BZero -> 0, BOne -> 1). Guarantee: Exact. Total.
+fn bit_digit(b: Bit) => SInt =
+  match b { BZero => SPos(0b0000_0000_0000_0000), BOne => SPos(0b0000_0000_0000_0001) };
+
+// bit_and / bit_or / bit_xor: total Boolean algebra. Guarantee: Exact (C2).
+fn bit_and(a: Bit, b: Bit) => Bit =
+  match a { BOne => b, BZero => BZero };
+
+fn bit_or(a: Bit, b: Bit) => Bit =
+  match a { BZero => b, BOne => BOne };
+
+fn bit_xor(a: Bit, b: Bit) => Bit =
+  match a { BZero => b, BOne => match b { BZero => BOne, BOne => BZero } };
+
+// ── Trits — an MSB-first trit string (the port of &[Trit]/Vec<Trit>; substitution note above) ───
+type Trits = TNil | TCons(Trit, Trits);
+
+// trits_len: the digit count, as Binary{8}. O(n) spine-walk (std.collections::len precedent);
+// a string longer than 255 digits hits add_u's never-silent carry refusal — far past the m <= 10
+// codec ceiling (FLAG-ternary-2), so unreachable through this surface's own producers.
+fn trits_len(ts: Trits) => Binary{8} =
+  match ts { TNil => 0b0000_0000, TCons(_, rest) => add_u(0b0000_0001, trits_len(rest)) };
+
+// tsnoc: append one trit at the LSB end. O(n) spine-walk (std.collections::snoc precedent).
+fn tsnoc(ts: Trits, t: Trit) => Trits =
+  match ts { TNil => TCons(t, TNil), TCons(h, rest) => TCons(h, tsnoc(rest, t)) };
+
+// tconcat: concatenate two trit strings. O(n) in the first spine.
+fn tconcat(a: Trits, b: Trits) => Trits =
+  match a { TNil => b, TCons(h, rest) => TCons(h, tconcat(rest, b)) };
+
+// zeros: the m-trit all-zero string (the balanced representation of 0 at width m).
+fn zeros(m: Binary{8}) => Trits =
+  match eq(m, 0b0000_0000) { 0b1 => TNil, _ => TCons(TZero, zeros(sub_u(m, 0b0000_0001))) };
+
+// ttake / tdrop: the first n digits / everything after them. Total (short inputs yield what
+// exists — used only on strings whose length the callers below have already established).
+fn ttake(ts: Trits, n: Binary{8}) => Trits =
+  match eq(n, 0b0000_0000) {
+    0b1 => TNil,
+    _ => match ts { TNil => TNil, TCons(h, rest) => TCons(h, ttake(rest, sub_u(n, 0b0000_0001))) }
+  };
+
+fn tdrop(ts: Trits, n: Binary{8}) => Trits =
+  match eq(n, 0b0000_0000) {
+    0b1 => ts,
+    _ => match ts { TNil => TNil, TCons(_, rest) => tdrop(rest, sub_u(n, 0b0000_0001)) }
+  };
+
+// all_zero: True iff every digit is TZero. Total (Exact — a finite-domain structural check).
+fn all_zero(ts: Trits) => Bool =
+  match ts {
+    TNil => True,
+    TCons(h, rest) => match h { TZero => all_zero(rest), TPos => False, TNeg => False }
+  };
+
+// ── int <-> trits codec (binary-ternary.md §1; div_u/rem_u base conversion) ─────────────────
+// b3x16: unsigned times-3 at Binary{16} via double-and-add (no mul_s — see the substitution
+// note: bin.mul is signed). add_u's carry-out refusal keeps any overflow never-silent (G2).
+fn b3x16(v: Binary{16}) => Binary{16} =
+  add_u(add_u(v, v), v);
+
+// pow3: 3^m at Binary{16}, for m <= 10 (3^10 = 59049 <= 65535; callers gate the ceiling —
+// max_magnitude below refuses past it). Guarantee: Exact on the gated domain.
+fn pow3(m: Binary{8}) => Binary{16} =
+  match eq(m, 0b0000_0000) { 0b1 => 0b0000_0000_0000_0001, _ => b3x16(pow3(sub_u(m, 0b0000_0001))) };
+
+// max_magnitude: the maximum representable magnitude in m trits, (3^m - 1) / 2 — the symmetric
+// range is [-max, +max]. Guarantee: Exact. Returns None for m > 10 (3^11 overflows Binary{16}) —
+// the explicit width ceiling, mirroring Rust's m >= 41 => None (C1; FLAG-ternary-2 / spec Q4).
+fn max_magnitude(m: Binary{8}) => Option[Binary{16}] =
+  match lt(0b0000_1010, m) {
+    0b1 => None,
+    _ => Some(div_u(sub_u(pow3(m), 0b0000_0000_0000_0001), 0b0000_0000_0000_0010))
+  };
+
+// smul3: signed times-3 (sign-magnitude — the sign is unchanged, the magnitude triples).
+fn smul3(x: SInt) => SInt =
+  match x { SPos(m) => SPos(b3x16(m)), SNeg(m) => SNeg(b3x16(m)) };
+
+// sadd_trit: signed x + digit(t), canonical sign-magnitude (never SNeg(0)). Exact integer
+// arithmetic; sub_u never underflows here because the magnitude cases are matched first.
+fn sadd_trit(x: SInt, t: Trit) => SInt =
+  match t {
+    TZero => x,
+    TPos => match x {
+      SPos(m) => SPos(add_u(m, 0b0000_0000_0000_0001)),
+      SNeg(m) => match eq(m, 0b0000_0000_0000_0001) {
+        0b1 => SPos(0b0000_0000_0000_0000),
+        _ => SNeg(sub_u(m, 0b0000_0000_0000_0001))
+      }
+    },
+    TNeg => match x {
+      SNeg(m) => SNeg(add_u(m, 0b0000_0000_0000_0001)),
+      SPos(m) => match eq(m, 0b0000_0000_0000_0000) {
+        0b1 => SNeg(0b0000_0000_0000_0001),
+        _ => match eq(m, 0b0000_0000_0000_0001) {
+          0b1 => SPos(0b0000_0000_0000_0000),
+          _ => SPos(sub_u(m, 0b0000_0000_0000_0001))
+        }
+      }
+    }
+  };
+
+// t2i_go: MSB-first Horner fold — acc' = acc*3 + digit (binary-ternary.md §1).
+fn t2i_go(ts: Trits, acc: SInt) => SInt =
+  match ts { TNil => acc, TCons(t, rest) => t2i_go(rest, sadd_trit(smul3(acc), t)) };
+
+// trits_to_int: the integer denoted by an MSB-first trit string — value(t) = sum of
+// digit(t_j) * 3^(m-1-j) (Horner). The empty string denotes 0. Guarantee: Exact — an integer
+// identity with no approximation (C2). Total for m <= 10; a longer string hits b3x16's
+// never-silent add_u carry refusal (the Binary{16} analogue of Rust's i64 width ceiling,
+// FLAG-ternary-2 — an explicit refusal, never a wrong value).
+fn trits_to_int(ts: Trits) => SInt =
+  t2i_go(ts, SPos(0b0000_0000_0000_0000));
+
+// encode_mag: the unique m-trit balanced representation of the NON-NEGATIVE magnitude u,
+// MSB-first — the div_u/rem_u base conversion. Balanced digit choice per step (LSB-first):
+// r = u rem 3 -> digit 0 (u' = u/3) | +1 (u' = u/3) | -1 (u' = (u+1)/3); the digit is appended
+// at the LSB end (tsnoc), so the result is MSB-first. Returns None when the residual is nonzero
+// after m digits — the value does not fit m trits (C1: explicit out-of-range, never truncation).
+// (add_u(u, 1) cannot overflow: r = 2 implies u <= 65534.)
+fn encode_mag(u: Binary{16}, m: Binary{8}) => Option[Trits] =
+  match eq(m, 0b0000_0000) {
+    0b1 => match eq(u, 0b0000_0000_0000_0000) { 0b1 => Some(TNil), _ => None },
+    _ =>
+      let r = rem_u(u, 0b0000_0000_0000_0011) in
+      match eq(r, 0b0000_0000_0000_0000) {
+        0b1 => match encode_mag(div_u(u, 0b0000_0000_0000_0011), sub_u(m, 0b0000_0001)) {
+          Some(rest) => Some(tsnoc(rest, TZero)),
+          None => None
+        },
+        _ => match eq(r, 0b0000_0000_0000_0001) {
+          0b1 => match encode_mag(div_u(u, 0b0000_0000_0000_0011), sub_u(m, 0b0000_0001)) {
+            Some(rest) => Some(tsnoc(rest, TPos)),
+            None => None
+          },
+          _ => match encode_mag(
+                  div_u(add_u(u, 0b0000_0000_0000_0001), 0b0000_0000_0000_0011),
+                  sub_u(m, 0b0000_0001)
+                ) {
+            Some(rest) => Some(tsnoc(rest, TNeg)),
+            None => None
+          }
+        }
+      }
+  };
+
+// int_to_trits: the unique m-trit balanced representation of v, MSB-first. Guarantee: Exact.
+// Returns None if v is outside [-(3^m-1)/2, +(3^m-1)/2] — an explicit out-of-range error, never
+// a silent truncation or wrap (C1/G2). A negative v is the digit-wise negation of its magnitude's
+// representation (balanced ternary is sign-symmetric — binary-ternary.md §1). Like the Rust
+// crate, int_to_trits does not consult max_magnitude: 0 encodes at ANY width (all zeros).
+fn int_to_trits(v: SInt, m: Binary{8}) => Option[Trits] =
+  match v {
+    SPos(mag) => encode_mag(mag, m),
+    SNeg(mag) => match encode_mag(mag, m) { Some(ts) => Some(trits_neg(ts)), None => None }
+  };
+
+// ── fixed-width balanced-ternary arithmetic over Trits ──────────────────────────────────────────
+// trits_neg: digit-wise negation — value(trits_neg(a)) = -value(a) exactly, width-preserving.
+// Guarantee: Exact. Total — the range [-max, +max] is symmetric (C2).
+fn trits_neg(ts: Trits) => Trits =
+  match ts { TNil => TNil, TCons(h, rest) => TCons(trit_neg(h), trits_neg(rest)) };
+
+// TSum — a (digit, carry) pair from a balanced-ternary digit addition.
+type TSum = TS(Trit, Trit);
+
+// trit2_sum: two-digit balanced sum — x + y = 3*carry + digit with digit, carry in {-1, 0, +1}
+// (the balanced-ternary half-adder table; Knuth 4.1). Guarantee: Exact. Total (9 cases).
+fn trit2_sum(x: Trit, y: Trit) => TSum =
+  match x {
+    TZero => TS(y, TZero),
+    TPos => match y { TZero => TS(TPos, TZero), TPos => TS(TNeg, TPos), TNeg => TS(TZero, TZero) },
+    TNeg => match y { TZero => TS(TNeg, TZero), TNeg => TS(TPos, TNeg), TPos => TS(TZero, TZero) }
+  };
+
+// trit_full_add: three-digit balanced sum (x + y + carry-in). The two partial carries c1, c2
+// satisfy |c1 + c2| <= 1 (x+y+c is in [-3, 3], so 3*(c1+c2) = total - digit is in [-4, 4]),
+// so their own sum has a zero carry — the discarded `_` below is structurally always TZero
+// (grounded here, not silently dropped — G2). Guarantee: Exact. Total.
+fn trit_full_add(x: Trit, y: Trit, c: Trit) => TSum =
+  match trit2_sum(x, y) {
+    TS(d1, c1) =>
+      match trit2_sum(d1, c) {
+        TS(d2, c2) => match trit2_sum(c1, c2) { TS(cc, _) => TS(d2, cc) }
+      }
+  };
+
+// TCarry — (partial sum, carry toward the MSB) from adding two equal-length tails.
+type TCarry = TC(Trits, Trit);
+
+// addc: ripple-carry addition of two MSB-first strings — recurses to the LSB end first, then
+// adds each digit column with the carry coming back up. None on unequal lengths (C1).
+fn addc(a: Trits, b: Trits) => Option[TCarry] =
+  match a {
+    TNil => match b { TNil => Some(TC(TNil, TZero)), TCons(_, _) => None },
+    TCons(ah, at) => match b {
+      TNil => None,
+      TCons(bh, bt) => match addc(at, bt) {
+        None => None,
+        Some(p) => match p {
+          TC(stail, cin) =>
+            match trit_full_add(ah, bh, cin) {
+              TS(d, cout) => Some(TC(TCons(d, stail), cout))
+            }
+        }
+      }
+    }
+  };
+
+// trits_add: fixed-width balanced-ternary addition a + b. Guarantee: Exact. Returns None on
+// fixed-width overflow — a nonzero final carry, i.e. the true sum lies outside
+// [-max_magnitude(m), +max_magnitude(m)] — and None if the widths differ. Never silently wraps
+// (C1/G2). (The nonzero-carry test IS the overflow test: value(digits) + 3^m * carry = a + b,
+// and |a + b| <= 2*max < 3^m forces carry = 0 exactly when the sum is representable.)
+fn trits_add(a: Trits, b: Trits) => Option[Trits] =
+  match addc(a, b) {
+    None => None,
+    Some(p) =>
+      match p {
+        TC(sum, cout) => match cout { TZero => Some(sum), TPos => None, TNeg => None }
+      }
+  };
+
+// trits_sub: fixed-width subtraction a - b = trits_add(a, trits_neg(b)) — the same identity the
+// Rust crate uses. Guarantee: Exact. None on overflow or unequal widths (C1/G2).
+fn trits_sub(a: Trits, b: Trits) => Option[Trits] =
+  trits_add(a, trits_neg(b));
+
+// t3x: fixed-width times-3 as two checked additions (x + x + x). Option-propagating so any
+// out-of-range intermediate stays never-silent; trits_mul only calls it at the doubled width,
+// where the Horner intermediates provably fit (see trits_mul).
+fn t3x(x: Trits) => Option[Trits] =
+  match trits_add(x, x) { None => None, Some(xx) => trits_add(xx, x) };
+
+// term_of: digit * a — the partial product row (TPos -> a, TZero -> 0, TNeg -> -a).
+fn term_of(d: Trit, aw: Trits) => Trits =
+  match d { TZero => zeros(trits_len(aw)), TPos => aw, TNeg => trits_neg(aw) };
+
+// mul_go: MSB-first Horner over b's digits at the doubled width — acc' = acc*3 + digit*a.
+fn mul_go(bs: Trits, aw: Trits, acc: Trits) => Option[Trits] =
+  match bs {
+    TNil => Some(acc),
+    TCons(d, rest) => match t3x(acc) {
+      None => None,
+      Some(acc3) =>
+        match trits_add(acc3, term_of(d, aw)) {
+          None => None,
+          Some(acc2) => mul_go(rest, aw, acc2)
+        }
+    }
+  };
+
+// trits_mul: fixed-width balanced-ternary multiplication a * b. Computes the full 2m-trit
+// product (both operands zero-padded to width 2m; every Horner intermediate is bounded by
+// (3^(k+m)-1)/2 for k processed digits, so the 2m-width additions never overflow) and returns
+// the low m trits iff the high m trits are all zero — otherwise None (overflow, explicit).
+// Also None if the widths differ. Guarantee: Exact — never a silent truncation (C1/G2).
+fn trits_mul(a: Trits, b: Trits) => Option[Trits] =
+  let m = trits_len(a) in
+  match eq(m, trits_len(b)) {
+    0b1 => match mul_go(b, tconcat(zeros(m), a), zeros(add_u(m, m))) {
+      None => None,
+      Some(prod) => match all_zero(ttake(prod, m)) { True => Some(tdrop(prod, m)), False => None }
+    },
+    _ => None
+  };
+
+// ── packed-ternary codecs (RFC-0004 §5; DN-01; spec §3) ─────────────────────────────────────────
+// A packing is a visible, inspectable representation choice — never a hidden lowering pass (C3).
+// The three schemes are lossless bit-exact re-encodings (Exact is honest — DN-01 §2); a future
+// lossy scheme would need a tag below Exact and may NOT be silently folded in (spec FLAG Q2).
+// The caller names the scheme explicitly in v0 (spec FLAG Q3 — RFC-0005 selector integration is
+// a separate design pass).
+type Scheme = I2S | Tl1 | Tl2;
+
+// scheme_trits_per_byte / scheme_group_size: I2S packs 4 trits/byte (2 bits each); TL1/TL2 pack
+// 5 trits/byte (base-3 in 243 <= 256). The group size equals the per-byte count; a pack call on
+// a non-multiple is an explicit Err(Misaligned) (RFC-0004 §5 "align to SIMD width"; C1).
+fn scheme_trits_per_byte(s: Scheme) => Binary{8} =
+  match s { I2S => 0b0000_0100, Tl1 => 0b0000_0101, Tl2 => 0b0000_0101 };
+
+fn scheme_group_size(s: Scheme) => Binary{8} =
+  scheme_trits_per_byte(s);
+
+// PackError: explicit pack/unpack errors (C1/G2 — never a sentinel). OffGrid: an encoding falls
+// outside the scheme's alphabet. Misaligned: the trit count is not a multiple of the group size.
+type PackError = OffGrid | Misaligned;
+
+// SelectionNote: how the scheme was selected. v0: the caller named it explicitly (FLAG Q3 — the
+// RFC-0005 selector would replace this with a PolicyRef; the structure is forward-compatible).
+type SelectionNote = ExplicitCaller;
+
+// ByteList — the packed bytes as a cons-list of Binary{8} (FLAG-ternary-3 substitution for
+// Vec<u8>: no surface prim constructs a kernel Bytes from computed bytes).
+type ByteList = BNil | BCons(Binary{8}, ByteList);
+
+fn bytelist_len(bs: ByteList) => Binary{8} =
+  match bs { BNil => 0b0000_0000, BCons(_, rest) => add_u(0b0000_0001, bytelist_len(rest)) };
+
+// Packed — bytes + the inspectable Meta.physical record: MkPacked(bytes, scheme, trit_count).
+// Two packings of the same trits under different schemes are the same LOGICAL value (DN-01 —
+// packing is not a type distinction; C4: metadata is not identity). Field privacy is not
+// expressible (FLAG-ternary-4) — unpack defends with explicit Err(OffGrid) instead.
+type Packed = MkPacked(ByteList, Scheme, Binary{8});
+
+// ExplainRecord — the inspectable EXPLAIN record (C3/NFR-1/SC-3):
+// ExplainRec(scheme, selection, trit_count, byte_count).
+type ExplainRecord = ExplainRec(Scheme, SelectionNote, Binary{8}, Binary{8});
+
+// ── I2S codec: 2 bits per trit, 4 trits per byte, MSB-first within the byte.
+// Encoding (bitnet.cpp I2_S convention, documented so the codec is auditable — C3/G11):
+// TPos = 0b01, TZero = 0b00, TNeg = 0b11; 0b10 is off-grid.
+fn i2s_encode(t: Trit) => Binary{8} =
+  match t { TPos => 0b0000_0001, TZero => 0b0000_0000, TNeg => 0b0000_0011 };
+
+fn i2s_byte(t0: Trit, t1: Trit, t2: Trit, t3: Trit) => Binary{8} =
+  or(
+    or(
+      or(shl_u(i2s_encode(t0), 0b0000_0110), shl_u(i2s_encode(t1), 0b0000_0100)),
+      shl_u(i2s_encode(t2), 0b0000_0010)
+    ),
+    i2s_encode(t3)
+  );
+
+// i2s_decode: the low 2 bits of `bits` back to a Trit; 0b10 is an explicit Err(OffGrid) (C1).
+fn i2s_decode(bits: Binary{8}) => Result[Trit, PackError] =
+  let c = and(bits, 0b0000_0011) in
+  match eq(c, 0b0000_0001) {
+    0b1 => Ok(TPos),
+    _ => match eq(c, 0b0000_0000) {
+      0b1 => Ok(TZero),
+      _ => match eq(c, 0b0000_0011) { 0b1 => Ok(TNeg), _ => Err(OffGrid) }
+    }
+  };
+
+// pack_i2s: 4 trits per byte; a ragged tail (1-3 leftover trits) is None — unreachable after
+// pack's alignment check, kept explicit rather than silently padded (G2).
+fn pack_i2s(ts: Trits) => Option[ByteList] =
+  match ts {
+    TNil => Some(BNil),
+    TCons(t0, r0) => match r0 {
+      TNil => None,
+      TCons(t1, r1) => match r1 {
+        TNil => None,
+        TCons(t2, r2) => match r2 {
+          TNil => None,
+          TCons(t3, rest) => match pack_i2s(rest) {
+            Some(bs) => Some(BCons(i2s_byte(t0, t1, t2, t3), bs)),
+            None => None
+          }
+        }
+      }
+    }
+  };
+
+fn unpack_i2s(bs: ByteList) => Result[Trits, PackError] =
+  match bs {
+    BNil => Ok(TNil),
+    BCons(byte, rest) => match i2s_decode(shr_u(byte, 0b0000_0110)) {
+      Err(e) => Err(e),
+      Ok(t0) => match i2s_decode(shr_u(byte, 0b0000_0100)) {
+        Err(e) => Err(e),
+        Ok(t1) => match i2s_decode(shr_u(byte, 0b0000_0010)) {
+          Err(e) => Err(e),
+          Ok(t2) => match i2s_decode(byte) {
+            Err(e) => Err(e),
+            Ok(t3) => match unpack_i2s(rest) {
+              Err(e) => Err(e),
+              Ok(tail) => Ok(TCons(t0, TCons(t1, TCons(t2, TCons(t3, tail)))))
+            }
+          }
+        }
+      }
+    }
+  };
+
+// ── TL1 codec: 5 trits per byte as a 5-digit base-3 number (TNeg -> 0, TZero -> 1, TPos -> 2;
+// first trit most significant). Max stored value 242 < 256. By-3 scaling via the unsigned add
+// tripling (no mul_s — see the substitution note).
+fn b3x8(v: Binary{8}) => Binary{8} =
+  add_u(add_u(v, v), v);
+
+fn tl1_encode(t: Trit) => Binary{8} =
+  match t { TNeg => 0b0000_0000, TZero => 0b0000_0001, TPos => 0b0000_0010 };
+
+// tl1_decode_digit: base-3 digit back to a Trit. Total on {0, 1, 2} — every caller feeds it
+// rem_u(_, 3), whose result is always in {0, 1, 2} (the >242-byte case is caught separately).
+fn tl1_decode_digit(d: Binary{8}) => Trit =
+  match eq(d, 0b0000_0000) {
+    0b1 => TNeg,
+    _ => match eq(d, 0b0000_0001) { 0b1 => TZero, _ => TPos }
+  };
+
+fn tl1_byte(t0: Trit, t1: Trit, t2: Trit, t3: Trit, t4: Trit) => Binary{8} =
+  let v0 = tl1_encode(t0) in
+  let v1 = add_u(b3x8(v0), tl1_encode(t1)) in
+  let v2 = add_u(b3x8(v1), tl1_encode(t2)) in
+  let v3 = add_u(b3x8(v2), tl1_encode(t3)) in add_u(b3x8(v3), tl1_encode(t4));
+
+// pack_tl1: 5 trits per byte; a ragged tail is None (unreachable after the alignment check; G2).
+fn pack_tl1(ts: Trits) => Option[ByteList] =
+  match ts {
+    TNil => Some(BNil),
+    TCons(t0, r0) => match r0 {
+      TNil => None,
+      TCons(t1, r1) => match r1 {
+        TNil => None,
+        TCons(t2, r2) => match r2 {
+          TNil => None,
+          TCons(t3, r3) => match r3 {
+            TNil => None,
+            TCons(t4, rest) => match pack_tl1(rest) {
+              Some(bs) => Some(BCons(tl1_byte(t0, t1, t2, t3, t4), bs)),
+              None => None
+            }
+          }
+        }
+      }
+    }
+  };
+
+// tl1_group: one byte back to its 5-trit group (MSB-first). The five base-3 digits come off
+// LSB-first via rem_u/div_u; a residual above 0 after five divisions means the byte value
+// was > 242 — an explicit Err(OffGrid), never a silently wrapped group (C1/G2).
+fn tl1_group(byte: Binary{8}) => Result[Trits, PackError] =
+  let d4 = tl1_decode_digit(rem_u(byte, 0b0000_0011)) in
+  let v1 = div_u(byte, 0b0000_0011) in
+  let d3 = tl1_decode_digit(rem_u(v1, 0b0000_0011)) in
+  let v2 = div_u(v1, 0b0000_0011) in
+  let d2 = tl1_decode_digit(rem_u(v2, 0b0000_0011)) in
+  let v3 = div_u(v2, 0b0000_0011) in
+  let d1 = tl1_decode_digit(rem_u(v3, 0b0000_0011)) in
+  let v4 = div_u(v3, 0b0000_0011) in
+  let d0 = tl1_decode_digit(rem_u(v4, 0b0000_0011)) in
+  match eq(div_u(v4, 0b0000_0011), 0b0000_0000) {
+    0b1 => Ok(TCons(d0, TCons(d1, TCons(d2, TCons(d3, TCons(d4, TNil)))))),
+    _ => Err(OffGrid)
+  };
+
+fn unpack_tl1(bs: ByteList) => Result[Trits, PackError] =
+  match bs {
+    BNil => Ok(TNil),
+    BCons(byte, rest) => match tl1_group(byte) {
+      Err(e) => Err(e),
+      Ok(group) => match unpack_tl1(rest) { Err(e) => Err(e), Ok(tail) => Ok(tconcat(group, tail)) }
+    }
+  };
+
+// ── TL2 codec: the TL1 value complemented within the 243-value space (stored = 242 - tl1).
+// A lossless bijection documented as a black-box-free encoding choice (C3/G11). Carried FLAG
+// from the crate: the exact normative bitnet.cpp TL2 layout is not yet ratified in the corpus;
+// this is the same placeholder the Rust oracle implements — divergence would fail the
+// differential, never pass silently.
+fn pack_tl2(ts: Trits) => Option[ByteList] =
+  match pack_tl1(ts) { None => None, Some(bs) => Some(tl2_complement(bs)) };
+
+fn tl2_complement(bs: ByteList) => ByteList =
+  match bs { BNil => BNil, BCons(b, rest) => BCons(sub_u(0b1111_0010, b), tl2_complement(rest)) };
+
+fn unpack_tl2(bs: ByteList) => Result[Trits, PackError] =
+  match bs {
+    BNil => Ok(TNil),
+    BCons(byte, rest) => match lt(0b1111_0010, byte) {
+      0b1 => Err(OffGrid),
+      _ => match tl1_group(sub_u(0b1111_0010, byte)) {
+        Err(e) => Err(e),
+        Ok(group) =>
+          match unpack_tl2(rest) {
+            Err(e) => Err(e),
+            Ok(tail) => Ok(tconcat(group, tail))
+          }
+      }
+    }
+  };
+
+// ── pack / unpack / scheme_of / explain ─────────────────────────────────────────────────────────
+// pack: pack a trit string under the caller-named scheme. The scheme is recorded as the
+// inspectable Meta.physical field of the returned Packed — never a hidden lowering (C3/NFR-1;
+// DN-01). Guarantee: Exact. Err(Misaligned) when the trit count is not a multiple of the
+// scheme's group size (C1); the inner None arms are the codecs' ragged-tail defense, unreachable
+// after this alignment check but never silently absorbed (G2).
+fn pack(ts: Trits, s: Scheme) => Result[Packed, PackError] =
+  let n = trits_len(ts) in
+  match eq(rem_u(n, scheme_group_size(s)), 0b0000_0000) {
+    0b1 => match s {
+      I2S => match pack_i2s(ts) { Some(bs) => Ok(MkPacked(bs, I2S, n)), None => Err(Misaligned) },
+      Tl1 => match pack_tl1(ts) { Some(bs) => Ok(MkPacked(bs, Tl1, n)), None => Err(Misaligned) },
+      Tl2 => match pack_tl2(ts) { Some(bs) => Ok(MkPacked(bs, Tl2, n)), None => Err(Misaligned) }
+    },
+    _ => Err(Misaligned)
+  };
+
+// unpack: the packed trits back out — lossless on every pack-produced value (Exact; DN-01 §2).
+// FLAG-ternary-4: without field privacy a forged Packed is constructible, so unpack returns
+// Result — a corrupt byte (I2S 0b10 code, TL1/TL2 byte > 242) or a trit_count that disagrees
+// with the decoded length is an explicit Err(OffGrid), never a panic or a silent wrong value.
+fn unpack(p: Packed) => Result[Trits, PackError] =
+  match p {
+    MkPacked(bs, s, n) => match s {
+      I2S => unpack_check(unpack_i2s(bs), n),
+      Tl1 => unpack_check(unpack_tl1(bs), n),
+      Tl2 => unpack_check(unpack_tl2(bs), n)
+    }
+  };
+
+// unpack_check: the defensive trit-count agreement gate (FLAG-ternary-4).
+fn unpack_check(r: Result[Trits, PackError], n: Binary{8}) => Result[Trits, PackError] =
+  match r {
+    Err(e) => Err(e),
+    Ok(ts) => match eq(trits_len(ts), n) { 0b1 => Ok(ts), _ => Err(OffGrid) }
+  };
+
+// scheme_of: the scheme used to pack — the inspectable Meta.physical record (C3/NFR-1).
+// Guarantee: Exact. Total.
+fn scheme_of(p: Packed) => Scheme =
+  match p { MkPacked(_, s, _) => s };
+
+// packed_bytes / packed_trit_count: read-only projections of the packed value.
+fn packed_bytes(p: Packed) => ByteList =
+  match p { MkPacked(bs, _, _) => bs };
+
+fn packed_trit_count(p: Packed) => Binary{8} =
+  match p { MkPacked(_, _, n) => n };
+
+// explain: the full EXPLAIN record — scheme, how it was selected (v0: explicit caller — FLAG Q3),
+// trit count, and byte count (C3/G11/NFR-1/SC-3). Guarantee: Exact. Total.
+fn explain(p: Packed) => ExplainRecord =
+  match p { MkPacked(bs, s, n) => ExplainRec(s, ExplicitCaller, n, bytelist_len(bs)) };
+
+// ── guarantee matrix (RFC-0016 §4.5; spec §4) — the load-bearing deliverable, as CHECKED DATA ───
+// Every row tags GExact: the balanced-ternary algebra is an exact integer identity and the
+// I2S/TL1/TL2 codecs are lossless re-encodings (the crate's C2/VR-5 justification, carried at
+// the same strength). The range boundary is FALLIBILITY (the explicit None/Err column), never a
+// weakened tag. Constructor names per the reserved-word substitution note (GExact etc.).
+type Tag = GExact | GProven | GEmpirical | GDeclared;
+
+// Fallibility: total, explicit-None off-domain (with the named condition), or explicit-Err
+// (with the named error set). Prose conditions are Bytes (textual string literals).
+type Fallibility = FTotal | FNoneOnOffDomain(Bytes) | FErrOn(Bytes);
+
+// Explainable: whether the op exposes an inspectable EXPLAIN artifact (C3). Only the pack ops do.
+type Explainable = ExplainYes | ExplainNA;
+
+// OpGuarantee — one matrix row: OpRow(op, tag, fallibility, effects, explainable). The op name
+// and effects are prose Bytes; tag/fallibility/explainable are typed ADTs (never stringly).
+type OpGuarantee = OpRow(Bytes, Tag, Fallibility, Bytes, Explainable);
+
+type Rows = RNil | RCons(OpGuarantee, Rows);
+
+fn row_trit_new() => OpGuarantee =
+  OpRow("trit_new", GExact, FNoneOnOffDomain("d outside {-1,0,+1}"), "none", ExplainNA);
+
+fn row_bit_new() => OpGuarantee =
+  OpRow("bit_new", GExact, FNoneOnOffDomain("d outside {0,1}"), "none", ExplainNA);
+
+fn row_trit_digit() => OpGuarantee =
+  OpRow("trit_digit", GExact, FTotal, "none", ExplainNA);
+
+fn row_trit_neg() => OpGuarantee =
+  OpRow("trit_neg", GExact, FTotal, "none", ExplainNA);
+
+fn row_bit_digit() => OpGuarantee =
+  OpRow("bit_digit", GExact, FTotal, "none", ExplainNA);
+
+fn row_bit_and() => OpGuarantee =
+  OpRow("bit_and", GExact, FTotal, "none", ExplainNA);
+
+fn row_bit_or() => OpGuarantee =
+  OpRow("bit_or", GExact, FTotal, "none", ExplainNA);
+
+fn row_bit_xor() => OpGuarantee =
+  OpRow("bit_xor", GExact, FTotal, "none", ExplainNA);
+
+// trits_to_int: total on the m <= 10 domain; past it the b3x16 tripling refuses never-silently
+// (FLAG-ternary-2 — the ported analogue of the Rust row's i64-total contract).
+fn row_trits_to_int() => OpGuarantee =
+  OpRow("trits_to_int", GExact, FTotal, "none", ExplainNA);
+
+fn row_int_to_trits() => OpGuarantee =
+  OpRow(
+    "int_to_trits",
+    GExact,
+    FNoneOnOffDomain("v outside [-(3^m-1)/2, +(3^m-1)/2]"),
+    "none",
+    ExplainNA
+  );
+
+fn row_trits_neg() => OpGuarantee =
+  OpRow("trits_neg", GExact, FTotal, "none", ExplainNA);
+
+fn row_trits_add() => OpGuarantee =
+  OpRow(
+    "trits_add",
+    GExact,
+    FNoneOnOffDomain("fixed-width overflow or unequal widths"),
+    "none",
+    ExplainNA
+  );
+
+fn row_trits_sub() => OpGuarantee =
+  OpRow(
+    "trits_sub",
+    GExact,
+    FNoneOnOffDomain("fixed-width overflow or unequal widths"),
+    "none",
+    ExplainNA
+  );
+
+fn row_trits_mul() => OpGuarantee =
+  OpRow(
+    "trits_mul",
+    GExact,
+    FNoneOnOffDomain("fixed-width overflow or unequal widths"),
+    "none",
+    ExplainNA
+  );
+
+fn row_pack() => OpGuarantee =
+  OpRow("pack", GExact, FErrOn("OffGrid | Misaligned"), "none", ExplainYes);
+
+// unpack: Total in the Rust crate (privacy-guarded); ported as explicit Err(OffGrid) on a
+// forged/corrupt Packed (FLAG-ternary-4 — a stated fallibility widening, not a tag change).
+fn row_unpack() => OpGuarantee =
+  OpRow(
+    "unpack",
+    GExact,
+    FErrOn("OffGrid — forged/corrupt Packed only; lossless on every pack-produced value"),
+    "none",
+    ExplainYes
+  );
+
+fn row_scheme_of() => OpGuarantee =
+  OpRow("scheme_of", GExact, FTotal, "none", ExplainYes);
+
+fn row_explain() => OpGuarantee =
+  OpRow("explain", GExact, FTotal, "none", ExplainYes);
+
+// matrix: all 18 rows, in the same order as guarantee_matrix.rs::MATRIX.
+fn matrix() => Rows =
+  RCons(row_trit_new(),
+  RCons(row_bit_new(),
+  RCons(row_trit_digit(),
+  RCons(row_trit_neg(),
+  RCons(row_bit_digit(),
+  RCons(row_bit_and(),
+  RCons(row_bit_or(),
+  RCons(row_bit_xor(),
+  RCons(row_trits_to_int(),
+  RCons(row_int_to_trits(),
+  RCons(row_trits_neg(),
+  RCons(row_trits_add(),
+  RCons(row_trits_sub(),
+  RCons(row_trits_mul(),
+  RCons(row_pack(),
+  RCons(row_unpack(),
+  RCons(row_scheme_of(),
+  RCons(row_explain(),
+  RNil))))))))))))))))));
+
+// ── structural checks over the matrix (the .myc analogues of guarantee_matrix.rs's invariants;
+// Empirical over Declared data — asserted in std_ternary.rs) ─────────────────────────────────────
+// bool_and: local total conjunction (std.diag precedent). Total (Exact).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+// nonempty: True iff the Bytes has at least one byte (bytes_len is Exact; eq at Binary{32}).
+fn nonempty(b: Bytes) => Bool =
+  match eq(bytes_len(b), 0b0000_0000_0000_0000_0000_0000_0000_0000) { 0b1 => False, _ => True };
+
+fn is_exact_tag(t: Tag) => Bool =
+  match t { GExact => True, GProven => False, GEmpirical => False, GDeclared => False };
+
+fn row_tag(r: OpGuarantee) => Tag =
+  match r { OpRow(_, t, _, _, _) => t };
+
+fn row_fallibility(r: OpGuarantee) => Fallibility =
+  match r { OpRow(_, _, f, _, _) => f };
+
+fn row_effects(r: OpGuarantee) => Bytes =
+  match r { OpRow(_, _, _, e, _) => e };
+
+fn row_explainable(r: OpGuarantee) => Explainable =
+  match r { OpRow(_, _, _, _, x) => x };
+
+fn matrix_len(xs: Rows) => Binary{8} =
+  match xs { RNil => 0b0000_0000, RCons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// all_exact: every row must tag GExact (C2/VR-5 — a non-Exact row would be a dishonest
+// downgrade of an exact fact; a mutant flipping any row fails this).
+fn all_exact(xs: Rows) => Bool =
+  match xs { RNil => True, RCons(r, rest) => bool_and(is_exact_tag(row_tag(r)), all_exact(rest)) };
+
+// all_effects_nonempty: every row states its effects — all "none" here (C6/RFC-0014). The
+// "== none" content assertion needs a bytes_eq prim (FLAG-ternary-5); non-emptiness is portable.
+fn all_effects_nonempty(xs: Rows) => Bool =
+  match xs {
+    RNil => True,
+    RCons(r, rest) => bool_and(nonempty(row_effects(r)), all_effects_nonempty(rest))
+  };
+
+// fallible_rows_name_their_error_set: every NoneOnOffDomain/ErrOn row carries a non-empty
+// condition/error-set string (C1/G2 — the error set must be named). Total rows are vacuous.
+fn fallible_rows_name_their_error_set(xs: Rows) => Bool =
+  match xs {
+    RNil => True,
+    RCons(r, rest) =>
+      bool_and(
+        match row_fallibility(r) {
+          FTotal => True,
+          FNoneOnOffDomain(c) => nonempty(c),
+          FErrOn(v) => nonempty(v)
+        },
+        fallible_rows_name_their_error_set(rest)
+      )
+  };
+
+// count_explainable: how many rows expose an EXPLAIN artifact — exactly the 4 pack ops
+// (pack/unpack/scheme_of/explain). The name-keyed form of this check needs bytes_eq
+// (FLAG-ternary-5); the count form is the portable structural equivalent.
+fn count_explainable(xs: Rows) => Binary{8} =
+  match xs {
+    RNil => 0b0000_0000,
+    RCons(r, rest) => match row_explainable(r) {
+      ExplainYes => add_u(0b0000_0001, count_explainable(rest)),
+      ExplainNA => count_explainable(rest)
+    }
+  };

@@ -1,0 +1,225 @@
+// nodule: std.numerics
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-09
+// @summary: Self-hosted honesty-crux surface of `std.numerics` — the guarantee lattice + weakest-wins
+nodule std.numerics;
+
+// meet-composition + basis-derived strength (the FR-N2 / VR-5 core of `mycelium-std-numerics`),
+// ported to `.myc` (M-1020, kickoff `spw`, RFC-0031 D5; the M-993 differential-witnessed loop). The
+// verified ε/δ bound *magnitudes* live in the kernel (`mycelium-numerics`, ADR-010) and stay Rust; a
+// float VALUE form does not exist in the `.myc` runtime yet (`enb` Gap A, M-895/M-896, ADR-040 §2.5),
+// so this port carries ONLY the parts that close honestly today: the strength lattice, its `meet`,
+// and the basis→strength derivation — exactly the "never-upgrading surface" the crate exists to be
+// (KC-3: it adds no trusted bound algebra, it consumes it).
+//
+// ── STEP-0 transpiler gap-profile (grounded, Empirical) ───────────────────────────────────────────
+// The committed E33-1 draft (gen/myc-drafts/stdlib/std-numerics/vet.json) records
+// total_checked_clean_items=2 / total_non_test_items=27 → checked_fraction 7.4%, and
+// total_emitted_items=2 → expressible_fraction 7.4% (summary.json). The recon re-vet this session
+// (base c2855f74, fresh myc-check) reproduced this byte-identically — ZERO delta — confirming the
+// two emitter features that landed since the draft's base (narrow-cast→truncate, D3 operand-type
+// inference) touch NONE of this crate's 31 gap classes. The 2 myc-check-clean emissions are the
+// `NumErr` + `CheckErr` enums, GRADUATED verbatim below; everything else is the disjoint hand-port
+// majority the transpiler structurally cannot emit (M-991 verdict, DN-34 §8.7–§8.9): cross-nodule
+// `use` imports, generic impls, `&mut Formatter` Display, top-level `const`, `&[T]` slices, and the
+// sealed `ProvenThm` witness.
+//
+// ── Convention (kernel types redeclared locally, NOT imported) ────────────────────────────────────
+// The single-nodule D5 harness (crates/mycelium-std-conformance/tests/harness/mod.rs) has no
+// cross-nodule import surface, and the RFC-0031 D1 kernel boundary keeps `mycelium-core` types in
+// Rust. So — exactly as `lib/std/core.myc` and `lib/std/diag.myc` do — the kernel `GuaranteeStrength`
+// and `BoundBasis` are mirrored here as LOCAL value-level ADTs (constructor-prefixed to dodge the
+// reserved strength keywords), and the row-4 Rust-oracle differential (std_numerics.rs) maps these
+// local values onto the live `mycelium_core::GuaranteeStrength`/`BoundBasis` oracle for comparison.
+//
+// ── Honesty tags (VR-5 — carried at the SAME strength as `mycelium-std-numerics`) ─────────────────
+// - `rank`, `meet`, `meet_all`, `basis_strength`, `is_stronger_eq`, the `Approx` projections, and the
+//   `NumErr`/`CheckErr` discriminators are total, match-defined, finite-domain ops with NO accuracy
+//   semantics of their own → `Exact` (RFC-0016 §4.1 C2, the "len-style" structural case). The thing
+//   that carries an accuracy tag is the `Bound` magnitude, which is NOT modeled here (kernel-owned).
+// - The lattice DATA (rank values, the meet table) is `Declared` — asserted, mirroring the Rust
+//   source's own structural `#[cfg(test)]` assertions; upgraded to `Empirical` by the differential.
+// - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) over the checks, driven against the
+//   LIVE `mycelium_core` + `mycelium_std_numerics` oracles (std_numerics.rs), is `Empirical` (trials)
+//   — never a machine-checked proof, never upgraded in translation.
+//
+// ── FLAGs (VR-5/G2 — the residual NOT ported; a mostly-FLAGged honest result is the success case) ──
+// - FLAG-num-1 (ε/δ bound magnitudes — the whole numeric core): `error_bound`/`prob_bound`/
+//   `union_delta`/`accuracy_to_probability`/`combine`'s ε-composition (`compose_error_bound`, outward
+//   /directed rounding), `check_error`/`check_union` (the M-203 tier-i re-derivation) all compute over
+//   `f64`. The `.myc` runtime has NO scalar-float VALUE form yet (`enb` Gap A, M-895/M-896; the Float
+//   TYPE parses + myc-checks — see `CheckErr` below — but no value can be constructed/evaluated), and
+//   the affine-arithmetic ε-kernel is `mycelium-numerics` (D1 kernel boundary, stays Rust). So the
+//   magnitude surface is FLAGged, not faked. `combine`'s STRENGTH half (the meet) IS ported below.
+// - FLAG-num-2 (FR-N3 sealed `ProvenThm` witness): the Rust `Approx::proven` is gated by a
+//   private-sealed-field witness token (`mod sealed { pub(super) struct Sealed; }` + a private field)
+//   so `Proven` is unreachable without a checked citation — a type-level Rust mechanism. `.myc` has no
+//   private-field / sealed-constructor construct, so the GATE cannot be reproduced. Rather than ship
+//   an ungated public `proven` that fabricates `GProven` (that would VIOLATE the invariant it claims
+//   to port — VR-5), the constructor is OMITTED; `basis_strength(BProvenThm(..)) => GProven` still
+//   models the strength derivation (matching `mycelium_core::BoundBasis::strength`, itself publicly
+//   reachable). Needs an `enb` sealing/visibility enabler → routed to the `enb` epic.
+// - FLAG-num-3 (`Display` impls): `NumErr`/`CheckErr` `core::fmt::Display` take `&mut Formatter` — an
+//   in-place mutation through a borrow with no value-semantic correspondence (ADR-003); not ported.
+// - FLAG-num-4 (RESOLVED — dev-dep IS present): `mycelium-std-numerics` IS a `[dev-dependencies]`
+//   member of crates/mycelium-std-conformance at this base (c2855f74, Cargo.toml line 35 — added by
+//   the scaffold commit itself). So the row-4 differential (std_numerics.rs) wires against BOTH the
+//   `mycelium_core::{GuaranteeStrength, BoundBasis}` oracle (the lattice/meet/basis→strength ground
+//   truth) AND the real `mycelium_std_numerics::{NumErr, CheckErr}` enum oracle (the refusal/verdict
+//   VARIANT set — an exhaustive Rust match makes a variant add/remove a compile-time differential
+//   break, never silent). No shared/integrator-owned file was edited to enable this (it was already so).
+// ── Guarantee lattice (mirror of mycelium_core::GuaranteeStrength) ─────────────────────────────────
+// Exact ⊐ Proven ⊐ Empirical ⊐ Declared (strongest → weakest; VR-5). Constructors are G-prefixed
+// because `Exact`/`Proven`/`Empirical`/`Declared` are RESERVED (the `T @ Exact` strength-annotation
+// surface). Same convention as lib/std/core.myc / lib/std/diag.myc.
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// rank: lattice rank 0..3, strongest = 0 (Exact) … weakest = 3 (Declared), as Binary{8}. Mirrors
+// `GuaranteeStrength::rank`. Total, match-defined → Exact.
+fn rank(g: Guarantee) => Binary{8} =
+  match g {
+    GExact => 0b0000_0000,
+    GProven => 0b0000_0001,
+    GEmpirical => 0b0000_0010,
+    GDeclared => 0b0000_0011
+  };
+
+// meet: the lattice MEET (greatest lower bound) — the WEAKEST (larger-rank) of the two strengths
+// (the FR-N2 crux: composition never yields a result stronger than its weakest input). Mirrors
+// `GuaranteeStrength::meet` exactly. Total, match-defined → Exact. Written as the direct
+// meet-semilattice table (Exact is the identity; Declared is absorbing) so totality is manifest —
+// no dependence on a Binary `>=` prim.
+//
+// Mutation witness: replacing any arm with a STRONGER result (e.g. GProven ∧ GDeclared => GProven)
+// would upgrade a composed strength past its weakest input — the exact VR-5 violation this guards.
+fn meet(a: Guarantee, b: Guarantee) => Guarantee =
+  match a {
+    GExact => b,
+    GDeclared => GDeclared,
+    GProven => match b {
+      GExact => GProven,
+      GProven => GProven,
+      GEmpirical => GEmpirical,
+      GDeclared => GDeclared
+    },
+    GEmpirical => match b {
+      GExact => GEmpirical,
+      GProven => GEmpirical,
+      GEmpirical => GEmpirical,
+      GDeclared => GDeclared
+    }
+  };
+
+// is_stronger_eq: True iff `a` is at least as strong as `b` (rank(a) <= rank(b)). The lattice order
+// as a total predicate; delegates to the Exact `lt` prim over the rank codes (same shape as
+// lib/std/select.myc::is_at_least). Exact.
+fn is_stronger_eq(a: Guarantee, b: Guarantee) => Bool =
+  match lt(rank(b), rank(a)) { 0b1 => False, _ => True };
+
+// ── Vec (local cons-list; the std.core/std.diag/std.collections self-contained convention) ─────────
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// meet_all: the meet-fold of a sequence of strengths, weakest-wins, from GExact (the TOP identity).
+// The empty sequence yields GExact. Mirrors `GuaranteeStrength::meet_all` (= `propagate` with an
+// Exact intrinsic) — the composition rule n-ary ops take over their inputs (FR-N2). Total (Exact by
+// composition of the Exact `meet`).
+fn meet_all(xs: Vec[Guarantee]) => Guarantee =
+  match xs { Nil => GExact, Cons(g, rest) => meet(g, meet_all(rest)) };
+
+// ── BoundBasis (mirror of mycelium_core::BoundBasis) + the basis→strength derivation (VR-5) ────────
+// How a bound was obtained — this alone determines the honest strength (ADR-011; M-I2/M-I3/M-I4).
+// Fields mirror the Rust enum: citation (Bytes), {trials (Binary{8}), method (Bytes)}. All Float-free
+// (the ε/δ magnitude lives in BoundKind, FLAG-num-1). B-prefixed to avoid shadowing `Bound` naming.
+type BoundBasis = BProvenThm(Bytes) | BEmpiricalFit(Binary{8}, Bytes) | BUserDeclared;
+
+// basis_strength: the honest strength a basis implies — the core VR-5 rule "the tag is exactly what
+// the basis supports, never asserted". Mirrors `mycelium_core::BoundBasis::strength` (bound.rs
+// §42–46) field-for-field: ProvenThm → Proven, EmpiricalFit → Empirical, UserDeclared → Declared.
+// Total, match-defined → Exact.
+//
+// Mutation witness: mapping BUserDeclared to GProven (an upgrade with no checked basis) is the
+// canonical VR-5 violation; the differential against BoundBasis::strength catches it.
+fn basis_strength(b: BoundBasis) => Guarantee =
+  match b {
+    BProvenThm(_) => GProven,
+    BEmpiricalFit(_, _) => GEmpirical,
+    BUserDeclared => GDeclared
+  };
+
+// ── Approx[A] carrier (mirror of mycelium_std_numerics::Approx<T>, strength component) ─────────────
+// A thin value pairing a value with its basis and the basis-DERIVED strength (RFC-0001 §4.3 `Meta`) —
+// NOT a new numeric type (FR-N1 / KC-3). The full Rust `Approx` also carries the numeric `Bound`
+// magnitude; that magnitude is the kernel-owned, float-valued surface (FLAG-num-1), so this carrier
+// models the strength-bearing `{basis, strength}` pair — the part that closes honestly. The strength
+// is ALWAYS derived (never a caller-set field): the invariant `strength == basis_strength(basis)`
+// holds by construction below (the constructors are the only builders), the VR-5 seal.
+type Approx[A] = MkApprox(A, BoundBasis, Guarantee);
+
+// attach: build an Approx by deriving the strength from the basis (spec §3 `attach`; VR-5 — the tag
+// is exactly what the basis supports, never asserted). declared/empirical are the named aliases (in
+// the Rust source their bodies are identical to attach — all three derive from the basis; only the
+// omitted `proven` differs, FLAG-num-2). Declared (type-level carrier contract).
+fn attach[A](value: A, basis: BoundBasis) => Approx[A] =
+  MkApprox(value, basis, basis_strength(basis));
+
+// declared: the explicit, always-flagged escape hatch (spec §3 `declared` / M-I4). Strength is
+// derived, not asserted — a UserDeclared basis yields GDeclared. Declared.
+fn declared[A](value: A, basis: BoundBasis) => Approx[A] =
+  attach(value, basis);
+
+// empirical: an Empirical-basis carrier; strength derived from the basis (an EmpiricalFit basis
+// yields GEmpirical; a weaker basis is honored, never upgraded). Declared.
+fn empirical[A](value: A, basis: BoundBasis) => Approx[A] =
+  attach(value, basis);
+
+// approx_strength: project the honest (basis-derived, invariant) strength. Total projection (Exact).
+fn approx_strength[A](a: Approx[A]) => Guarantee =
+  match a { MkApprox(_, _, s) => s };
+
+// approx_value: project the carried value. Total (Exact).
+fn approx_value[A](a: Approx[A]) => A =
+  match a { MkApprox(v, _, _) => v };
+
+// approx_basis: project the basis. Total (Exact).
+fn approx_basis[A](a: Approx[A]) => BoundBasis =
+  match a { MkApprox(_, b, _) => b };
+
+// combine_strength: the STRENGTH half of the FR-N2 `combine` — the meet of two carriers' strengths
+// (weakest-wins). The ε-bound composition half (compose_error_bound, outward rounding) is FLAG-num-1
+// (kernel-owned, float-valued), so this ports only the never-upgrading strength rule. Exact.
+fn combine_strength[A](x: Approx[A], y: Approx[A]) => Guarantee =
+  meet(approx_strength(x), approx_strength(y));
+
+// ── Graduated transpiler emissions (the 2 myc-check-clean draft items — E33-1 corpus) ─────────────
+// NumErr: structured refusal record for the numerics helpers (C1; RFC-0013; spec §3). Every failure
+// mode is an explicit variant — no silent coercion, no fabricated default (M-204 refuse-never-fabricate
+// posture). Emitted clean by mycelium-transpile; graduated verbatim. Float-free → fully exercised in
+// the differential. Discriminators below map it to a stable Binary{8} code (total → Exact).
+type NumErr = BadEps | BadDelta | NoRule | NormMismatch | Overflow;
+
+// num_err_code: a stable Binary{8} discriminant for each refusal variant, in the Rust enum's own
+// declaration order. Total, match-defined → Exact. The row-4 differential ties each code to the live
+// `mycelium_std_numerics::NumErr` variant via an exhaustive Rust match (a variant add/remove breaks
+// the differential at compile time — never silent).
+fn num_err_code(e: NumErr) => Binary{8} =
+  match e {
+    BadEps => 0b0000_0000,
+    BadDelta => 0b0000_0001,
+    NoRule => 0b0000_0010,
+    NormMismatch => 0b0000_0011,
+    Overflow => 0b0000_0100
+  };
+
+// CheckErr: structured verdict for the tier-i re-validation checker (spec §3; RFC-0013). Emitted
+// clean by mycelium-transpile; graduated verbatim. `Rejected(Float, Float)` carries the (recomputed,
+// claimed) ε pair — the Float TYPE parses + myc-checks, but a Float VALUE cannot be constructed in
+// the `.myc` runtime yet (FLAG-num-1 / `enb` Gap A), so only `Malformed` is constructible/evaluable
+// today; the `Rejected` arm is declared for surface fidelity, exercised once floats land.
+type CheckErr = Rejected(Float, Float) | Malformed;
+
+// is_malformed: True iff the checker verdict is the (Float-free) Malformed variant. Total → Exact.
+// Never-silent: a rejected-vs-malformed distinction is explicit, never collapsed.
+fn is_malformed(c: CheckErr) => Bool =
+  match c { Malformed => True, Rejected(_, _) => False };

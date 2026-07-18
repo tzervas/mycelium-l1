@@ -1,0 +1,3 @@
+// rejected: a fn must declare its result type with '->'
+nodule bad;
+fn f(x: Binary{8}) = x

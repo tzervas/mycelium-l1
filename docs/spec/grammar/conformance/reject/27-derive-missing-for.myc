@@ -1,0 +1,5 @@
+// rejected: 'derive' application missing the 'for' keyword between the rule name and type.
+// The parser expects 'derive Name for T'; a missing 'for' is a never-silent parse refusal
+// (G2 / DN-54 §4 / M-812 / DN-38 §8.1).
+nodule demo;
+derive Trivial Binary{8}

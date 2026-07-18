@@ -1,0 +1,14 @@
+// exercises: the M-664 surface — `consume <expr>` (affine Substrate acquisition, DN-03 §1 / LR-8)
+// as an active expression, and an inherent `impl T { fn … }` method block (methods associated with
+// a type, not a trait). The `consume` operand is a `Substrate`-typed parameter; the inherent block
+// groups an ordinary explicitly-typed function with its type (no implicit `self` in v0).
+nodule resources;
+
+fn take(s: Substrate{Socket}) => Substrate{Socket} =
+    consume s;
+
+type Wrapped = Mk(Binary{8});
+
+impl Wrapped {
+    fn unwrap(w: Wrapped) => Binary{8} = match w { Mk(b) => b };
+};

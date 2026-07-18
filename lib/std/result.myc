@@ -1,0 +1,46 @@
+// nodule: std.result
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-23
+// @updated: 2026-06-23
+// @summary: The first self-hosted generic stdlib nodule — Result<A,E> plus combinators is_ok, is_err, unwrap_or, map, and_then, fold. M-649. Guarantee: Declared (type-level contract; differential agreement Empirical). Never-silent (G2): unwrap_or takes a caller-supplied fallback — no panic, no sentinel. HOF combinators map/and_then/fold are present and executable (RFC-0024 static defunctionalization, M-685/686/687): Declared type-level contract; differential agreement Empirical (three-way L1-eval ≡ L0-interp ≡ AOT, M-688).
+nodule std.result;
+
+type Result[A, E] = Ok(A) | Err(E);
+
+fn is_ok[A, E](r: Result[A, E]) => Bool =
+  match r { Ok(_) => True, Err(_) => False };
+
+fn is_err[A, E](r: Result[A, E]) => Bool =
+  match r { Ok(_) => False, Err(_) => True };
+
+fn unwrap_or[A, E](r: Result[A, E], fallback: A) => A =
+  match r { Ok(x) => x, Err(_) => fallback };
+
+// map: apply `f` to the success value; an Err passes through untouched. Why: lift a pure A -> B
+// transform over a Result without forcing the caller to match — never-silent (Err is preserved).
+fn map[A, B, E](r: Result[A, E], f: A => B) => Result[B, E] =
+  match r { Ok(x) => Ok(f(x)), Err(e) => Err(e) };
+
+// and_then: chain a Result-returning step on success; an Err short-circuits. Why: sequence
+// fallible steps without nesting matches — the monadic bind for Result.
+fn and_then[A, B, E](r: Result[A, E], f: A => Result[B, E]) => Result[B, E] =
+  match r { Ok(x) => f(x), Err(e) => Err(e) };
+
+// fold: eliminate a Result into one B via on_ok/on_err — the catamorphism (two single-arg fns,
+// so no multi-arg arrow needed). Why: collapse both cases to a common type, total + never-silent.
+fn fold[A, E, B](r: Result[A, E], on_ok: A => B, on_err: E => B) => B =
+  match r { Ok(x) => on_ok(x), Err(e) => on_err(e) };
+
+// map_err: transform the error; an Ok passes through untouched. The mirror of `map` on the Err
+// side — re-type or enrich an error without disturbing the success path (never-silent: Ok is
+// preserved). Declared.
+fn map_err[A, E, F](r: Result[A, E], f: E => F) => Result[A, F] =
+  match r { Ok(x) => Ok(x), Err(e) => Err(f(e)) };
+
+// or_else: keep an Ok; on Err, run a recovery step that may itself fail. The Err-side bind — the
+// dual of `and_then` (which binds on Ok). Why: sequence fallback/recovery without nesting matches,
+// the error stays explicit (never-silent, G2). Declared.
+fn or_else[A, E](r: Result[A, E], f: E => Result[A, E]) => Result[A, E] =
+  match r { Ok(x) => Ok(x), Err(e) => f(e) };

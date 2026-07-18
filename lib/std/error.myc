@@ -1,0 +1,187 @@
+// nodule: std.error
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted errors-as-values ergonomics layer over Result<A,E>/Option<A> — propagate,
+nodule std.error;
+
+// recover, or re-propagate, never drop (M-931, E29-1, RFC-0031 §5 D5; kickoff opp; ports the
+// EXPRESSIBLE surface of crates/mycelium-std-error; docs/spec/stdlib/error.md).
+// ── Surface-check (D5 row 1, Empirical, 2026-07-02) ─────────────────────────────────────────────
+//
+// crates/mycelium-std-error's public surface has 21 ops (guarantee_matrix::MATRIX, minus the
+// recover-bridge row) + the RFC-0014 `recover` bridge (a re-export of `std.recover`, M-520).
+// Checked against today's `.myc` surface (parser/checker in crates/mycelium-l1/src):
+//
+// PORTED (15 ops, all below): map, map_err, and_then, or_else, filter, inspect, inspect_err,
+// ok_or, ok_or_else, ok, flatten, unwrap_or, unwrap_or_else, unwrap_or_option,
+// unwrap_or_else_option.
+//
+// FLAGGED — NOT expressible today, no enabler landed (never forced, VR-5/G2):
+// - FLAG-error-1 (`unwrap` / `expect` / `unwrap_err`): these are Rust-side PARTIAL ops that
+//   "refuse loudly" (panic with a `RefusalRecord` diagnostic) on the wrong variant. `.myc` match
+//   arms must be **checker-verified exhaustive** (Maranget usefulness, W7 —
+//   crates/mycelium-l1/src/checkty.rs "non-exhaustive match" / decision.rs "a verified-exhaustive
+//   match never produces a reachable Fail") and there is no host `panic`/`trap`/diagnostic-refusal
+//   primitive exposed to `.myc` fn bodies. A deliberate, loud, non-Option/Result-returning failure
+//   from a total function cannot be expressed without such a primitive. This exactly matches the
+//   spec's own open question (`docs/spec/stdlib/error.md` §7-Q3): "the exact failure mechanism
+//   ... crosses into M-510/M-520 territory" — co-design the mechanism there, then port these three.
+// - FLAG-error-2 (`recover` — the RFC-0014 bridge): re-exports `mycelium_std_recover::{Outcome,
+//   Resolution, RecoverOutcome, handle_classified}` and takes a `mycelium_core::PolicyRef` (a
+//   Rust-kernel-only type, re-exported verbatim by `mycelium-std-error`'s own `lib.rs` — no `.myc`
+//   value-level `PolicyRef` exists; R2-vocab/D1-boundary item). Its target, `std.recover`, has NOT
+//   yet been ported to `.myc` (M-930, sibling task under this same kickoff — `lib/std/recover.myc`
+//   does not exist at the time of this port). Porting the bridge before both its type (`PolicyRef`)
+//   and its target (`std.recover`) land would be a hollow stub, not a real port — FLAGGED back to
+//   the M-930/enb tracking instead of forced here.
+// - FLAG-error-3 (`transpose`, `zip`) — DISCOVERED DURING THIS PORT (2026-07-02), not a pre-known
+//   gap: the v0 checker refuses a function that reuses ONE of its own declared type parameters at
+//   two different **instantiation depths** of the same polymorphic sum type within one body — e.g.
+//   `transpose[A,E](o: Option[Result[A,E]]) => Result[Option[A],E]` matches `Result[A,E]`'s `Ok`
+//   (instantiated at `A`) while constructing `Result[Option[A],E]`'s `Ok` (instantiated at
+//   `Option[A]`) in the SAME function. Reproduced minimally (both directly on `myc-check` and via
+//   `cargo test -p mycelium-l1`):
+//     `check-error: check error in <fn>: constructor <Ctor> field: type parameter A would have
+//      to be both Option<A> and A — an ambiguous instantiation, not a guess (RFC-0007 §11.3)`
+//   `zip[A,B](a: Option[A], b: Option[B]) => Option[Pair[A,B]]` hits the identical error on
+//   `Option`'s own reuse (`A` vs `Pair<A,B>`). Contrast: `map[A,B,E]` ALSO reuses its declared
+//   type params across two instantiations of `Result` (`Result[A,E]` in, `Result[B,E]` out) and
+//   type-checks fine — the distinguishing factor is that `map`'s two instantiations use two
+//   DISTINCT declared parameters (`A`, `B`), never the SAME parameter nested inside itself
+//   (`A` vs `Option[A]`). `flatten[A,E](r: Result[Result[A,E],E]) => Result[A,E]` type-checks fine
+//   for the converse reason: its `Ok`/`Err` constructions never re-wrap at a different depth (the
+//   `Ok(inner)` arm returns the ALREADY-Result-typed `inner` directly, no new instantiation). This
+//   is a genuine, RFC-0007-§11.3-cited v0-checker limitation, not a workaround-able syntax issue —
+//   confirmed by testing four independent restructurings (nested match, `let`-bound intermediate,
+//   and a `map`-based composition, which hits a SEPARATE "generic HOF arg" refusal per RFC-0024
+//   §5) before flagging. Filed for `enb`/a future checker-generality wave, not forced here.
+//
+// SUBSTITUTIONS made honestly (never a silent signature change — VR-5/G2):
+// - `Result[A,E]`/`Option[A]` are **redeclared locally**, not `use`d from std.result/std.option.
+//   The port harness (crates/mycelium-l1/tests/harness/mod.rs, M-925) checks exactly one `Nodule`
+//   per program (`check_nodule(&Nodule)` — crates/mycelium-l1/src/checkty.rs); a program built
+//   from a single `include_str!`'d nodule has no second nodule for a cross-nodule `use std.result.*;`
+//   (M-662) to resolve against. This mirrors std.fmt.myc's own self-containment note (there:
+//   worktree isolation; here: the single-nodule harness) — same resolution, same shape as the
+//   landed std.result/std.option (KC-3: not a new type, a mirror of an existing one).
+// - `Unit` stands in for `.myc`'s missing native nullary-function-type surface form: `BaseType::Fn`
+//   (crates/mycelium-l1/src/ast.rs) always requires a non-empty domain type — HOF stage 1
+//   (RFC-0024 §3) has no `() => T` closure type. `ok_or_else`/`unwrap_or_else_option`'s
+//   lazily-computed error/default take `Unit => …` instead of a true nullary closure; laziness is
+//   preserved (only the taken match arm's expression is evaluated), only the call-site ergonomics
+//   change (the caller passes an explicit `Unit` token). **Since DN-137/M-1102, `Unit` is the
+//   built-in PRELUDE type** (a hand-seeded `type Unit = Unit;`, `checkty::unit_prelude` — the
+//   arity-0 M-826 product-family member) — the local nullary-marker redeclaration this file used
+//   to carry (`type Unit = U;`) is gone; it would now collide with the prelude ("duplicate type
+//   declaration"). The HOF-domain substitution itself is unchanged (still not a true nullary
+//   closure type — that residual is untouched by DN-137), only its type is now native rather than
+//   a local stand-in.
+//
+// Never-silent floor (C1/I1) carried over intact: every ported op either transforms the sum (the
+// error/absence survives in the result), re-propagates it, or explicitly recovers it with an
+// honest tag (never upgraded — VR-5). No ported op silently drops an `Err`/`None`.
+// Result/Option — local mirrors of std.result/std.option (see the self-containment note above).
+type Result[A, E] = Ok(A) | Err(E);
+
+type Option[A] = Some(A) | None;
+
+// ── transform (keep the sum shape; never collapse an error away) ───────────────────────────────
+//
+// map/map_err/and_then/or_else duplicate std.result's landed combinators of the same name (see
+// the self-containment note above) — same semantics, same guarantee (Declared: type-level
+// contract; differential agreement Empirical, std_error.rs), carried at the SAME strength (VR-5).
+// map: apply `f` to the success value; an Err passes through untouched (error preserved in sum).
+fn map[A, B, E](r: Result[A, E], f: A => B) => Result[B, E] =
+  match r { Ok(x) => Ok(f(x)), Err(e) => Err(e) };
+
+// map_err: transform the error; an Ok passes through untouched (the Err-side mirror of map).
+fn map_err[A, E, F](r: Result[A, E], f: E => F) => Result[A, F] =
+  match r { Ok(x) => Ok(x), Err(e) => Err(f(e)) };
+
+// and_then: monadic bind — apply `f` to the success value; an Err short-circuits and propagates
+// (never dropped).
+fn and_then[A, B, E](r: Result[A, E], f: A => Result[B, E]) => Result[B, E] =
+  match r { Ok(x) => f(x), Err(e) => Err(e) };
+
+// or_else: explicit recovery hook — apply `f` to the error; an Ok passes through. `f` must yield
+// a Result (recover or re-propagate — never a drop).
+fn or_else[A, E](r: Result[A, E], f: E => Result[A, E]) => Result[A, E] =
+  match r { Ok(x) => Ok(x), Err(e) => f(e) };
+
+// filter: Some(x) where predicate(x) is False becomes None — a typed transition (named absence),
+// not a silent loss (I1/C1).
+fn filter[A](o: Option[A], predicate: A => Bool) => Option[A] =
+  match o { Some(x) => match predicate(x) { True => Some(x), False => None }, None => None };
+
+// inspect: peek the Ok side; the value and sum shape are unchanged. `.myc` closures carry no
+// declared-effect annotations in HOF stage 1 (RFC-0024 §3) — unlike the Rust crate's
+// `FnOnce(&T)`, `f`'s return value is computed and then discarded (never observed further), so
+// this combinator is honestly a structural peek, not an effect-tracked one (no RFC-0016 C6
+// obligation to discharge since `.myc` has no closure-effect surface yet — captured, not faked).
+fn inspect[A, E, B](r: Result[A, E], f: A => B) => Result[A, E] =
+  match r {
+    Ok(x) =>
+      let peeked = f(x) in
+      Ok(x),
+    Err(e) => Err(e)
+  };
+
+// inspect_err: peek the Err side; the value and propagation are unchanged (mirror of inspect).
+fn inspect_err[A, E, B](r: Result[A, E], f: E => B) => Result[A, E] =
+  match r {
+    Ok(x) => Ok(x),
+    Err(e) =>
+      let peeked = f(e) in
+      Err(e)
+  };
+
+// ── convert between Option and Result (no information lost silently) ───────────────────────────
+// ok_or: None becomes Err(err) — names the absence explicitly (never a silent drop).
+fn ok_or[A, E](o: Option[A], err: E) => Result[A, E] =
+  match o { Some(x) => Ok(x), None => Err(err) };
+
+// ok_or_else: None becomes Err(f(Unit)) — a lazily-computed error (see the Unit substitution note
+// above; f is only invoked on the None arm, so laziness is preserved).
+fn ok_or_else[A, E](o: Option[A], f: Unit => E) => Result[A, E] =
+  match o { Some(x) => Ok(x), None => Err(f(Unit)) };
+
+// ok: Result -> Option. FLAGGED LOSSY CONVERSION (spec §7-Q2/C3): the one op in this surface that
+// discards `E` (Err -> None). C1-honest only because it is an explicitly-named, EXPLAIN-able lossy
+// conversion (this doc comment), never an unflagged drop. Whether it should be gated behind an
+// unmissable name (e.g. ok_discarding_err) awaits RFC-0016 §8-Q3 ratification (spec FLAG Q2,
+// carried over unresolved — not this port's call to make).
+fn ok[A, E](r: Result[A, E]) => Option[A] =
+  match r { Ok(x) => Some(x), Err(e) => None };
+
+// flatten: collapse a nested Result; the inner Err propagates to the outer — no wrapping is
+// discarded silently.
+fn flatten[A, E](r: Result[Result[A, E], E]) => Result[A, E] =
+  match r { Ok(inner) => inner, Err(e) => Err(e) };
+
+// (transpose, zip: FLAG-error-3 above — a v0-checker instantiation-depth limitation, not forced.)
+// ── defaulted accessors (recover with an HONEST Declared tag — never fabricate a guarantee) ────
+//
+// unwrap_or/unwrap_or_else duplicate std.result's landed combinators of the same name (Result
+// side); unwrap_or_option/unwrap_or_else_option duplicate std.option's `unwrap_or`/generalize it
+// with a lazy default (Option side) — see the self-containment note above. Guarantee: Declared
+// (RFC-0014 I2/VR-5 — the substituted default is asserted, not proven; downgrade is the rule).
+// Never-silent (I1/C1): the caller supplies the default/closure explicitly — no panic, no sentinel.
+// unwrap_or: the success value, else the caller-supplied fallback.
+fn unwrap_or[A, E](r: Result[A, E], fallback: A) => A =
+  match r { Ok(x) => x, Err(e) => fallback };
+
+// unwrap_or_else: the success value, else a computed fallback from the error.
+fn unwrap_or_else[A, E](r: Result[A, E], f: E => A) => A =
+  match r { Ok(x) => x, Err(e) => f(e) };
+
+// unwrap_or_option: the held value, else the caller-supplied fallback (Option variant).
+fn unwrap_or_option[A](o: Option[A], fallback: A) => A =
+  match o { Some(x) => x, None => fallback };
+
+// unwrap_or_else_option: the held value, else a computed fallback (see the Unit substitution note
+// above; f is only invoked on the None arm).
+fn unwrap_or_else_option[A](o: Option[A], f: Unit => A) => A =
+  match o { Some(x) => x, None => f(Unit) };

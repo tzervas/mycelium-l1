@@ -1,0 +1,5 @@
+// exercises: spore (reconstruction-manifest) construction
+nodule memory;
+
+fn save(v: Dense{4, F32}) => Spore =
+    spore(v);

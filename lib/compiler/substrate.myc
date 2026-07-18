@@ -1,0 +1,330 @@
+// nodule: compiler.substrate
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-06
+// @updated: 2026-07-06
+// @summary: Self-hosted port of the `Substrate` v0 value form's DETERMINISTIC surface (M-740
+//   Stage 4; DN-26 §7.3 row 4). A deliberately NARROWED port of
+//   crates/mycelium-l1/src/substrate.rs — the shared-across-clone atomic-CAS use-once backstop
+//   has no pure-value analog (FLAG-substrate-1 below); everything else (provenance, explain,
+//   the consume-once transition along one threaded value, release, error/event formatting) is
+//   ported.
+nodule compiler.substrate;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 4). `crates/mycelium-l1/src/substrate.rs` stays the trusted
+// differential oracle (DN-26 §7.4) — this file is checked against it by
+// `crates/mycelium-l1/tests/compiler_stage4_substrate.rs` (a unit differential over small
+// synthetic inputs, args-in/verdict-out, the compiler_stage2.rs/compiler_stage3.rs one-eval
+// economy pattern — NOT a corpus sweep, since `substrate.rs` is a runtime value-form module with
+// no source-text grammar to sweep).
+//
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE CENTRAL HAZARD (FLAG-substrate-1) — the shared-across-clone atomic CAS backstop is NOT,
+// and CANNOT be, a pure-value port.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// The Rust `SubstrateHandle` carries `consumed: Arc<AtomicBool>` — a flag SHARED across every
+// `Clone` of one identity, flipped via `compare_exchange`. That is what makes `try_consume` a
+// real runtime BACKSTOP for the closure/loop-body multiplicity gap the static affine pass cannot
+// see (`crate::affine`'s own documented limitation): consuming ANY clone of a handle is visible
+// through EVERY clone, because they all share one `Arc<AtomicBool>` cell.
+//
+// Mycelium's value semantics have no shared interior mutability and no process-global mutable
+// counter (KC-3; this is the same reasoning ADR-003 gives for why identity is not content). A
+// `.myc` value type can only carry a plain `consumed: Bool` FIELD, and every "clone" of that
+// value (a `let`-binding, an argument pass, a whole-value pattern binder) copies the field, not a
+// shared cell. So THIS port's `try_consume` can only enforce consume-once along a SINGLE
+// threaded value — exactly the "well-typed program never calls try_consume twice on the same
+// binding" guarantee the PRIMARY static affine pass already gives — but it CANNOT catch the
+// specific gap the Rust runtime backstop exists for (a second alias of the same identity, e.g. a
+// stale clone captured before the consuming one, calling `try_consume` again and expecting to
+// observe the other alias's consumption). That gap is real, honest, and NOT faked here: a `.myc`
+// program that (somehow) held two separate `SubstrateHandle` VALUES claiming the same `id` would
+// see each one's OWN `consumed` field independently — there is no shared cell to make the second
+// alias's `try_consume` fail. This is a genuine, structural limitation of porting a runtime
+// handle into a value language, not an oversight — reported up (not this leaf's call to resolve;
+// DN-71/M-903's own docs already name the static-pass-is-primary framing this port leans on).
+//
+// Everything else in DN-71 Model S's DETERMINISTIC surface — provenance, identity, `explain`,
+// the Live -> Consumed / Live -> Released terminal transitions along one threaded value, and the
+// error/event data — has a faithful, honest pure-value analog, ported below.
+//
+// Further narrowings (each deliberate, documented — VR-5/G2 — never silent):
+//
+// FLAG-substrate-2 (id assignment — explicit threading, not a process-global counter). Rust mints
+// `id` from a `static NEXT_HANDLE_ID: AtomicU64`. A value language has no mutable global state, so
+// `acquire` here takes an explicit `next_id: Binary{32}` SEED and returns `Pair[SubstrateHandle,
+// Binary{32}]` — the minted handle plus the incremented next-id the caller threads into its NEXT
+// `acquire` call. This preserves the oracle's real invariant (every `acquire` mints a fresh,
+// distinct identity) while making the threading honest and visible rather than hidden behind
+// interior mutability. The differential gate (`compiler_stage4_substrate.rs`) reads the REAL
+// oracle-assigned id back from a live `SubstrateHandle::acquire` call and feeds that exact value
+// in as `next_id`, so both sides always compare the SAME concrete identity — the differential
+// never asserts anything about the Rust-side global counter's OWN numbering scheme (out of scope;
+// that scheme is itself process-global mutable state, not part of the deterministic surface).
+//
+// FLAG-substrate-3 (id width — Binary{32}, not Binary{64}). Rust's `id: u64`. This port narrows to
+// `Binary{32}` (ample headroom for any realistic differential input — a handful of acquisitions
+// per test run) rather than hand-writing 64-bit literals throughout; a full `Binary{64}` port is
+// straightforward future work (widen every literal/field), not done here to keep this leaf small.
+// The differential casts the oracle's `u64` id down to `u32` before comparing (never silently —
+// the cast is visible in the test file, and only ever applied to small in-test-run id values).
+//
+// FLAG-substrate-4 (`ReleaseEvent`/`SubstrateError::Display` prose — ASCII-safe, NOT byte-
+// identical to the Rust `Display` impls). The real `Display` prose for both types embeds an em
+// dash ("—") and a section sign ("§"), non-ASCII UTF-8 text this leaf did not want to risk
+// depending on undertested `.myc` string-literal lexing for (untested territory — every existing
+// `.myc` string literal in this codebase is ASCII-only). `re_display`/`se_display` below port an
+// ASCII-only, structurally-equivalent rendering (same fields, same order, shorter surrounding
+// prose). The differential gate compares these against a Rust-side MIRROR function using the
+// SAME simplified template — NOT the live `Display` impl — which is exactly the "hash/tag or
+// classification code" allowance the task brief itself sanctions for string outputs. `explain`
+// below is NOT narrowed this way: its Rust format string is already pure ASCII, so it is ported
+// byte-for-byte and the differential compares it directly against the live oracle's `.explain()`.
+//
+// FLAG-substrate-5 (self-contained — no cross-nodule `use`; the token.myc FLAG-token-4 / M-982
+// convention). `Option`/`Result`/`Vec`/`Pair` are redeclared locally; `Bool`/`True`/`False` are
+// the checker's own built-in type (no redeclaration needed or possible, per every sibling nodule's
+// own usage of bare `Bool`/`True`/`False`).
+//
+// FLAG-substrate-6 (`release`'s signature matches the Rust oracle exactly — `Option[ReleaseEvent]`
+// only, no returned handle). Combined with FLAG-substrate-1's value-semantics framing: calling
+// `release(h, site)` does not, and cannot, update the CALLER's own `h` binding (value semantics —
+// `h` is unchanged by any function call over it). A caller who calls `release(h, site)` and later
+// re-inspects the ORIGINAL `h` will still see its ORIGINAL `consumed` field, never the released
+// state — this mirrors the Rust method's own return type exactly (`Option<ReleaseEvent>`, not
+// `Self`), so it is not a new divergence, just worth stating plainly (G2: no silent surprise).
+//
+// Porting-idiom notes (Mycelium checker/evaluator constraints, not semantic narrowings vs Rust):
+// every `match` below is exactly one constructor level deep (M-980/split-match); the one
+// list-accumulating loop (`itoa_acc`, digit-count-bounded, at most ~10 iterations for a
+// `Binary{32}` decimal expansion) is written as a direct-tail accumulator per the M-985 idiom —
+// it needs NO trailing `rev_acc` reversal, because each successively-computed digit is MORE
+// significant than the last and is `Cons`ed onto the FRONT of the accumulator, so the final list
+// already reads most-significant-digit-first (worked example in `itoa_acc`'s own comment below);
+// every empty-list seed is explicitly ascribed (`Nil : Vec[Bytes]`, never bare `Nil`).
+
+// ── Option / Result / Vec / Pair (local; no cross-nodule import — FLAG-substrate-5) ─────────────
+type Option[A] = Some(A) | None;
+type Result[A, E] = Ok(A) | Err(E);
+type Vec[A] = Nil | Cons(A, Vec[A]);
+type Pair[A, B] = Pr(A, B);
+
+// ── empty_bytes (the lex.myc / nodule.myc construction: a zero-width slice of a 1-byte literal) ─
+fn empty_bytes() => Bytes =
+  bytes_slice(0x00, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000);
+
+// ── digit_bytes / itoa (decimal formatting — NOT ported from Rust; hand-written here because
+// this port needs to embed `id: Binary{32}` as decimal text in `explain`/`re_display`/
+// `se_display`, and no decimal-formatting helper exists anywhere in the corpus yet — see
+// ast.myc's own FLAG-ast-7, which explicitly punted on this for the same reason. Built from
+// `div_u`/`rem_u`/`eq`/`add_u` only (no `mul` prim is needed for base-10 extraction). Its own
+// correctness is exercised indirectly by every `explain`/`re_display`/`se_display` differential
+// case below (each embeds a real id value).
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+// digit_bytes: map a single decimal digit (0..9, as a Binary{32} value) to its one-byte ASCII
+// text (a literal `Bytes` — "0".."9"). Out-of-range (>9) never-silently falls to "?" (G2) —
+// unreachable from `itoa_acc`'s own `rem_u(_, 10)` call, whose result is always in 0..9, but the
+// fallback is explicit rather than assumed.
+fn digit_bytes(d: Binary{32}) => Bytes =
+  match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+    0b1 => "0",
+    _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0001) {
+      0b1 => "1",
+      _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0010) {
+        0b1 => "2",
+        _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0011) {
+          0b1 => "3",
+          _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0100) {
+            0b1 => "4",
+            _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0101) {
+              0b1 => "5",
+              _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0110) {
+                0b1 => "6",
+                _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_0111) {
+                  0b1 => "7",
+                  _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_1000) {
+                    0b1 => "8",
+                    _ => match eq(d, 0b0000_0000_0000_0000_0000_0000_0000_1001) {
+                      0b1 => "9",
+                      _ => "?"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+// itoa_acc: peel decimal digits off `n` from LEAST significant to MOST significant, `Cons`ing
+// each newly-computed (and therefore MORE significant) digit onto the FRONT of `acc`. Direct
+// tail call (M-985 idiom), bounded by the decimal digit count of a `Binary{32}` value (at most
+// 10 iterations — 4,294,967,295 has 10 digits) — nowhere near the depth budget even unelided.
+//
+// Worked example, n = 123: iter 1 -> rem=3, acc=[3];  n=12
+//                          iter 2 -> rem=2, acc=[2,3]; n=1
+//                          iter 3 -> rem=1, acc=[1,2,3]; n=0, stop.
+// acc is already MOST-significant-digit-first ([1,2,3] = "123") — no `rev_acc` needed: each digit
+// `Cons`ed later is MORE significant, so front-insertion naturally produces place-value order.
+fn itoa_acc(n: Binary{32}, acc: Vec[Bytes]) => Vec[Bytes] =
+  match eq(n, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+    0b1 => acc,
+    _ => itoa_acc(
+           div_u(n, 0b0000_0000_0000_0000_0000_0000_0000_1010),
+           Cons(digit_bytes(rem_u(n, 0b0000_0000_0000_0000_0000_0000_0000_1010)), acc)
+         )
+  };
+
+// concat_bytes_list: join a Vec[Bytes] in order. Non-tail, bounded by the same small digit-count
+// (the join_segs / ast.myc precedent for a non-tail recursion bounded by a handful of items, not
+// source length).
+fn concat_bytes_list(xs: Vec[Bytes]) => Bytes =
+  match xs {
+    Nil => empty_bytes(),
+    Cons(h, rest) => bytes_concat(h, concat_bytes_list(rest))
+  };
+
+// itoa: the decimal ASCII text of a non-negative Binary{32} value ("0" for zero; no leading zero
+// otherwise, matching Rust's `{}` Display for an unsigned integer).
+fn itoa(n: Binary{32}) => Bytes =
+  match eq(n, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+    0b1 => "0",
+    _ => concat_bytes_list(itoa_acc(n, Nil : Vec[Bytes]))
+  };
+
+// ── SubstrateProvenance (mirrors substrate.rs::SubstrateProvenance) ─────────────────────────────
+// Prov(acquired_via, site) — the acquiring op + a free-form human-readable acquisition site,
+// carried verbatim (never interpreted), per the Rust doc comment.
+type SubstrateProvenance = Prov(Bytes, Bytes);
+
+fn prov_acquired_via(p: SubstrateProvenance) => Bytes =
+  match p { Prov(a, _) => a };
+
+fn prov_site(p: SubstrateProvenance) => Bytes =
+  match p { Prov(_, s) => s };
+
+fn prov_new(acquired_via: Bytes, site: Bytes) => SubstrateProvenance =
+  Prov(acquired_via, site);
+
+// ── SubstrateHandle (mirrors substrate.rs::SubstrateHandle's DETERMINISTIC fields only) ─────────
+// SH(tag, id, provenance, consumed) — FLAG-substrate-1: `consumed` here is a plain per-value
+// `Bool`, NOT a cell shared across aliases (that is the whole hazard this file's header FLAGs).
+type SubstrateHandle = SH(Bytes, Binary{32}, SubstrateProvenance, Bool);
+
+fn sh_tag(h: SubstrateHandle) => Bytes =
+  match h { SH(t, _, _, _) => t };
+
+fn sh_id(h: SubstrateHandle) => Binary{32} =
+  match h { SH(_, i, _, _) => i };
+
+fn sh_provenance(h: SubstrateHandle) => SubstrateProvenance =
+  match h { SH(_, _, p, _) => p };
+
+fn sh_is_consumed(h: SubstrateHandle) => Bool =
+  match h { SH(_, _, _, c) => c };
+
+// sh_eq: identity equality (mirrors substrate.rs::PartialEq for SubstrateHandle — "two handles
+// are the same resource iff their ids are equal"; `provenance` is invariant per id and `consumed`
+// is state over an identity, not part of it, exactly as the Rust doc comment reasons).
+fn sh_eq(a: SubstrateHandle, b: SubstrateHandle) => Bool =
+  match eq(sh_id(a), sh_id(b)) { 0b1 => True, _ => False };
+
+// acquire: mint a fresh Live handle (mirrors substrate.rs::SubstrateHandle::acquire) — see
+// FLAG-substrate-2 for the explicit next_id threading this value-language port requires in place
+// of a process-global atomic counter. Returns the minted handle paired with the next-id to use
+// for a SUBSEQUENT acquisition (mirrors the oracle's real invariant: every acquire mints a fresh,
+// distinct identity).
+fn acquire(tag: Bytes, provenance: SubstrateProvenance, next_id: Binary{32}) => Pair[SubstrateHandle, Binary{32}] =
+  Pr(SH(tag, next_id, provenance, False), add_u(next_id, 0b0000_0000_0000_0000_0000_0000_0000_0001));
+
+fn acquired_handle(p: Pair[SubstrateHandle, Binary{32}]) => SubstrateHandle =
+  match p { Pr(h, _) => h };
+
+fn acquired_next_id(p: Pair[SubstrateHandle, Binary{32}]) => Binary{32} =
+  match p { Pr(_, n) => n };
+
+// explain: a never-silent, one-line EXPLAIN description (house rule 2 — no black boxes; mirrors
+// substrate.rs::SubstrateHandle::explain BYTE-FOR-BYTE — its Rust format string is pure ASCII, so
+// no FLAG-substrate-4 narrowing applies here).
+fn explain(h: SubstrateHandle) => Bytes =
+  let a = bytes_concat("Substrate{", sh_tag(h)) in
+  let b = bytes_concat(a, "} #") in
+  let c = bytes_concat(b, itoa(sh_id(h))) in
+  let d = bytes_concat(c, " acquired via `") in
+  let e = bytes_concat(d, prov_acquired_via(sh_provenance(h))) in
+  let f = bytes_concat(e, "` at ") in
+  bytes_concat(f, prov_site(sh_provenance(h)));
+
+// ── SubstrateError (mirrors substrate.rs::SubstrateError) ──────────────────────────────────────
+// AlreadyConsumed(tag, id) — the runtime use-once backstop tripping ALONG ONE THREADED VALUE
+// (FLAG-substrate-1: not across aliases, unlike the Rust oracle's shared-Arc backstop).
+type SubstrateError = AlreadyConsumed(Bytes, Binary{32});
+
+fn se_tag(e: SubstrateError) => Bytes =
+  match e { AlreadyConsumed(t, _) => t };
+
+fn se_id(e: SubstrateError) => Binary{32} =
+  match e { AlreadyConsumed(_, i) => i };
+
+// se_display: an ASCII-safe structural mirror of substrate.rs::SubstrateError's Display impl —
+// FLAG-substrate-4 (the real Display prose uses an em dash; ported here as an ASCII-only
+// equivalent carrying the SAME two fields in the SAME order — only structural/field content is
+// differential-tested, against a matching Rust-side mirror function, not the live Display impl).
+fn se_display(e: SubstrateError) => Bytes =
+  let a = bytes_concat("double-consume: Substrate{", se_tag(e)) in
+  let b = bytes_concat(a, "} #") in
+  let c = bytes_concat(b, itoa(se_id(e))) in
+  bytes_concat(c, " was already consumed");
+
+// ── try_consume (mirrors substrate.rs::SubstrateHandle::try_consume's Live -> Consumed move) ────
+// `Ok` on a Live handle: the checked move, returning the SAME identity now marked consumed.
+// `Err(AlreadyConsumed)` if `h` was already consumed. FLAG-substrate-1: this is checked ALONG
+// `h`'s OWN `consumed` field only — the primary enforcement is still the static affine pass
+// (this file does not, and cannot, implement that pass); this is the value-language analog of
+// the Rust runtime backstop, narrower exactly as the header FLAG explains.
+fn try_consume(h: SubstrateHandle) => Result[SubstrateHandle, SubstrateError] =
+  match sh_is_consumed(h) {
+    True => Err(AlreadyConsumed(sh_tag(h), sh_id(h))),
+    False => Ok(SH(sh_tag(h), sh_id(h), sh_provenance(h), True))
+  };
+
+// ── ReleaseEvent (mirrors substrate.rs::ReleaseEvent) ───────────────────────────────────────────
+// RE(tag, id, site) — a recorded scope-exit release; produced only for a Live handle (never
+// fabricated for one already consumed/released — G2).
+type ReleaseEvent = RE(Bytes, Binary{32}, Bytes);
+
+fn re_tag(e: ReleaseEvent) => Bytes =
+  match e { RE(t, _, _) => t };
+
+fn re_id(e: ReleaseEvent) => Binary{32} =
+  match e { RE(_, i, _) => i };
+
+fn re_site(e: ReleaseEvent) => Bytes =
+  match e { RE(_, _, s) => s };
+
+// re_display: an ASCII-safe structural mirror of substrate.rs::ReleaseEvent's Display impl —
+// FLAG-substrate-4 (same allowance as se_display above: same three fields, same order, shorter
+// ASCII-only prose; differential-tested against a matching Rust-side mirror, not the live Display).
+fn re_display(e: ReleaseEvent) => Bytes =
+  let a = bytes_concat("released: Substrate{", re_tag(e)) in
+  let b = bytes_concat(a, "} #") in
+  let c = bytes_concat(b, itoa(re_id(e))) in
+  let d = bytes_concat(c, " released at scope exit (") in
+  let f = bytes_concat(d, re_site(e)) in
+  bytes_concat(f, ")");
+
+// ── release (mirrors substrate.rs::SubstrateHandle::release's Live -> terminal transition) ──────
+// `Some(ReleaseEvent)` on a Live `h` (the FIRST terminal transition — never a duplicate/fabricated
+// event, G2). `None` if `h` was already terminal (already try_consume'd — FLAG-substrate-1's own
+// framing: "already terminal" is judged by `h`'s OWN field, not a shared cell). FLAG-substrate-6:
+// this returns `Option[ReleaseEvent]` only, exactly like the Rust oracle's own signature — it does
+// NOT return an updated handle (value semantics: the caller's own `h` binding is unaffected by
+// this call, exactly as calling ANY function over `h` leaves the caller's binding unchanged).
+fn release(h: SubstrateHandle, site: Bytes) => Option[ReleaseEvent] =
+  match sh_is_consumed(h) {
+    True => None,
+    False => Some(RE(sh_tag(h), sh_id(h), site))
+  };

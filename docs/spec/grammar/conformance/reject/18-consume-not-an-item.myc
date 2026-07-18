@@ -1,0 +1,7 @@
+// rejected: 'consume <expr>' is a DN-03 §1 surface-tier construct — an EXPRESSION (acquire + take
+// exclusive ownership of an affine Substrate; LR-8), now ACTIVE as of M-664. It lexes as a keyword
+// (never a silent identifier, G2). At ITEM position (here, top level of the nodule) it is rejected:
+// a `consume` belongs inside a `fn` body, not as a top-level item. The parser emits a teaching
+// diagnostic pointing into a fn body. ('grow' is superseded by 'derive'; see fixture 19.)
+nodule demo;
+consume worker

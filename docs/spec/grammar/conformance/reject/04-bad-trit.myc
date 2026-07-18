@@ -1,0 +1,5 @@
+// rejected: a `0t…` balanced-ternary literal carries a glyph outside {+, 0, -} (RFC-0037 D4). The
+// lexer scans only `+`/`0`/`-` after `0t`, so a leading non-trit glyph leaves the literal empty and
+// is a never-silent lex refusal (no trit glyph), never a silently-truncated literal.
+nodule bad;
+fn f() => Ternary{3} = 0tx

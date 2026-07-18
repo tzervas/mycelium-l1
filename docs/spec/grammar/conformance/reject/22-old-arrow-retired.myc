@@ -1,0 +1,6 @@
+// rejected: the function-return arrow `->` is RETIRED (RFC-0037 D4 — the arrow is now `=>`). The
+// `->` glyph still lexes (it is the operator-desugaring arrow token), so the parser gives an explicit
+// teaching refusal at the return-arrow position rather than silently accepting the old form (G2). A
+// retired surface form is never silently accepted.
+nodule bad;
+fn f(x: Binary{8}) -> Binary{8} = x

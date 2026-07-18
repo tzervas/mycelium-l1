@@ -1,0 +1,42 @@
+// exercises: operator syntax (RFC-0025 / M-705) — symbolic infix/prefix sugar that desugars to
+// canonical word functions (`a + b` -> `add(a, b)`, `-a` -> `neg(a)`), frontend-only (KC-3).
+// This corpus is a PARSE oracle: every form below parses. Resolution is a separate (never-silent,
+// G2) concern — `add`/`sub`/`mul`/`xor` (and unary `neg`/`not`) resolve to prims today; the other
+// word targets (`div`/`rem`/`band`/`bor`/`eq`/`ne`/`and`/`or`, and the M-745 set
+// `lt`/`gt`/`shl`/`shr`/`lte`/`gte`) parse here and surface an explicit "unknown function/prim"
+// refusal downstream until their stdlib/kernel prims land (M-809).
+nodule operators;
+
+// arithmetic: `*` binds tighter than `+`/`-`; binary operators are left-associative
+fn arith(a: Ternary{4}, b: Ternary{4}, c: Ternary{4}) => Ternary{4} =
+    a + b * c - a;
+
+// bitwise: `&` > `^` > `|` (Rust's table); xor resolves to a prim today
+fn bits(a: Binary{8}, b: Binary{8}, c: Binary{8}) => Binary{8} =
+    a | b ^ c & a;
+
+// prefix operators: unary `-` (neg) and `!` (not), right-associative, tighter than any binary op
+fn prefix(a: Binary{8}) => Binary{8} =
+    !a;
+
+fn negate(a: Ternary{4}) => Ternary{4} =
+    -a + a;
+
+// comparison / equality and logical operators (parse-level; word targets pending their prims)
+fn compare(a: Binary{8}, b: Binary{8}) => Binary{8} =
+    a == b && a != b || a & b;
+
+// M-745 (RFC-0025 §4.1 / RFC-0037 D1): the angle/shift glyphs freed by the bracket kind-split.
+// Shift (`<<`/`>>`, Tier 4) binds tighter than the bitwise ops; comparison (`<`/`>`, Tier 8) binds
+// looser than them and tighter than equality — so `a << b < c | d` ≡ lt(shl(a,b), bor(c,d)).
+fn shift_and_compare(a: Binary{8}, b: Binary{8}, c: Binary{8}, d: Binary{8}) => Binary{8} =
+    a << b < c | d;
+
+// `<=`/`>=` have no glyph (retired by RFC-0037 D1); the word forms `lte`/`gte` are ordinary calls
+// and stay valid everywhere (additive — words are canonical).
+fn ordered(a: Binary{8}, b: Binary{8}) => Binary{8} =
+    lte(a, b) && gte(b, a);
+
+// parentheses override precedence; the word form stays valid alongside the sugar
+fn mixed(a: Ternary{4}, b: Ternary{4}) => Ternary{4} =
+    (a + b) * add(a, b);

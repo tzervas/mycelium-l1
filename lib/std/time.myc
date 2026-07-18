@@ -1,0 +1,450 @@
+// nodule: std.time
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-09
+// @summary: Self-hosted `std.time` port (M-1021, kickoff spw / Wave-0 pilot) — the value-semantic
+nodule std.time;
+
+// time surface's EXPRESSIBLE-TODAY subset, hand-ported the M-993 differential-witnessed way from the
+// retained Rust oracle (crates/mycelium-std-time). Ported: the three typed instant kinds + Duration
+// as value ADTs, their pure bit-preserving constructors/accessors, the SIGNED Duration comparison
+// surface (faithful — the kernel surfaces two's-complement compare via `lt_s`/`eq`, uncapped), the
+// UNSIGNED instant comparison surface, the `TimeErr` discriminant, the two declared-effect newtype
+// wrappers, the deterministic `ManualClock` (value-semantic functional-update setters + its declared-
+// effect reads), and the RFC-0016 §4.5 guarantee matrix as checked data. Three-way differential
+// (L1-eval ≡ L0-interp ≡ AOT) + a live Rust-oracle differential are Empirical (std_time.rs); the
+// per-op basis tags below are carried, never upgraded in translation (VR-5).
+//
+// HONESTY BOUNDARY — what is NOT ported here and why (FLAGged → enb, never faked — G2/VR-5):
+//
+// - **Signed Duration arithmetic** (`duration_add`/`duration_sub`/`duration_scale`/`duration_as_unit`,
+//   `checked_neg`/`checked_abs`) and the **instant differences** (`mono_diff`/`wall_diff`/
+//   `logical_diff`). Rust's `Duration.nanos`/`WallInstant.nanos_since_epoch` are SIGNED `i128` with
+//   `checked_add`/`checked_sub`/`checked_mul` (signed-overflow → `Err(Overflow)`, C1/G2). The kernel's
+//   two's-complement arithmetic prim family (`add_s`/`sub_s`/`neg_s`/`mul_s`) is hard-capped at
+//   TC_MAX_WIDTH=64 (crates/mycelium-core/src/binary.rs — every 128-bit call REFUSES on the width
+//   itself, regardless of value), so a faithful Binary{128} port of the signed arithmetic is a
+//   STRUCTURAL blocker, not an edge case. `mono_diff`/`logical_diff` need `(u64 as i128) − (u64 as
+//   i128)` fidelity (two u64 can differ by ~2^64, needing ≥65-bit signed arithmetic) — same cap. The
+//   self-hosted `add_u`/`sub_u` are UNSIGNED-checked (carry/borrow boundary, not the signed boundary),
+//   so using them for signed spans would MISREPORT overflow (a C1/G2 violation). FLAG → enb: extend the
+//   TC prim family past 64 bits (multi-limb lane) OR ratify a Binary{64}-narrowed Duration via a DN.
+//   Signed *comparison* IS faithful today (`lt_s` is pure MSB-first bit-lexicographic, uncapped), so
+//   the comparison surface below IS ported.
+//
+// - **The OS clock-source floor** (`SystemClock`'s real `std::time::{Instant, SystemTime}` reads and
+//   the `ClockSource` trait object). Host FFI + trait objects + `&dyn` receivers have no value-semantic
+//   correspondence in this grammar (ADR-003), and the real OS read is out of Wave-0 scope by the
+//   crate's own FLAG §7-Q3 / M-541 (the std-sys clock floor comes later). The DETERMINISTIC injectable
+//   clock (`ManualClock`) — the half that IS pure/value-semantic — IS ported below (as a 3-field ADT
+//   with functional-update setters + declared-effect reads), which is what tests inject anyway.
+//
+// - **`ManualClock::advance_mono`/`step_logical`** (saturating). Rust uses `saturating_add` (a SILENT
+//   clamp at u64::MAX). The self-hosted `add_u` is never-silent CHECKED add (overflow → Overflow
+//   refusal). The two AGREE on the whole non-saturating domain but DIVERGE at the u64::MAX tail
+//   (Rust clamps, this refuses). Porting `advance_mono` as `add_u` would silently change the function's
+//   tail semantics, so it is left a FLAG rather than a mislabelled port (VR-5). FLAG → enb: a
+//   `saturating_add` prim (or ratify the never-silent variant as the intended semantics via a DN).
+//
+// - **Diagnostic payloads on `TimeErr`** (`ClockUnavailable{reason: &str}`, `NonMonotonic{earlier_ns,
+//   later_ns: i128}`). No string type in this grammar, and the i128 fields are the signed gap above,
+//   so `TimeErr` is ported as a plain 3-variant DISCRIMINANT (faithful for the error IDENTITY; the
+//   diagnostic detail is dropped, FLAGged → enb). `Display`/`impl_std_error!` (a `&mut Formatter`
+//   receiver + a `macro_rules!` surface) are dropped entirely — matches every existing lib/std/*.myc
+//   error type (error.myc ports no Display either).
+//
+// - **`as_inner` (`&T` borrow)** on the wrapper types — no reference surface in this value-semantic
+//   grammar; the consuming `into_inner` IS ported.
+//
+// Guarantee basis (transparency rule / VR-5), grounded in the Rust oracle's guarantee matrix
+// (crates/mycelium-std-time/src/lib.rs §10, RFC-0016 §4.5):
+// - constructors/accessors + the functional-update setters are bit-preserving/value-copying —
+//   **Exact**, total.
+// - the Duration comparison surface wraps the `eq`/`lt_s` kernel prims — **Exact** over the finite
+//   Binary{128} domain (signed two's-complement ordering, RFC-0033 §4.1.2), total; the instant
+//   comparison surface wraps `eq`/`lt` (unsigned) — **Exact** over Binary{64}.
+// - the declared-effect newtype `new`/`into_inner` and the `ManualClock` reads carry a **Declared**
+//   type-level contract (the effect is declared by the wrapper's TYPE — structural, not a theorem;
+//   matches the oracle's C6). The reads are the module's honesty crux.
+// - the guarantee-matrix ROW DATA is **Declared** (asserted, hand-transcribed — matches the oracle's
+//   own `#[cfg(test)]` structural assertions); each row's `tag` field is itself GExact/GDeclared per
+//   the oracle. Three-way differential + Rust-oracle agreement are **Empirical** (trials, std_time.rs).
+// ── §1. Error discriminant (C1/G2; payloads FLAGged — see honesty boundary above) ──────────────────
+// Every explicit failure IDENTITY from a `std.time` operation. Discriminant-only port: the Rust
+// oracle's diagnostic payloads are dropped pending a string + signed-int surface (FLAG → enb).
+// Total, finite (Exact identity).
+type TimeErr = Overflow | ClockUnavailable | NonMonotonic;
+
+// ── §2. Typed instant kinds (value-semantic; the typed cross-source distinction is structural) ─────
+// A point on the MONOTONIC clock (never-backward, no civil meaning). Rust: `nanos: u64` — genuinely
+// UNSIGNED, so `Binary{64}` is faithful. Only same-source differences are meaningful; cross-source
+// subtraction does not exist as a function (the typed distinction, spec §1) — here that is enforced by
+// there being no cross-type diff function at all.
+type MonoInstant = MonoInstant(Binary{64});
+
+// mono_from_nanos: construct from a raw nanosecond tick. Exact, total (bit-preserving).
+fn mono_from_nanos(nanos: Binary{64}) => MonoInstant =
+  MonoInstant(nanos);
+
+// mono_as_nanos: the raw nanosecond tick (canonical representation). Exact, total.
+fn mono_as_nanos(self: MonoInstant) => Binary{64} =
+  match self { MonoInstant(p0) => p0 };
+
+// A point on the RFC-0008 LOGICAL clock (a deterministic monotonic tick). Rust: `tick: u64` —
+// genuinely UNSIGNED, so `Binary{64}` is faithful. Reading surface only; advancement is runtime-owned
+// (M-521/M-356), FLAGged in the oracle.
+type LogicalInstant = LogicalInstant(Binary{64});
+
+// logical_from_tick: construct from a logical tick. Exact, total.
+fn logical_from_tick(tick: Binary{64}) => LogicalInstant =
+  LogicalInstant(tick);
+
+// logical_as_tick: the raw tick value. Exact, total.
+fn logical_as_tick(self: LogicalInstant) => Binary{64} =
+  match self { LogicalInstant(p0) => p0 };
+
+// A point on the WALL-CLOCK (civil/UTC time, an entropy source). Rust: `nanos_since_epoch: i128` —
+// SIGNED (can be negative for pre-1970 dates). Stored here as the `Binary{128}` two's-complement bit
+// pattern: the constructor/accessor are bit-preserving round-trips (Exact) that do NOT interpret the
+// sign, so they are faithful regardless of the signed-arithmetic gap above.
+type WallInstant = WallInstant(Binary{128});
+
+// wall_from_nanos_since_epoch: construct from a signed nanosecond count since the Unix epoch (stored
+// as its two's-complement bits). Exact round-trip, total.
+fn wall_from_nanos_since_epoch(nanos: Binary{128}) => WallInstant =
+  WallInstant(nanos);
+
+// wall_as_nanos_since_epoch: the raw signed nanosecond count (its two's-complement bits). Exact, total.
+fn wall_as_nanos_since_epoch(self: WallInstant) => Binary{128} =
+  match self { WallInstant(p0) => p0 };
+
+// ── §3. Duration value + signed comparison surface (C4; arithmetic FLAGged — see boundary) ─────────
+// A signed nanosecond span. Rust: `nanos: i128`, SIGNED. Stored as the `Binary{128}` two's-complement
+// bit pattern. The constructor/accessor are bit-preserving round-trips (Exact); the comparison surface
+// below uses the SIGNED kernel prims (`lt_s`/`eq`), so it is faithful to the signed ordering.
+// Arithmetic (add/sub/scale) is NOT ported — it needs signed checked-arithmetic prims (FLAG → enb).
+type Duration = Duration(Binary{128});
+
+// dur_from_nanos: construct from a signed nanosecond count (stored as two's-complement bits). Exact.
+fn dur_from_nanos(nanos: Binary{128}) => Duration =
+  Duration(nanos);
+
+// dur_as_nanos: the raw signed nanosecond count (its two's-complement bits). Exact, total.
+fn dur_as_nanos(self: Duration) => Binary{128} =
+  match self { Duration(p0) => p0 };
+
+// dur_zero: the zero span (Rust `Duration::ZERO`). Exact, total — the all-zero 128-bit pattern.
+fn dur_zero() => Duration =
+  Duration(
+    0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000
+  );
+
+// The three-valued total-order result (mirrors std.cmp::Ordering; redeclared locally — the single-
+// nodule harness has no cross-nodule import; the std.cmp/std.core self-containment convention). Total.
+type Ordering = Lt | Eq | Gt;
+
+// dur_cmp: SIGNED three-way comparison of two spans (Rust `duration_cmp`, i.e. `i128::cmp`). Exact,
+// total — `eq` is bit-identity and `lt_s` is the signed two's-complement less-than prim (RFC-0033
+// §4.1.2, uncapped). Eq if equal, Lt if a < b (signed), Gt otherwise.
+fn dur_cmp(a: Duration, b: Duration) => Ordering =
+  match eq(dur_as_nanos(a), dur_as_nanos(b)) {
+    0b1 => Eq,
+    _ => match lt_s(dur_as_nanos(a), dur_as_nanos(b)) { 0b1 => Lt, _ => Gt }
+  };
+
+// dur_eq: signed equality of two spans. Exact, total (`eq` is bit-identity, signedness-agnostic).
+fn dur_eq(a: Duration, b: Duration) => Bool =
+  match dur_cmp(a, b) { Eq => True, Lt => False, Gt => False };
+
+// dur_lt: SIGNED less-than (`a < b`). Exact, total.
+fn dur_lt(a: Duration, b: Duration) => Bool =
+  match dur_cmp(a, b) { Lt => True, Eq => False, Gt => False };
+
+// dur_le: SIGNED less-than-or-equal — projection of dur_cmp. Exact, total.
+fn dur_le(a: Duration, b: Duration) => Bool =
+  match dur_cmp(a, b) { Lt => True, Eq => True, Gt => False };
+
+// dur_is_zero: whether this span is zero (Rust `Duration::is_zero`). Exact, total.
+fn dur_is_zero(d: Duration) => Bool =
+  dur_eq(d, dur_zero());
+
+// dur_is_negative: whether this span is negative (Rust `Duration::is_negative`, i.e. `nanos < 0`).
+// Exact, total — `lt_s` against zero is the faithful signed test.
+fn dur_is_negative(d: Duration) => Bool =
+  dur_lt(d, dur_zero());
+
+// ── §3b. Instant comparison surface (UNSIGNED u64; Rust derives Ord on the tick fields) ────────────
+// mono_cmp: UNSIGNED three-way comparison of two MONOTONIC instants (Rust: derived `Ord` on `u64`).
+// Exact, total — `lt` is the unsigned less-than prim.
+fn mono_cmp(a: MonoInstant, b: MonoInstant) => Ordering =
+  match eq(mono_as_nanos(a), mono_as_nanos(b)) {
+    0b1 => Eq,
+    _ => match lt(mono_as_nanos(a), mono_as_nanos(b)) { 0b1 => Lt, _ => Gt }
+  };
+
+// logical_cmp: UNSIGNED three-way comparison of two LOGICAL instants (Rust: derived `Ord` on `u64`).
+// Exact, total.
+fn logical_cmp(a: LogicalInstant, b: LogicalInstant) => Ordering =
+  match eq(logical_as_tick(a), logical_as_tick(b)) {
+    0b1 => Eq,
+    _ => match lt(logical_as_tick(a), logical_as_tick(b)) { 0b1 => Lt, _ => Gt }
+  };
+
+// wall_cmp: SIGNED three-way comparison of two WALL instants (Rust: derived `Ord` on the `i128`
+// nanos-since-epoch). Exact, total — `lt_s` is signed.
+fn wall_cmp(a: WallInstant, b: WallInstant) => Ordering =
+  match eq(wall_as_nanos_since_epoch(a), wall_as_nanos_since_epoch(b)) {
+    0b1 => Eq,
+    _ =>
+      match lt_s(wall_as_nanos_since_epoch(a), wall_as_nanos_since_epoch(b)) {
+        0b1 => Lt,
+        _ => Gt
+      }
+  };
+
+// ── §4. Declared-effect wrapper types (C6 / RFC-0014; pure new/into_inner only) ────────────────────
+// Declared-effect wrapper for a MONOTONIC or LOGICAL clock read (effect: `time`). The wrapper's TYPE
+// is the inspectable effect declaration (RFC-0014; the oracle's C6). Only the pure `new`/`into_inner`
+// are ported (Declared type-level contract). `as_inner` (a `&T` borrow) has no value-semantic analog.
+type DeclaredTime[T] = DeclaredTime(T);
+
+// declared_time_new: wrap a value produced by an effectful, time-only read. Declared, total.
+fn declared_time_new[T](inner: T) => DeclaredTime[T] =
+  DeclaredTime(inner);
+
+// declared_time_into_inner: unwrap to the inner value. Declared, total.
+fn declared_time_into_inner[T](d: DeclaredTime[T]) => T =
+  match d { DeclaredTime(x) => x };
+
+// Declared-effect wrapper for a WALL-CLOCK read (effect: `{ time, entropy }`). The typed distinction
+// from `DeclaredTime`: a wall read is an entropy source (RT3). Only the pure `new`/`into_inner` port.
+type DeclaredTimeEntropy[T] = DeclaredTimeEntropy(T);
+
+// declared_entropy_new: wrap a wall-clock read result, naming both `time` and `entropy`. Declared.
+fn declared_entropy_new[T](inner: T) => DeclaredTimeEntropy[T] =
+  DeclaredTimeEntropy(inner);
+
+// declared_entropy_into_inner: unwrap to the inner value. Declared, total.
+fn declared_entropy_into_inner[T](d: DeclaredTimeEntropy[T]) => T =
+  match d { DeclaredTimeEntropy(x) => x };
+
+// ── §5. Deterministic ManualClock (the value-semantic half of the clock surface; C6) ───────────────
+// Rust's `ManualClock` is a mutable struct with `&mut self` setters. Hand-ported the value-semantic
+// idiom used throughout lib/std: a 3-field ADT whose "setters" are pure functions returning a NEW
+// clock (functional update). The reads return the stored value wrapped in the declared-effect type —
+// ManualClock reads are INFALLIBLE, so the Rust `Result<_, TimeErr>` wrapper (which only carries the
+// SystemClock `ClockUnavailable` case) collapses to the bare value here; the observable (the read
+// tick) is identical (FLAG note: the Result layer is a SystemClock concern, deferred with it).
+type ManualClock = ManualClock(MonoInstant, WallInstant, LogicalInstant);
+
+// manual_clock_default: the all-zero clock (Rust `ManualClock::default`; `default` is a reserved word,
+// hand-port workaround naming). Exact, total.
+fn manual_clock_default() => ManualClock =
+  ManualClock(
+    mono_from_nanos(
+      0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000
+    ),
+    wall_from_nanos_since_epoch(
+      0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000
+    ),
+    logical_from_tick(
+      0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000
+    )
+  );
+
+// manual_clock_new: construct a clock from explicit component instants. Exact, total.
+fn manual_clock_new(m: MonoInstant, w: WallInstant, l: LogicalInstant) => ManualClock =
+  ManualClock(m, w, l);
+
+// Field projections (Exact, total).
+fn manual_get_mono(c: ManualClock) => MonoInstant =
+  match c { ManualClock(m, _, _) => m };
+
+fn manual_get_wall(c: ManualClock) => WallInstant =
+  match c { ManualClock(_, w, _) => w };
+
+fn manual_get_logical(c: ManualClock) => LogicalInstant =
+  match c { ManualClock(_, _, l) => l };
+
+// manual_set_mono/set_wall/set_logical: functional-update setters (Rust `&mut self` setters, ported as
+// value-semantic new-clock returns). Exact, total.
+fn manual_set_mono(c: ManualClock, m: MonoInstant) => ManualClock =
+  match c { ManualClock(_, w, l) => ManualClock(m, w, l) };
+
+fn manual_set_wall(c: ManualClock, w: WallInstant) => ManualClock =
+  match c { ManualClock(m, _, l) => ManualClock(m, w, l) };
+
+fn manual_set_logical(c: ManualClock, l: LogicalInstant) => ManualClock =
+  match c { ManualClock(m, w, _) => ManualClock(m, w, l) };
+
+// manual_mono_now: read the MONOTONIC clock. Declares effect `time` (the wrapper type). Declared.
+fn manual_mono_now(c: ManualClock) => DeclaredTime[MonoInstant] =
+  declared_time_new(manual_get_mono(c));
+
+// manual_wall_now: read the WALL clock. Declares `{ time, entropy }` (the ENTROPY wrapper — the typed
+// distinction that structurally enforces RT2/RT3). Declared.
+fn manual_wall_now(c: ManualClock) => DeclaredTimeEntropy[WallInstant] =
+  declared_entropy_new(manual_get_wall(c));
+
+// manual_logical_now: read the LOGICAL clock. Declares effect `time` only (deterministic). Declared.
+fn manual_logical_now(c: ManualClock) => DeclaredTime[LogicalInstant] =
+  declared_time_new(manual_get_logical(c));
+
+// ── §6. Guarantee matrix (RFC-0016 §4.5 — encoded as CHECKED DATA, asserted in std_time.rs) ────────
+// The honesty crux of std.time, hand-transcribed verbatim from mycelium_std_time::GUARANTEE_MATRIX
+// (11 rows, same order). Mirrors the lib/std/core.myc precedent: a local `Guarantee` lattice mirror
+// (G-prefixed to avoid the reserved `Exact`/`Declared` strength keywords), a positional `Row(...)`
+// constructor, per-row constructor fns, a `matrix()` cons-list builder, and structural-predicate fns
+// in place of the Rust panic-on-violation `assert_matrix_invariants`. The counts these fns compute
+// (row total, Exact count, Declared count, explainable count) are driven against the LIVE Rust oracle
+// in std_time.rs — any transcription drift flips a count and fails the differential (Empirical).
+// The lattice tag Exact ⊐ Proven ⊐ Empirical ⊐ Declared (VR-5). G-prefixed (the bare names are the
+// reserved guarantee-strength type-annotation keywords). Total.
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// is_exact / is_declared: project a Guarantee tag. Total over the finite domain (Exact).
+fn is_exact(g: Guarantee) => Bool =
+  match g { GExact => True, GProven => False, GEmpirical => False, GDeclared => False };
+
+fn is_declared(g: Guarantee) => Bool =
+  match g { GDeclared => True, GExact => False, GProven => False, GEmpirical => False };
+
+// GuaranteeRow: Row(op, tag, fallibility, effects, explainable) — field-for-field mirror of
+// mycelium_std_time::GuaranteeRow. `op`/`fallibility`/`effects` are free-form prose (Bytes); `tag` is
+// the typed lattice ADT; `explainable` is Bool.
+type GuaranteeRow = Row(Bytes, Guarantee, Bytes, Bytes, Bool);
+
+// Field accessors (total, Exact).
+fn row_tag(r: GuaranteeRow) => Guarantee =
+  match r { Row(_, t, _, _, _) => t };
+
+fn row_effects(r: GuaranteeRow) => Bytes =
+  match r { Row(_, _, _, e, _) => e };
+
+fn row_explainable(r: GuaranteeRow) => Bool =
+  match r { Row(_, _, _, _, x) => x };
+
+// bool_and: local total Bool combinator (self-containment convention). Total (Exact).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+// ── The 11 rows (hand-transcribed verbatim from mycelium_std_time::GUARANTEE_MATRIX, in order) ─────
+// Pure arithmetic (Exact, effect-free).
+fn row_duration_add() => GuaranteeRow =
+  Row("duration_add", GExact, "Err(Overflow) — never wrap/clamp", "none", True);
+
+fn row_duration_sub() => GuaranteeRow =
+  Row("duration_sub", GExact, "Err(Overflow) — never wrap/clamp", "none", True);
+
+fn row_duration_scale() => GuaranteeRow =
+  Row("duration_scale", GExact, "Err(Overflow) — never wrap/clamp", "none", True);
+
+fn row_duration_cmp() => GuaranteeRow =
+  Row("duration_cmp", GExact, "total", "none", False);
+
+fn row_duration_as_unit() => GuaranteeRow =
+  Row("duration_as_unit", GExact, "Err(Overflow) on unit=0 or narrowing overflow", "none", True);
+
+// Instant differences (Exact, same-source).
+fn row_mono_diff() => GuaranteeRow =
+  Row("mono_diff", GExact, "total (same-source, MONOTONIC is never-backward)", "none", False);
+
+fn row_wall_diff() => GuaranteeRow =
+  Row("wall_diff", GExact, "Err(NonMonotonic) on backward jump — never silent zero", "none", True);
+
+fn row_logical_diff() => GuaranteeRow =
+  Row("logical_diff", GExact, "total (LOGICAL is monotonic by construction)", "none", False);
+
+// Clock reads (Declared — the crux). `mono_now`/`logical_now` declare `time`; `wall_now` declares
+// `{ time, entropy }` — the ONLY entropy-declaring row (the typed distinction).
+fn row_mono_now() => GuaranteeRow =
+  Row("mono_now", GDeclared, "Err(ClockUnavailable)", "time", True);
+
+fn row_wall_now() => GuaranteeRow =
+  Row("wall_now", GDeclared, "Err(ClockUnavailable)", "{ time, entropy }", True);
+
+fn row_logical_now() => GuaranteeRow =
+  Row(
+    "logical_now",
+    GDeclared,
+    "total (deterministic counter, always readable in v0)",
+    "time",
+    True
+  );
+
+// Vec (local cons-list, self-contained; the std.core/std.diag convention).
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// matrix: the full 11-row table, same order as mycelium_std_time::GUARANTEE_MATRIX.
+fn matrix() => Vec[GuaranteeRow] =
+  [
+    row_duration_add(),
+    row_duration_sub(),
+    row_duration_scale(),
+    row_duration_cmp(),
+    row_duration_as_unit(),
+    row_mono_diff(),
+    row_wall_diff(),
+    row_logical_diff(),
+    row_mono_now(),
+    row_wall_now(),
+    row_logical_now()
+  ];
+
+// ── Structural counts over the matrix (the .myc analogs of assert_matrix_invariants) ───────────────
+// matrix_len: the row count, as Binary{8} (11 rows fits trivially). O(n) spine-walk (Declared).
+fn matrix_len(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// count_exact: how many rows tag GExact — the "pure-arithmetic rows are Exact" invariant (8 rows).
+fn count_exact(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs {
+    Nil => 0b0000_0000,
+    Cons(r, rest) => match is_exact(row_tag(r)) {
+      True => add_u(0b0000_0001, count_exact(rest)),
+      False => count_exact(rest)
+    }
+  };
+
+// count_declared: how many rows tag GDeclared — the "clock reads are Declared" invariant (3 rows,
+// VR-5, the crux — a clock read tagged Exact/Proven/Empirical would itself be an overclaim).
+fn count_declared(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs {
+    Nil => 0b0000_0000,
+    Cons(r, rest) => match is_declared(row_tag(r)) {
+      True => add_u(0b0000_0001, count_declared(rest)),
+      False => count_declared(rest)
+    }
+  };
+
+// explainable_count: how many rows surface an inspectable EXPLAIN artifact (8 rows).
+fn explainable_count(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs {
+    Nil => 0b0000_0000,
+    Cons(r, rest) => match row_explainable(r) {
+      True => add_u(0b0000_0001, explainable_count(rest)),
+      False => explainable_count(rest)
+    }
+  };
+
+// entropy_distinction_holds: the typed distinction — `wall_now`'s effect declaration differs from
+// `mono_now`'s. Rust: `wall_now.effects` ("{ time, entropy }", 16 bytes) != `mono_now.effects`
+// ("time", 4 bytes). Checked here by BYTE-LENGTH inequality (no general bytes_eq prim; a length
+// difference is sufficient to witness the two rows carry distinct effect declarations, and full
+// content of "time" is spot-checked in std_time.rs). True (Exact by composition of `bytes_len`/`eq`).
+fn entropy_distinction_holds() => Bool =
+  match eq(bytes_len(row_effects(row_wall_now())), bytes_len(row_effects(row_mono_now()))) {
+    0b1 => False,
+    _ => True
+  };
+
+// crux_holds: the whole honesty crux in one predicate — the wall row is Declared AND declares an
+// effect distinct from the mono row's, while the mono row is also Declared (all three clock reads are
+// ambient, none is dressed up as Exact). Mirrors the spirit of assert_matrix_invariants (Declared over
+// asserted data; Empirical under the std_time.rs differential).
+fn crux_holds() => Bool =
+  bool_and(is_declared(row_tag(row_wall_now())),
+  bool_and(is_declared(row_tag(row_mono_now())),
+  bool_and(is_declared(row_tag(row_logical_now())),
+  entropy_distinction_holds())));

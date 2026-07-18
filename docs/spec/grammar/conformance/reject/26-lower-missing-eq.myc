@@ -1,0 +1,5 @@
+// rejected: 'lower' declaration missing the '=' separator between the rule name and RHS.
+// The parser expects 'lower Name[params] = <rhs>'; a missing '=' is a never-silent
+// parse refusal (G2 / DN-54 §3 / M-812).
+nodule demo;
+lower Trivial true

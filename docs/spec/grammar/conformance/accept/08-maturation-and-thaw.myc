@@ -1,0 +1,10 @@
+// exercises: scope-level maturation (header metadata) + `thaw` de-maturation (RFC-0017).
+// `// @matured: true` is a HEADER comment (Nodule-Header spec §3) — the grammar treats it as a
+// comment, because maturation is a SCOPE attribute, not a term form (RFC-0017 §4.1). The grammar-
+// relevant form is `thaw`, which keeps one definition interpreted inside the matured nodule.
+// @matured: true
+nodule geometry.kernel;
+
+fn rotate(p: Dense{2, F32}) => Dense{2, F32} = p;
+
+thaw fn experimental_shear(p: Dense{2, F32}) => Dense{2, F32} = p;

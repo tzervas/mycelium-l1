@@ -1,0 +1,419 @@
+// nodule: compiler.token
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-05
+// @updated: 2026-07-05
+// @summary: Self-hosted L1 token kinds + source positions (M-740 Stage 1; DN-26 §7.3 row 1). A
+//   faithful port of crates/mycelium-l1/src/token.rs plus the token-relevant slice of error.rs (the
+//   small token<->error 2-cycle, DN-26 §7.1) — this nodule carries only the token/position DATA and
+//   the `keyword` classifier; the scanning state machine is `compiler.lex` (lex.myc, sibling nodule).
+nodule compiler.token;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 1). The Rust source (`crates/mycelium-l1/src/token.rs`) stays the
+// trusted differential oracle (DN-26 §7.4) — this file is never authoritative on its own; every
+// classification here is checked against it by `crates/mycelium-l1/tests/compiler_stage1.rs`
+// (token-stream differential over the accept-corpus, DN-26 §7.3).
+//
+// Representational deviations from the Rust type (each a deliberate, honest, DOCUMENTED choice —
+// VR-5/G2 — never a silent divergence):
+//
+// FLAG-token-1 (String -> Bytes). Rust's payload-carrying variants (`Ident(String)`,
+// `BinLit(String)`, `BytesLit(String)`, `TritLit(String)`, `StrLit(String)`, `FloatLit(String)`) all
+// carry a Rust `String`. The `.myc` surface has no first-class `String` (RFC-0031 D1 boundary,
+// per lib/std/recover.myc's own FLAG-recover-4); the current surface's textual-literal type is
+// `Bytes` (M-910/M-911 — `"…"` string literals ARE `Bytes` values, per lib/std/core.myc's use of
+// `"none"` as a `Bytes` constant). Every String-carrying variant below carries `Bytes` instead —
+// same information, no numeric/textual content lost.
+//
+// FLAG-token-2 (Int carries Bytes, not i64). Rust's `Int(i64)` is the ONE variant Rust converts
+// eagerly at lex time (every other literal-payload variant already defers conversion to
+// elaboration — see token.rs's own `FloatLit` doc comment: "the value conversion happens once, at
+// elaboration"). Converting a verbatim decimal-digit run to a `Binary{64}` value at LEX time needs
+// multi-digit multiply-accumulate arithmetic (`*10 + digit`, built from `add_u`/doubling — no `mul`
+// prim over `Binary{N}` is registered today); that is elaboration-shaped work, not classification
+// work, and out of Stage 1's "source -> token stream" scope (DN-26 §7.3). `Int` here carries the
+// verbatim digit-run `Bytes` (mirroring `FloatLit`'s own deferred-conversion precedent), so the
+// numeric CONVERSION is deferred exactly like every sibling literal kind — never silently dropped,
+// just staged consistently with the rest of the enum.
+//
+// FLAG-token-3 (keyword-name collisions — the std.core precedent, generalized). Fourteen Tok /
+// ScalarTok / StrengthTok variant names are IDENTICAL to a reserved keyword spelling in THIS SAME
+// grammar: the repr-type keywords `Binary`/`Ternary`/`Dense`/`Seq`/`Bytes`/`Float`/`Substrate`/
+// `Sparse`, the scalar keywords `F16`/`F32`/`F64` (not `BF16` — its Tok-payload spelling `Bf16`
+// differs in case, so it does NOT collide), and the strength keywords `Exact`/`Proven`/`Empirical`/
+// `Declared`. Because the (Rust, and future self-hosted) lexer resolves a bare identifier to its
+// keyword token BEFORE it ever reaches constructor-name position — token.rs's own contract: a
+// reserved word can never be a silent identifier ("reject/05") — these exact spellings are
+// UNAVAILABLE as constructor names in self-hosted `.myc` source. `lib/std/core.myc` already hit
+// this for the strength words and solved it with a `G`-prefix (`GExact`/`GProven`/`GEmpirical`/
+// `GDeclared`); this file reuses that exact convention (same prefix, same words) for `StrengthTok`,
+// adds a matching `S`-prefix for `ScalarTok` (`SF16`/`SBf16`/`SF32`/`SF64` — prefixed uniformly for
+// naming consistency even though `SBf16`'s bare form would not itself collide), and a `Kw`-prefix
+// for the eight colliding `Tok` repr-type variants (`KwBinary`/`KwTernary`/`KwDense`/`KwSeq`/
+// `KwBytes`/`KwFloat`/`KwSubstrate`/`KwSparse`). This is a pure spelling accommodation — the
+// CLASSIFICATION is unchanged (each still names exactly the keyword token it always named); no
+// semantic renaming, just the collision worked around the way the codebase already established.
+//
+// FLAG-token-4 (no cross-nodule execution yet — the `compiler.lex` self-containment note applies
+// here too). `compiler.lex` cannot `use compiler.token.*` and actually RUN the imported `keyword`/
+// `Tok`/`Pos`/`Spanned` today: `crates/mycelium-l1/src/checkty.rs` (`check_phylum`'s doc comment,
+// ~line 1118) states plainly that "cross-nodule execution is staged — the per-nodule Envs are real
+// and complete for type-checking; running a `use`d fn across nodules is a follow-up (eval keeps its
+// per-nodule reach; a cross-nodule call lowers to a never-silent Unsupported/Residual)." So
+// `compiler.lex` redeclares this nodule's types/`keyword` fn locally (byte-for-byte identical),
+// mirroring the established stdlib self-containment convention (`lib/std/text.myc`'s own "no
+// cross-leaf import" note) — for TWO compounding reasons now, not one: worktree discipline AND
+// today's real execution-staging gap. This nodule (`compiler.token`) stays the canonical,
+// independently-differential-tested standalone copy; DN-26/M-741 should track lifting the
+// cross-nodule-execution gap so a future stage can drop the duplication (not this leaf's call to
+// make — FLAGged up).
+
+// ── Option (local; no cross-leaf import) ────────────────────────────────────────────────────────
+// Option<A>: the never-silent optional value. Redeclared here (not imported from std.option) per
+// the established self-containment convention (lib/std/text.myc's own "no cross-leaf import" note)
+// — see FLAG-token-4 above for why this now also applies cross-NODULE, not just cross-phylum.
+type Option[A] = Some(A) | None;
+
+// ── Pos ──────────────────────────────────────────────────────────────────────────────────────────
+// Pos: a 1-based (line, col) source position (mirrors token.rs::Pos). Both fields Binary{32} (a
+// u32-width line/column counter is ample headroom for any real source file).
+type Pos = P(Binary{32}, Binary{32});
+
+fn pos_line(p: Pos) => Binary{32} =
+  match p { P(l, _) => l };
+
+fn pos_col(p: Pos) => Binary{32} =
+  match p { P(_, c) => c };
+
+// ── ScalarTok ────────────────────────────────────────────────────────────────────────────────────
+// Scalar-kind keyword payload (mirrors token.rs::ScalarTok). `S`-prefixed — see FLAG-token-3.
+type ScalarTok = SF16 | SBf16 | SF32 | SF64;
+
+// ── StrengthTok ──────────────────────────────────────────────────────────────────────────────────
+// Guarantee-strength keyword payload (mirrors token.rs::StrengthTok). `G`-prefixed — see
+// FLAG-token-3 (the exact lib/std/core.myc::Guarantee precedent, redeclared here rather than
+// cross-nodule-imported per FLAG-token-4).
+type StrengthTok = GExact | GProven | GEmpirical | GDeclared;
+
+// ── Tok ──────────────────────────────────────────────────────────────────────────────────────────
+// The lexical token (mirrors token.rs::Tok field-for-field; see the file header for the three
+// deviations — String->Bytes, Int->Bytes, and the Kw/S/G keyword-collision prefixes). Full
+// per-variant rationale lives in the Rust source (the trusted oracle, DN-26 §7.4); this is the
+// classification data, not a re-derivation of the "why" prose for each reserved word.
+type Tok =
+    // structural keywords (DN-02; nodule per DN-06)
+    Nodule | Phylum | Colony
+    // runtime-vocabulary reserved words (DN-03 §4; RFC-0008 §4.5) — all reserved, not yet active
+  | Hypha | Fuse | Mesh | Graft | Cyst | Xloc | Forage | Backbone | Tier | Reclaim
+    // surface-tier reserved words (DN-03 §1) + the grow->derive reconciliation (DN-38 §8.1)
+  | Consume | Grow | Derive
+    // conventional keywords
+  | Use | Pub | Priv | Type | Trait | Impl | Fn | Matured | Thaw
+  | Let | In | If | Then | Else | Match | For | Swap
+  | Default | Paradigm | With | Wild | Spore | To | Policy
+    // RFC-0037 surface keywords
+  | Lambda | Object | Via | Lower
+    // repr-type keywords (Kw-prefixed where they collide — FLAG-token-3; Vsa does not collide)
+  | KwBinary | KwTernary | KwDense | Vsa
+    // RFC-0037 D2-b short repr-keyword aliases (none of these collide)
+  | BinShort | TernShort | EmbShort | HvecShort
+  | KwSeq | KwBytes | KwFloat | KwSubstrate | KwSparse
+    // scalar / strength keyword payloads
+  | Scalar(ScalarTok) | Strength(StrengthTok)
+    // identifiers & literals (FLAG-token-1 / FLAG-token-2: Bytes-carrying throughout)
+  | Ident(Bytes)
+  | BinLit(Bytes)
+  | BytesLit(Bytes)
+  | TritLit(Bytes)
+  | StrLit(Bytes)
+  | Int(Bytes)
+  | FloatLit(Bytes)
+    // punctuation
+  | LParen | RParen | LBrace | RBrace | LBracket | RBracket
+  | LAngle | RAngle | Shl | Shr
+  | At | AtStdSys
+  | Colon | Comma | Semi | Dot | Pipe
+  | Plus | Minus | Star | Slash | Percent | Caret | Amp | AmpAmp
+  | Eq | EqEq | Arrow | FatArrow | Bang | BangEq | PipePipe
+  | Eof;
+
+// ── Spanned ──────────────────────────────────────────────────────────────────────────────────────
+// A token with its starting position (mirrors token.rs::Spanned).
+type Spanned = Sp(Tok, Pos);
+
+fn sp_tok(s: Spanned) => Tok =
+  match s { Sp(t, _) => t };
+
+fn sp_pos(s: Spanned) => Pos =
+  match s { Sp(_, p) => p };
+
+// ── keyword ──────────────────────────────────────────────────────────────────────────────────────
+// Resolve an identifier-shaped lexeme to its keyword token, or `None` if it is a plain identifier
+// (mirrors token.rs::keyword exactly — same 64 words, same precedence, generated mechanically from
+// the Rust source's own match arms so the word list can be diffed 1:1 against the oracle). Total
+// composition of the Exact `bytes_eq` prim (M-912) — never-silent by construction: unmatched input
+// falls through to the explicit `None` at the innermost arm.
+fn keyword(word: Bytes) => Option[Tok] =
+    match bytes_eq(word, "nodule") {
+      0b1 => Some(Nodule),
+      _ =>
+      match bytes_eq(word, "phylum") {
+        0b1 => Some(Phylum),
+        _ =>
+        match bytes_eq(word, "colony") {
+          0b1 => Some(Colony),
+          _ =>
+          match bytes_eq(word, "hypha") {
+            0b1 => Some(Hypha),
+            _ =>
+            match bytes_eq(word, "fuse") {
+              0b1 => Some(Fuse),
+              _ =>
+              match bytes_eq(word, "mesh") {
+                0b1 => Some(Mesh),
+                _ =>
+                match bytes_eq(word, "graft") {
+                  0b1 => Some(Graft),
+                  _ =>
+                  match bytes_eq(word, "cyst") {
+                    0b1 => Some(Cyst),
+                    _ =>
+                    match bytes_eq(word, "xloc") {
+                      0b1 => Some(Xloc),
+                      _ =>
+                      match bytes_eq(word, "forage") {
+                        0b1 => Some(Forage),
+                        _ =>
+                        match bytes_eq(word, "backbone") {
+                          0b1 => Some(Backbone),
+                          _ =>
+                          match bytes_eq(word, "tier") {
+                            0b1 => Some(Tier),
+                            _ =>
+                            match bytes_eq(word, "reclaim") {
+                              0b1 => Some(Reclaim),
+                              _ =>
+                              match bytes_eq(word, "consume") {
+                                0b1 => Some(Consume),
+                                _ =>
+                                match bytes_eq(word, "grow") {
+                                  0b1 => Some(Grow),
+                                  _ =>
+                                  match bytes_eq(word, "lambda") {
+                                    0b1 => Some(Lambda),
+                                    _ =>
+                                    match bytes_eq(word, "object") {
+                                      0b1 => Some(Object),
+                                      _ =>
+                                      match bytes_eq(word, "via") {
+                                        0b1 => Some(Via),
+                                        _ =>
+                                        match bytes_eq(word, "lower") {
+                                          0b1 => Some(Lower),
+                                          _ =>
+                                          match bytes_eq(word, "derive") {
+                                            0b1 => Some(Derive),
+                                            _ =>
+                                            match bytes_eq(word, "use") {
+                                              0b1 => Some(Use),
+                                              _ =>
+                                              match bytes_eq(word, "pub") {
+                                                0b1 => Some(Pub),
+                                                _ =>
+                                                match bytes_eq(word, "priv") {
+                                                0b1 => Some(Priv),
+                                                _ =>
+                                                match bytes_eq(word, "type") {
+                                                  0b1 => Some(Type),
+                                                  _ =>
+                                                  match bytes_eq(word, "trait") {
+                                                    0b1 => Some(Trait),
+                                                    _ =>
+                                                    match bytes_eq(word, "impl") {
+                                                      0b1 => Some(Impl),
+                                                      _ =>
+                                                    match bytes_eq(word, "fn") {
+                                                      0b1 => Some(Fn),
+                                                      _ =>
+                                                    match bytes_eq(word, "matured") {
+                                                      0b1 => Some(Matured),
+                                                      _ =>
+                                                    match bytes_eq(word, "thaw") {
+                                                      0b1 => Some(Thaw),
+                                                      _ =>
+                                                    match bytes_eq(word, "let") {
+                                                      0b1 => Some(Let),
+                                                      _ =>
+                                                    match bytes_eq(word, "in") {
+                                                      0b1 => Some(In),
+                                                      _ =>
+                                                    match bytes_eq(word, "if") {
+                                                      0b1 => Some(If),
+                                                      _ =>
+                                                    match bytes_eq(word, "then") {
+                                                      0b1 => Some(Then),
+                                                      _ =>
+                                                    match bytes_eq(word, "else") {
+                                                      0b1 => Some(Else),
+                                                      _ =>
+                                                    match bytes_eq(word, "match") {
+                                                      0b1 => Some(Match),
+                                                      _ =>
+                                                    match bytes_eq(word, "for") {
+                                                      0b1 => Some(For),
+                                                      _ =>
+                                                    match bytes_eq(word, "swap") {
+                                                      0b1 => Some(Swap),
+                                                      _ =>
+                                                    match bytes_eq(word, "default") {
+                                                      0b1 => Some(Default),
+                                                      _ =>
+                                                    match bytes_eq(word, "paradigm") {
+                                                      0b1 => Some(Paradigm),
+                                                      _ =>
+                                                    match bytes_eq(word, "with") {
+                                                      0b1 => Some(With),
+                                                      _ =>
+                                                    match bytes_eq(word, "wild") {
+                                                      0b1 => Some(Wild),
+                                                      _ =>
+                                                    match bytes_eq(word, "spore") {
+                                                      0b1 => Some(Spore),
+                                                      _ =>
+                                                    match bytes_eq(word, "to") {
+                                                      0b1 => Some(To),
+                                                      _ =>
+                                                    match bytes_eq(word, "policy") {
+                                                      0b1 => Some(Policy),
+                                                      _ =>
+                                                    match bytes_eq(word, "Binary") {
+                                                      0b1 => Some(KwBinary),
+                                                      _ =>
+                                                    match bytes_eq(word, "Ternary") {
+                                                      0b1 => Some(KwTernary),
+                                                      _ =>
+                                                    match bytes_eq(word, "Dense") {
+                                                      0b1 => Some(KwDense),
+                                                      _ =>
+                                                    match bytes_eq(word, "VSA") {
+                                                      0b1 => Some(Vsa),
+                                                      _ =>
+                                                    match bytes_eq(word, "bin") {
+                                                      0b1 => Some(BinShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "tern") {
+                                                      0b1 => Some(TernShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "emb") {
+                                                      0b1 => Some(EmbShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "hvec") {
+                                                      0b1 => Some(HvecShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "Seq") {
+                                                      0b1 => Some(KwSeq),
+                                                      _ =>
+                                                    match bytes_eq(word, "Bytes") {
+                                                      0b1 => Some(KwBytes),
+                                                      _ =>
+                                                    match bytes_eq(word, "Float") {
+                                                      0b1 => Some(KwFloat),
+                                                      _ =>
+                                                    match bytes_eq(word, "Substrate") {
+                                                      0b1 => Some(KwSubstrate),
+                                                      _ =>
+                                                    match bytes_eq(word, "Sparse") {
+                                                      0b1 => Some(KwSparse),
+                                                      _ =>
+                                                    match bytes_eq(word, "F16") {
+                                                      0b1 => Some(Scalar(SF16)),
+                                                      _ =>
+                                                    match bytes_eq(word, "BF16") {
+                                                      0b1 => Some(Scalar(SBf16)),
+                                                      _ =>
+                                                    match bytes_eq(word, "F32") {
+                                                      0b1 => Some(Scalar(SF32)),
+                                                      _ =>
+                                                    match bytes_eq(word, "F64") {
+                                                      0b1 => Some(Scalar(SF64)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Exact") {
+                                                      0b1 => Some(Strength(GExact)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Proven") {
+                                                      0b1 => Some(Strength(GProven)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Empirical") {
+                                                      0b1 => Some(Strength(GEmpirical)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Declared") {
+                                                      0b1 => Some(Strength(GDeclared)),
+                                                      _ =>
+                                                      None
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ;

@@ -1,0 +1,237 @@
+// nodule: std.core
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted RFC-0016 §4.5 `std.core` guarantee matrix — the Ring-0 prelude's 9-row
+nodule std.core;
+
+//   honest-tag/fallibility/effects/EXPLAIN table, ported to `.myc` as CHECKED DATA (M-927,
+//   kickoff `opp`, RFC-0031 D5). Everything else in `mycelium-std-core` is a KERNEL re-export
+//   facade — NOT ported here; see the FLAGs below (RFC-0031 D1 kernel boundary).
+// M-927 (E29-1, kickoff `opp`). RFC-0031 D5 port of `crates/mycelium-std-core/src/lib.rs` — the
+// stdlib's OWN core nodule (NOT the kernel `mycelium-core`, which stays Rust per RFC-0031 D1).
+//
+// Surface-check (D5 row 1, Empirical, 2026-07-02): `mycelium-std-core` is a re-export-heavy
+// facade — 7 kernel re-export groups, a prelude bundle, a 5-fn kernel query surface, the shared
+// error scaffold, and ONE own type (`GuaranteeRow` + its `GUARANTEE_MATRIX` const data). Checked
+// item-by-item against today's `.myc` surface (parser/checker in crates/mycelium-l1/src) and the
+// transpiler gap report (mycelium-transpile over the crate: 3/22 non-test items emitted — all
+// three D1-boundary kernel `use` lines, none usable; 0% of what is ported below):
+//
+// PORTED (the crate's one own type + its const data + the structural checks over it):
+//   `GuaranteeRow` (mirrored as `GuaranteeRow = Row(…)` below), the 9-row `GUARANTEE_MATRIX`
+//   (`matrix()` below, hand-transcribed verbatim), and the `.myc` analogs of the crate's own
+//   structural tests (`matrix_is_all_exact_and_effect_free`, `only_query_rows_are_explainable`).
+//
+// FLAGGED — the D1 kernel-boundary surface, NOT ported (never forced past a boundary — VR-5/G2;
+// a mostly-FLAGged result is the honest outcome for a re-export facade, the std.diag precedent):
+// - FLAG-core-1 (the 7 kernel re-export groups): `Bound`/`BoundBasis`/`BoundKind`/`NormKind`,
+//   `CoreValue`/`Datum`, `GuaranteeStrength`, `ContentHash`, `Meta`/`PackScheme`/`PhysicalLayout`/
+//   `Provenance`/`SparsityObs`, `Repr`/`ScalarKind`/`SparsityClass`, `Payload`/`Trit`/`Value` —
+//   all `pub use mycelium_core::…` re-exports of RFC-0001 kernel types. The kernel stays Rust
+//   (RFC-0031 D1) and no FFI/kernel-type construction mechanism is exposed to `.myc` today.
+// - FLAG-core-2 (`prelude`): a curated re-export bundle over FLAG-core-1 plus the query fns —
+//   doubly out of scope: its members are D1-boundary, and the single-nodule harness (M-925,
+//   crates/mycelium-l1/tests/harness/mod.rs) has no cross-nodule re-export surface to express a
+//   prelude with.
+// - FLAG-core-3 (the §4.8 query surface): `repr_of`/`meta_of`/`guarantee_of`/`bound_of`/
+//   `provenance_of` are thin, pure delegations over the kernel `CoreValue` sum — `.myc` has no
+//   value-level reflection surface for `CoreValue`/`Meta`/`Provenance` today (they are exactly
+//   the inspection window ONTO kernel metadata, so they sit ON the D1 boundary by construction).
+//   The three Rust tests that exercise them by constructing kernel values
+//   (`queries_on_a_repr_value_are_present`, `queries_on_algebraic_data_report_absence_never_silently`,
+//   `lattice_meet_never_upgrades` — the last drives the kernel's own `meet`/`rank`) are FLAGged
+//   with them. Route to `enb` only if wave demand justifies a reflection enabler — not requested
+//   by this port alone.
+// - FLAG-core-4 (`error_scaffold`, M-535): the `StdError` marker trait + blanket impl, the
+//   `impl_std_error!` `macro_rules!` boilerplate macro, and the generic-bounded test helpers —
+//   Rust-host `std::error::Error` machinery (traits with supertrait bounds, macros); no `.myc`
+//   equivalent construct exists (the transpiler gap report names all of them: Trait/GenericBound/
+//   MacroDef).
+// - FLAG-core-5 (shared manifest): `lib/std/mycelium-proj.toml` `[surface] exports` does not yet
+//   list `std.core` — that file is integration-tier owned (shared across the wave's leaves);
+//   FLAGged up, not edited here (mirrors every other `opp`-wave port).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as `mycelium-std-core`):
+// - Every row's `tag` field is `GExact` (RFC-0016 §4.1 C2 — `std.core` introduces no operation
+//   that selects, converts, or approximates; the honest floor, not an upgrade).
+// - The row DATA itself (the 9 hand-transcribed constructors below) is `Declared` — asserted, not
+//   machine-checked; matches the Rust source's own `#[cfg(test)]` structural assertions.
+// - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) over the checks below is
+//   `Empirical` (trials, std_core.rs, driven against the LIVE `mycelium_std_core::GUARANTEE_MATRIX`
+//   oracle) — matches every other `opp`-wave port's harness tag.
+//
+// Bytes-comparison note (narrowed from the std.diag FLAG): RFC-0032 D4 exposes only `bytes_len`/
+// `bytes_get`/`bytes_slice`/`bytes_concat` — still no general `bytes_eq`/substring prim. But the
+// Rust test's `row.effects == "none"` assertion IS fully ported here: "none" is a FIXED 4-byte
+// literal, so length-guarded byte-wise comparison (`effects_is_none` below) composes the Exact
+// `bytes_len`/`bytes_get`/`eq` prims into full content equality — no new prim, no approximation.
+// Free-form prose fields (`op`, `fallibility`) remain transcribed byte-faithfully but are only
+// spot-checked (first byte) in std_core.rs, as in std.diag.
+// ── Guarantee ────────────────────────────────────────────────────────────────────────────────────
+// The lattice tag Exact ⊐ Proven ⊐ Empirical ⊐ Declared (VR-5). Typed — never stringly. Mirrors the
+// kernel `GuaranteeStrength` re-export (FLAG-core-1) as local VALUE-level data, exactly as
+// std.diag's `Guarantee` does (same type, same G-prefix; redeclared locally because the
+// single-nodule harness has no cross-nodule import — the std.error self-containment precedent).
+//
+// Naming (FLAG, surface note): `Exact`/`Proven`/`Empirical`/`Declared` are RESERVED (the
+// `T @ Exact` guarantee-strength type-annotation surface, `token.rs::StrengthTok`). Constructors
+// are prefixed `G` (`GExact`/`GProven`/`GEmpirical`/`GDeclared`) to avoid the keyword collision.
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// ── GuaranteeRow ─────────────────────────────────────────────────────────────────────────────────
+// Mirrors `mycelium_std_core::GuaranteeRow` field-for-field, in the same order:
+//   Row(op, tag, fallibility, effects, explainable)
+// `op`/`fallibility`/`effects` are free-form prose (Bytes — textual string literals, M-910/M-911);
+// `tag` is the typed lattice ADT above (in Rust: the kernel `GuaranteeStrength` — mirrored, never
+// stringly); `explainable` is Bool (in Rust: `bool`).
+type GuaranteeRow = Row(Bytes, Guarantee, Bytes, Bytes, Bool);
+
+// ── Field accessors ──────────────────────────────────────────────────────────────────────────────
+fn row_op(r: GuaranteeRow) => Bytes =
+  match r { Row(op, _, _, _, _) => op };
+
+fn row_tag(r: GuaranteeRow) => Guarantee =
+  match r { Row(_, t, _, _, _) => t };
+
+fn row_fallibility(r: GuaranteeRow) => Bytes =
+  match r { Row(_, _, f, _, _) => f };
+
+fn row_effects(r: GuaranteeRow) => Bytes =
+  match r { Row(_, _, _, e, _) => e };
+
+fn row_explainable(r: GuaranteeRow) => Bool =
+  match r { Row(_, _, _, _, x) => x };
+
+// ── Structural predicates (ADT/prim equality — total, Exact by composition) ─────────────────────
+fn is_exact(g: Guarantee) => Bool =
+  match g { GExact => True, GProven => False, GEmpirical => False, GDeclared => False };
+
+// bool_and / bool_not: local total Bool combinators (no cross-leaf import; the std.diag/std.cmp
+// self-containedness convention). Total (Exact).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn bool_not(a: Bool) => Bool =
+  match a { True => False, False => True };
+
+// byte_is: True iff byte `i` of `b` equals `v`. Delegates to the Exact `bytes_get`/`eq` prims.
+// PRECONDITION (caller-guarded, never violated below): `i < bytes_len(b)` — `bytes_get` is
+// explicit-error out of range (C1 never-silent), so every call site length-guards first.
+fn byte_is(b: Bytes, i: Binary{8}, v: Binary{8}) => Bool =
+  match eq(bytes_get(b, i), v) { 0b1 => True, _ => False };
+
+// effects_is_none: True iff `b` is EXACTLY the 4 bytes "none" — the full-content port of the Rust
+// test's `row.effects == "none"` assertion (see the Bytes-comparison note above). The length guard
+// makes the byte reads total: the byte comparisons run only in the len==4 arm.
+// 'n' = 0x6E, 'o' = 0x6F, 'e' = 0x65. Total (Exact by composition of Exact prims).
+fn effects_is_none(b: Bytes) => Bool =
+  match eq(bytes_len(b), 0b0000_0000_0000_0000_0000_0000_0000_0100) {
+    0b1 =>
+      bool_and(byte_is(b, 0b0000_0000, 0b0110_1110),
+      bool_and(byte_is(b, 0b0000_0001, 0b0110_1111),
+      bool_and(byte_is(b, 0b0000_0010, 0b0110_1110),
+      byte_is(b, 0b0000_0011, 0b0110_0101)))),
+    _ => False
+  };
+
+// ── The 9 rows (hand-transcribed verbatim from mycelium_std_core::GUARANTEE_MATRIX, RFC-0016 §4.5) ──
+// Same order as the Rust const. Every row is GExact and effect-free ("none") — the honest floor
+// for a no-accuracy re-export surface (lib.rs doc: "never an approximation or a selection of
+// their own").
+// ── type re-exports (the D1-FLAGged surface, present here AS MATRIX DATA ONLY) ──────────────────
+fn row_value_repr_meta() => GuaranteeRow =
+  Row("Value/Repr/Meta (type re-exports)", GExact, "total", "none", False);
+
+fn row_corevalue_datum() => GuaranteeRow =
+  Row("CoreValue/Datum (type re-exports)", GExact, "total", "none", False);
+
+fn row_guarantee_strength() => GuaranteeRow =
+  Row("GuaranteeStrength (lattice tags)", GExact, "total", "none", False);
+
+fn row_bound_boundbasis() => GuaranteeRow =
+  Row("Bound/BoundBasis (type re-exports)", GExact, "total", "none", False);
+
+// ── §4.8 runtime query surface (the fns themselves are FLAG-core-3; their rows are data) ────────
+fn row_repr_of() => GuaranteeRow =
+  Row("repr_of", GExact, "Option<&Repr> (None for algebraic data)", "none", False);
+
+fn row_meta_of() => GuaranteeRow =
+  Row("meta_of", GExact, "Option<&Meta> (None for algebraic data)", "none", False);
+
+fn row_guarantee_of() => GuaranteeRow =
+  Row("guarantee_of", GExact, "total", "none", True);
+
+fn row_bound_of() => GuaranteeRow =
+  Row("bound_of", GExact, "Option<&Bound> (None when no meta/bound)", "none", True);
+
+fn row_provenance_of() => GuaranteeRow =
+  Row("provenance_of", GExact, "Option<&Provenance> (None for algebraic data)", "none", True);
+
+// ── Vec (local, self-contained; mirrors std.diag/std.collections' cons-list convention) ─────────
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// matrix: the full 9-row table, in the same order as mycelium_std_core::GUARANTEE_MATRIX.
+fn matrix() => Vec[GuaranteeRow] =
+  [
+    row_value_repr_meta(),
+    row_corevalue_datum(),
+    row_guarantee_strength(),
+    row_bound_boundbasis(),
+    row_repr_of(),
+    row_meta_of(),
+    row_guarantee_of(),
+    row_bound_of(),
+    row_provenance_of()
+  ];
+
+// ── Structural checks over the matrix (the .myc analogs of lib.rs::tests) ───────────────────────
+// Every check below is Empirical (trials, std_core.rs three-way differential vs the live Rust
+// oracle) over Declared data.
+// matrix_len: the row count, as Binary{8} (9 rows fits trivially). O(n) spine-walk (Declared,
+// mirrors std.diag::matrix_len).
+fn matrix_len(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// all_exact: True iff every row's tag is Exact — one half of
+// lib.rs::tests::matrix_is_all_exact_and_effect_free ("a Proven/Empirical tag here would itself
+// violate VR-5").
+fn all_exact(xs: Vec[GuaranteeRow]) => Bool =
+  match xs { Nil => True, Cons(r, rest) => bool_and(is_exact(row_tag(r)), all_exact(rest)) };
+
+// all_effects_none: True iff every row's effects field is EXACTLY "none" — the other half of
+// lib.rs::tests::matrix_is_all_exact_and_effect_free, ported at FULL content fidelity (see
+// effects_is_none above).
+fn all_effects_none(xs: Vec[GuaranteeRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(effects_is_none(row_effects(r)), all_effects_none(rest))
+  };
+
+// explainable_count: how many rows surface an inspectable EXPLAIN artifact, as Binary{8} —
+// the cardinality half of lib.rs::tests::only_query_rows_are_explainable.
+fn explainable_count(xs: Vec[GuaranteeRow]) => Binary{8} =
+  match xs {
+    Nil => 0b0000_0000,
+    Cons(r, rest) => match row_explainable(r) {
+      True => add_u(0b0000_0001, explainable_count(rest)),
+      False => explainable_count(rest)
+    }
+  };
+
+// only_query_rows_explainable: the EXPLAIN window is exactly the value-tag/bound/provenance
+// queries — lib.rs::tests::only_query_rows_are_explainable, ported as a per-row identity check
+// (the Rust test's op-NAME list equality needs bytes_eq — the identity of each row constructor
+// carries the same information here, so nothing is lost).
+fn only_query_rows_explainable() => Bool =
+  bool_and(row_explainable(row_guarantee_of()),
+  bool_and(row_explainable(row_bound_of()),
+  bool_and(row_explainable(row_provenance_of()),
+  bool_and(bool_not(row_explainable(row_value_repr_meta())),
+  bool_and(bool_not(row_explainable(row_corevalue_datum())),
+  bool_and(bool_not(row_explainable(row_guarantee_strength())),
+  bool_and(bool_not(row_explainable(row_bound_boundbasis())),
+  bool_and(bool_not(row_explainable(row_repr_of())),
+  bool_not(row_explainable(row_meta_of()))))))))));

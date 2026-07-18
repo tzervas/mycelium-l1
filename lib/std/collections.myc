@@ -1,0 +1,148 @@
+// nodule: std.collections
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-26
+// @updated: 2026-06-26
+// @summary: Self-hosted collection types — Vec (cons-list), Map (association list), Set (key list)
+nodule std.collections;
+
+// with honest O(n) bounds and never-silent fallibility. M-716 (E13-1, #461). Guarantee (per-op,
+// audit-precise): constructors + total discriminators are Exact; eliminating/transforming ops carry
+// a Declared type-level contract; `len`'s "fits Binary{8}" bound is Empirical (add_u refuses at
+// 256); three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) is Empirical (trials,
+// std_collections.rs). Never-silent (G2): every fallible op returns Option — no panic, no sentinel.
+// Map/Set lookup use the `eq` kernel prim (width-typed over Binary{N}): map_get and set_contains are
+// now WIDTH-GENERIC over the key/element width `N` (M-718/M-753 — the recursive linear scan is itself
+// width-generic, enabled by the width-var pass-through in checkty.rs `unify`), superseding the wave-n1
+// Binary{8}-monomorphic interim. Vec ops are fully generic except len/get which use Binary{8} as the
+// index width.
+// Option re-declaration: collections.myc is a self-contained nodule — test drivers append it
+// verbatim and expect Option and Bool in scope without a separate import step (mirrors option.myc
+// and result.myc self-containedness). The type parameter is named `Opt` (not `A`) to avoid
+// substitution-key collisions when Option is nested inside Vec<A> (e.g. Option<Vec<A>>) — the
+// checker's generic-constructor inference uses string-keyed substitution, and two type params with
+// the same name `A` from different generic types collide (RFC-0007 §11.3 + M-716). The external
+// name is unchanged: callers write `Option<Binary{8}>` as always.
+type Option[Opt] = Some(Opt) | None;
+
+// ── Vec — a recursive cons-list (not Seq: Seq{T,N} is fixed-length and cannot grow) ─────────────
+//
+// Rep: type Vec<A> = Nil | Cons(A, Vec<A>)
+// All ops are O(n) in the spine (Declared). Constructors Nil/Cons are Exact (total).
+// `len` is O(n) and its "fits Binary{8}" contract is Empirical: add_u refuses at 256 on all paths.
+// `get` is O(n) and OOB → None (never-silent, G2).
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// empty: the empty Vec. Total constructor (Exact).
+fn empty[A]() => Vec[A] =
+  Nil;
+
+// push_front: prepend `x` to `xs`. O(1) cons (Exact constructor; the "O(1)" claim is Declared —
+// one cons allocation, not an amortised bound — no asymptotic theorem is checked).
+fn push_front[A](x: A, xs: Vec[A]) => Vec[A] =
+  Cons(x, xs);
+
+// is_empty: True iff the Vec is Nil. Total (Exact).
+fn is_empty[A](xs: Vec[A]) => Bool =
+  match xs { Nil => True, Cons(_, _) => False };
+
+// head: the first element, or None on an empty Vec. Never-silent (G2): Nil → None, not a panic or
+// sentinel. Declared (type-level contract; not a theorem).
+fn head[A](xs: Vec[A]) => Option[A] =
+  match xs { Nil => None, Cons(x, _) => Some(x) };
+
+// tail: the rest after the first element, or None on empty. Never-silent (G2): Nil → None. Declared.
+fn tail[A](xs: Vec[A]) => Option[Vec[A]] =
+  match xs { Nil => None, Cons(_, rest) => Some(rest) };
+
+// len: the number of elements. O(n) recursive spine-walk. Uses add_u at Binary{8}: a list longer
+// than 255 elements causes add_u to refuse on ALL paths — never a silent wrap (G2). This is an
+// explicit never-silent contract; the "fits Binary{8}" bound is Empirical (add_u's runtime refusal
+// is the evidence, not a type-level proof). Declared (type-level contract for the O(n) walk).
+fn len[A](xs: Vec[A]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, len(rest)) };
+
+// get: the element at index `i` (Binary{8}), or None if OOB. O(n) spine-walk. Never-silent (G2):
+// OOB → None, never a fabricated value. Declared.
+fn get[A](xs: Vec[A], i: Binary{8}) => Option[A] =
+  match xs {
+    Nil => None,
+    Cons(x, rest) =>
+      match eq(i, 0b0000_0000) {
+        0b1 => Some(x),
+        _ => get(rest, sub_u(i, 0b0000_0001))
+      }
+  };
+
+// snoc: append `x` at the end of `xs`. O(n) spine-walk to the tail (Declared). The spine is rebuilt
+// on the way back — a pure value-semantics copy. Base case: push_front(x, xs) where xs = Nil (the
+// matched branch), which is Cons(x, Nil) by evaluation. We write push_front(x, xs) rather than
+// Cons(x, Nil) because bare nullary constructors (Nil) cannot appear in field position when the
+// type parameter A is still abstract — the checker requires a concrete expected context (RFC-0007
+// §11.3). push_front(x, xs) synthesizes the correct Vec<A> type without that constraint.
+fn snoc[A](xs: Vec[A], x: A) => Vec[A] =
+  match xs { Nil => push_front(x, xs), Cons(h, rest) => Cons(h, snoc(rest, x)) };
+
+// reverse: reverse `xs` via recursive snoc (O(n²): each snoc is O(n), called n times). The
+// O(n) accumulator-based reversal requires passing a bare `Nil` as a generic function argument,
+// which cannot be type-inferred when the type parameter is still abstract (RFC-0007 §11.3 — the
+// checker requires an expected context for nullary generic constructors; a call-site argument
+// position does not propagate one when the parameter type has a free variable). This O(n²) form
+// avoids that constraint and is honest about the cost. Declared (O(n²) structural recursion).
+// FLAG: an O(n) reverse using a typed `empty()` helper or let-binding may land when RFC-0007
+// §11.3 ascription syntax or a type-argument inference extension is available.
+fn reverse[A](xs: Vec[A]) => Vec[A] =
+  match xs { Nil => Nil, Cons(h, rest) => snoc(reverse(rest), h) };
+
+// ── Map — an association list keyed by Binary{N} ──────────────────────────────────────────────────
+//
+// Rep: MNil | MCons(k, v, Map<K,V>)
+// Lookup uses the `eq` kernel prim (width-typed). map_get is WIDTH-GENERIC over the key width `N`
+// (M-718/M-753) and fully generic over the value type `V`. Missing key → None (never-silent, G2).
+// All ops are O(n) (Declared).
+type Map[K, V] = MNil | MCons(K, V, Map[K, V]);
+
+// map_empty: the empty Map. Total constructor (Exact).
+fn map_empty[K, V]() => Map[K, V] =
+  MNil;
+
+// map_insert: insert key `k` with value `v` at the head of the association list. O(1) cons (Exact
+// constructor). Does NOT deduplicate keys — the first occurrence wins on lookup (Declared).
+fn map_insert[K, V](k: K, v: V, m: Map[K, V]) => Map[K, V] =
+  MCons(k, v, m);
+
+// map_get: O(n) linear scan for key `k` in `m`. Returns Some(v) on the first match, None on miss.
+// Never-silent (G2): missing key → None, not a sentinel or panic. Width-GENERIC over the key width
+// `N` and fully generic over the value type `V` (M-718/M-753): the key is `Binary{N}` (compared by the
+// width-typed `eq` prim), the value `V` is opaque (only carried). Declared.
+fn map_get[V]{N}(m: Map[Binary{N}, V], k: Binary{N}) => Option[V] =
+  match m {
+    MNil => None,
+    MCons(k2, v, rest) => match eq(k, k2) { 0b1 => Some(v), _ => map_get(rest, k) }
+  };
+
+// ── Set — an association list of keys ─────────────────────────────────────────────────────────────
+//
+// Rep: SNil | SCons(x, Set<A>)
+// set_contains is WIDTH-GENERIC over the element width `N` (M-718/M-753) — same width-typed `eq`
+// constraint as map_get. All ops are O(n) (Declared). Constructors Exact.
+type Set[A] = SNil | SCons(A, Set[A]);
+
+// set_empty: the empty Set. Total constructor (Exact).
+fn set_empty[A]() => Set[A] =
+  SNil;
+
+// set_add: add element `x` to the front of the Set. O(1) cons (Exact constructor). Does NOT
+// deduplicate — a key may appear more than once; set_contains returns True on first match (Declared).
+fn set_add[A](x: A, s: Set[A]) => Set[A] =
+  SCons(x, s);
+
+// set_contains: O(n) linear scan — True iff `x` appears in `s`. Never-silent (G2): absent → False,
+// not a sentinel. Width-GENERIC over the element width `N` (M-718/M-753): the element is `Binary{N}`,
+// compared by the width-typed `eq` prim, monomorphized to the call-site width. Declared.
+fn set_contains{N}(s: Set[Binary{N}], x: Binary{N}) => Bool =
+  match s {
+    SNil => False,
+    SCons(h, rest) => match eq(x, h) { 0b1 => True, _ => set_contains(rest, x) }
+  };

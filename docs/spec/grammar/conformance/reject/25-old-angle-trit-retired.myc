@@ -1,0 +1,6 @@
+// rejected: the old angle-bracket balanced-ternary literal `<+0->` is RETIRED (RFC-0037 D4 — trit
+// literals now use the `0t…` prefix, e.g. `0t+0-`). With `<` demoted to the operator-only `LAngle`
+// glyph, a `<` at expression position is read as an operator, so the old trit literal is a
+// never-silent parse refusal at the expression, never a silent acceptance of the old angle form (G2).
+nodule bad;
+fn f() => Ternary{3} = <+0->

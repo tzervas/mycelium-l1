@@ -1,0 +1,8 @@
+// reject: RFC-0037 D2-b / DN-02 (M-915) — `vec` was explicitly REJECTED as the short repr-keyword
+// alias for `VSA` (it collides conceptually with `Vec` in `lib/std/collections.myc`); `hvec` is
+// used instead (accept/26). `vec` is therefore NOT a keyword — it lexes as a plain identifier, so
+// `vec{...}` in type position is a never-silent parse refusal (never a silent accept as a repr
+// type, G2): the parser expects a parameter-list delimiter after the bare identifier `vec`, not a
+// `{` descriptor.
+nodule d;
+fn f(x: vec{4, F32}) => Binary{8} = 0b0000_0000;

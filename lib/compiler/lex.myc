@@ -1,0 +1,856 @@
+// nodule: compiler.lex
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-05
+// @updated: 2026-07-05
+// @summary: Self-hosted L1 lexer (M-740 Stage 1; DN-26 §7.3 row 1). A faithful port of
+//   crates/mycelium-l1/src/lexer.rs's `lex` entry (the plain, comment-discarding path) over the
+//   token/position types this nodule redeclares from `compiler.token` (see FLAG-lex-0).
+nodule compiler.lex;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 1). `crates/mycelium-l1/src/lexer.rs` stays the trusted
+// differential oracle (DN-26 §7.4); this file is checked against it by
+// `crates/mycelium-l1/tests/compiler_stage1.rs` (token-stream differential over the accept-corpus).
+//
+// FLAG-lex-0 (self-contained; redeclares compiler.token). Per token.myc's own FLAG-token-4:
+// cross-nodule EXECUTION is staged today (`checkty.rs`'s `check_phylum` doc comment, ~line 1118:
+// "running a `use`d fn across nodules is a follow-up ... a cross-nodule call lowers to a
+// never-silent Unsupported/Residual"). So this nodule cannot `use compiler.token.*` and actually
+// RUN `keyword`/`Tok`/`Pos`/`Spanned` yet; it redeclares them byte-for-byte identically, mirroring
+// the established stdlib self-containment convention (`lib/std/text.myc`). Once cross-nodule
+// execution lands, a follow-up can delete this duplication and `use` the sibling nodule instead —
+// not this leaf's call to make (FLAGged up).
+//
+// Representation choices/deviations (each deliberate + honest — VR-5/G2):
+//
+// FLAG-lex-1 (source as Bytes, not Vec<char>). Rust's lexer decodes the source into `Vec<char>`
+// once so `chars[i]` is O(1) codepoint access. The `.myc` surface has no such buffer; the source is
+// kept as raw `Bytes` (UTF-8) and scanned BYTE-wise. This is behaviorally identical for this
+// grammar: every structural character (punctuation, digits, keyword letters, escape markers) is
+// ASCII, and ASCII bytes never collide with a UTF-8 continuation byte (continuation bytes are
+// always >= 0x80). So a `"` / `\` / newline / keyword letter is unambiguously recognized scanning
+// bytes, exactly as scanning chars would. Only [`step_pos`] needs to know the difference: it bumps
+// the COLUMN only on non-continuation bytes (mirroring "count codepoints, not bytes" — the
+// `is_cont_byte` predicate is the same 0x80..0xBF test `lib/std/text.myc::is_cont_byte` already
+// established for UTF-8 decoding).
+//
+// FLAG-lex-2 (literal-payload tokens carry Bytes verbatim; no eager numeric conversion at all,
+// INCLUDING `Int`). token.myc's FLAG-token-1/2 already carry `Ident`/`BinLit`/`BytesLit`/`TritLit`/
+// `StrLit`/`FloatLit`/`Int` as `Bytes`. This lexer does not even attempt the decimal/exponent FLOAT
+// EXTENSION Rust's `lex_int` performs (the `.` + fractional-digit / `e|E` + exponent lookahead) —
+// every digit run here lexes as `Int` only; a `.` after digits is left as a separate [`Tok::Dot`]
+// token (never consumed into a float). This is a real, deliberate scope narrowing (not just a
+// deferred conversion): no accept-corpus file (`docs/spec/grammar/conformance/accept/`) contains a
+// float literal (verified by grep during authoring), so nothing in the Stage-1 gate exercises this
+// gap, but it IS a true behavioral difference from the oracle and is reported as such, not silently
+// narrowed. A follow-up stage should port `lex_int`'s float-extension lookahead + the finite-value
+// gate (FLAG-lex-3) faithfully.
+//
+// FLAG-lex-3 (no float finite-value / overflow gate). Because floats are not scanned as a distinct
+// literal form (FLAG-lex-2), the finite-value / out-of-range refusal `lexer.rs::lex_int` performs
+// for `FloatLit` (ADR-040 §2.4: a literal whose correctly-rounded binary64 magnitude is not finite
+// is an explicit error) has no analog here. Also not enforced: `Int`'s own i64-range refusal
+// (`s.parse::<i64>()` failing) — moot here since `Int` carries verbatim digits, not a converted
+// value (FLAG-lex-2/token.myc FLAG-token-2). Neither gap is exercised by the accept-corpus.
+//
+// FLAG-lex-4 (ASCII-only whitespace, not `char::is_whitespace`). `skip_trivia` treats exactly
+// space/tab/CR/LF as trivia; Rust's `c.is_whitespace()` recognizes the broader Unicode White_Space
+// set. No accept-corpus file uses non-ASCII whitespace (grep-verified), so this is behaviorally
+// identical over the Stage-1 gate's actual input, but is a real, narrower gap than the oracle.
+//
+// FLAG-lex-5 (comment capture — `lex_with_comments`/`Comment` — is OUT OF SCOPE for this stage).
+// The token-STREAM differential (DN-26 §7.3) is defined over the token stream `lex` produces, which
+// already discards comments identically to Rust's plain `lex` path; the `mycfmt`-only comment
+// side-channel (`Comment`, `lex_with_comments`) belongs to a much later self-hosting stage (the
+// self-hosted formatter) and is not ported here.
+//
+// FLAG-lex-6 (checker bug — nested-constructor match panics; see
+// `crates/mycelium-l1/tests/compiler_stage1.rs`'s `FLAG-stage1-checker-1` for the full isolation).
+// A combined two-level pattern `Some(Scalar(SF16))` (unwrapping `Option[Tok]` and a payload
+// constructor in ONE match arm) panics `usefulness::useful_budgeted` when the outer type has ~80
+// variants (`Tok`). This nodule's OWN logic never matches on `Tok` at all (it only CONSTRUCTS
+// `Tok` values — `keyword`'s internal matching is on `Bytes`, inherited unchanged from
+// `compiler.token`), so the bug does not affect `lex` itself; it only constrains how the
+// DIFFERENTIAL TEST inspects the resulting token stream (documented at the test call site).
+
+// ── Option (local; no cross-leaf import) ────────────────────────────────────────────────────────
+type Option[A] = Some(A) | None;
+
+// ── Result (local; no cross-leaf import) ────────────────────────────────────────────────────────
+type Result[A, E] = Ok(A) | Err(E);
+
+// ── Pair (local helper product) ─────────────────────────────────────────────────────────────────
+type Pair[A, B] = Pr(A, B);
+
+// ── Pos (redeclared from compiler.token — FLAG-lex-0) ───────────────────────────────────────────
+type Pos = P(Binary{32}, Binary{32});
+
+fn pos_line(p: Pos) => Binary{32} =
+  match p { P(l, _) => l };
+
+fn pos_col(p: Pos) => Binary{32} =
+  match p { P(_, c) => c };
+
+// ── ScalarTok / StrengthTok (redeclared from compiler.token — FLAG-lex-0/token.myc FLAG-token-3) ──
+type ScalarTok = SF16 | SBf16 | SF32 | SF64;
+type StrengthTok = GExact | GProven | GEmpirical | GDeclared;
+
+// ── Tok (redeclared verbatim from compiler.token — FLAG-lex-0) ─────────────────────────────────
+type Tok =
+    Nodule | Phylum | Colony
+  | Hypha | Fuse | Mesh | Graft | Cyst | Xloc | Forage | Backbone | Tier | Reclaim
+  | Consume | Grow | Derive
+  | Use | Pub | Priv | Type | Trait | Impl | Fn | Matured | Thaw
+  | Let | In | If | Then | Else | Match | For | Swap
+  | Default | Paradigm | With | Wild | Spore | To | Policy
+  | Lambda | Object | Via | Lower
+  | KwBinary | KwTernary | KwDense | Vsa
+  | BinShort | TernShort | EmbShort | HvecShort
+  | KwSeq | KwBytes | KwFloat | KwSubstrate | KwSparse
+  | Scalar(ScalarTok) | Strength(StrengthTok)
+  | Ident(Bytes)
+  | BinLit(Bytes)
+  | BytesLit(Bytes)
+  | TritLit(Bytes)
+  | StrLit(Bytes)
+  | Int(Bytes)
+  | FloatLit(Bytes)
+  | LParen | RParen | LBrace | RBrace | LBracket | RBracket
+  | LAngle | RAngle | Shl | Shr
+  | At | AtStdSys
+  | Colon | Comma | Semi | Dot | Pipe
+  | Plus | Minus | Star | Slash | Percent | Caret | Amp | AmpAmp
+  | Eq | EqEq | Arrow | FatArrow | Bang | BangEq | PipePipe
+  | Eof;
+
+// ── Spanned (redeclared from compiler.token — FLAG-lex-0) ──────────────────────────────────────
+type Spanned = Sp(Tok, Pos);
+
+fn sp_tok(s: Spanned) => Tok =
+  match s { Sp(t, _) => t };
+
+fn sp_pos(s: Spanned) => Pos =
+  match s { Sp(_, p) => p };
+
+// ── keyword (redeclared verbatim from compiler.token — FLAG-lex-0) ─────────────────────────────
+// Identical to compiler.token::keyword; see token.myc for the full rationale/provenance note. Kept
+// byte-for-byte identical here so a future cross-nodule-execution enabler can delete this copy and
+// `use compiler.token.keyword` with no behavior change.
+fn keyword(word: Bytes) => Option[Tok] =
+    match bytes_eq(word, "nodule") {
+      0b1 => Some(Nodule),
+      _ =>
+      match bytes_eq(word, "phylum") {
+        0b1 => Some(Phylum),
+        _ =>
+        match bytes_eq(word, "colony") {
+          0b1 => Some(Colony),
+          _ =>
+          match bytes_eq(word, "hypha") {
+            0b1 => Some(Hypha),
+            _ =>
+            match bytes_eq(word, "fuse") {
+              0b1 => Some(Fuse),
+              _ =>
+              match bytes_eq(word, "mesh") {
+                0b1 => Some(Mesh),
+                _ =>
+                match bytes_eq(word, "graft") {
+                  0b1 => Some(Graft),
+                  _ =>
+                  match bytes_eq(word, "cyst") {
+                    0b1 => Some(Cyst),
+                    _ =>
+                    match bytes_eq(word, "xloc") {
+                      0b1 => Some(Xloc),
+                      _ =>
+                      match bytes_eq(word, "forage") {
+                        0b1 => Some(Forage),
+                        _ =>
+                        match bytes_eq(word, "backbone") {
+                          0b1 => Some(Backbone),
+                          _ =>
+                          match bytes_eq(word, "tier") {
+                            0b1 => Some(Tier),
+                            _ =>
+                            match bytes_eq(word, "reclaim") {
+                              0b1 => Some(Reclaim),
+                              _ =>
+                              match bytes_eq(word, "consume") {
+                                0b1 => Some(Consume),
+                                _ =>
+                                match bytes_eq(word, "grow") {
+                                  0b1 => Some(Grow),
+                                  _ =>
+                                  match bytes_eq(word, "lambda") {
+                                    0b1 => Some(Lambda),
+                                    _ =>
+                                    match bytes_eq(word, "object") {
+                                      0b1 => Some(Object),
+                                      _ =>
+                                      match bytes_eq(word, "via") {
+                                        0b1 => Some(Via),
+                                        _ =>
+                                        match bytes_eq(word, "lower") {
+                                          0b1 => Some(Lower),
+                                          _ =>
+                                          match bytes_eq(word, "derive") {
+                                            0b1 => Some(Derive),
+                                            _ =>
+                                            match bytes_eq(word, "use") {
+                                              0b1 => Some(Use),
+                                              _ =>
+                                              match bytes_eq(word, "pub") {
+                                                0b1 => Some(Pub),
+                                                _ =>
+                                                match bytes_eq(word, "priv") {
+                                                0b1 => Some(Priv),
+                                                _ =>
+                                                match bytes_eq(word, "type") {
+                                                  0b1 => Some(Type),
+                                                  _ =>
+                                                  match bytes_eq(word, "trait") {
+                                                    0b1 => Some(Trait),
+                                                    _ =>
+                                                    match bytes_eq(word, "impl") {
+                                                      0b1 => Some(Impl),
+                                                      _ =>
+                                                    match bytes_eq(word, "fn") {
+                                                      0b1 => Some(Fn),
+                                                      _ =>
+                                                    match bytes_eq(word, "matured") {
+                                                      0b1 => Some(Matured),
+                                                      _ =>
+                                                    match bytes_eq(word, "thaw") {
+                                                      0b1 => Some(Thaw),
+                                                      _ =>
+                                                    match bytes_eq(word, "let") {
+                                                      0b1 => Some(Let),
+                                                      _ =>
+                                                    match bytes_eq(word, "in") {
+                                                      0b1 => Some(In),
+                                                      _ =>
+                                                    match bytes_eq(word, "if") {
+                                                      0b1 => Some(If),
+                                                      _ =>
+                                                    match bytes_eq(word, "then") {
+                                                      0b1 => Some(Then),
+                                                      _ =>
+                                                    match bytes_eq(word, "else") {
+                                                      0b1 => Some(Else),
+                                                      _ =>
+                                                    match bytes_eq(word, "match") {
+                                                      0b1 => Some(Match),
+                                                      _ =>
+                                                    match bytes_eq(word, "for") {
+                                                      0b1 => Some(For),
+                                                      _ =>
+                                                    match bytes_eq(word, "swap") {
+                                                      0b1 => Some(Swap),
+                                                      _ =>
+                                                    match bytes_eq(word, "default") {
+                                                      0b1 => Some(Default),
+                                                      _ =>
+                                                    match bytes_eq(word, "paradigm") {
+                                                      0b1 => Some(Paradigm),
+                                                      _ =>
+                                                    match bytes_eq(word, "with") {
+                                                      0b1 => Some(With),
+                                                      _ =>
+                                                    match bytes_eq(word, "wild") {
+                                                      0b1 => Some(Wild),
+                                                      _ =>
+                                                    match bytes_eq(word, "spore") {
+                                                      0b1 => Some(Spore),
+                                                      _ =>
+                                                    match bytes_eq(word, "to") {
+                                                      0b1 => Some(To),
+                                                      _ =>
+                                                    match bytes_eq(word, "policy") {
+                                                      0b1 => Some(Policy),
+                                                      _ =>
+                                                    match bytes_eq(word, "Binary") {
+                                                      0b1 => Some(KwBinary),
+                                                      _ =>
+                                                    match bytes_eq(word, "Ternary") {
+                                                      0b1 => Some(KwTernary),
+                                                      _ =>
+                                                    match bytes_eq(word, "Dense") {
+                                                      0b1 => Some(KwDense),
+                                                      _ =>
+                                                    match bytes_eq(word, "VSA") {
+                                                      0b1 => Some(Vsa),
+                                                      _ =>
+                                                    match bytes_eq(word, "bin") {
+                                                      0b1 => Some(BinShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "tern") {
+                                                      0b1 => Some(TernShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "emb") {
+                                                      0b1 => Some(EmbShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "hvec") {
+                                                      0b1 => Some(HvecShort),
+                                                      _ =>
+                                                    match bytes_eq(word, "Seq") {
+                                                      0b1 => Some(KwSeq),
+                                                      _ =>
+                                                    match bytes_eq(word, "Bytes") {
+                                                      0b1 => Some(KwBytes),
+                                                      _ =>
+                                                    match bytes_eq(word, "Float") {
+                                                      0b1 => Some(KwFloat),
+                                                      _ =>
+                                                    match bytes_eq(word, "Substrate") {
+                                                      0b1 => Some(KwSubstrate),
+                                                      _ =>
+                                                    match bytes_eq(word, "Sparse") {
+                                                      0b1 => Some(KwSparse),
+                                                      _ =>
+                                                    match bytes_eq(word, "F16") {
+                                                      0b1 => Some(Scalar(SF16)),
+                                                      _ =>
+                                                    match bytes_eq(word, "BF16") {
+                                                      0b1 => Some(Scalar(SBf16)),
+                                                      _ =>
+                                                    match bytes_eq(word, "F32") {
+                                                      0b1 => Some(Scalar(SF32)),
+                                                      _ =>
+                                                    match bytes_eq(word, "F64") {
+                                                      0b1 => Some(Scalar(SF64)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Exact") {
+                                                      0b1 => Some(Strength(GExact)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Proven") {
+                                                      0b1 => Some(Strength(GProven)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Empirical") {
+                                                      0b1 => Some(Strength(GEmpirical)),
+                                                      _ =>
+                                                    match bytes_eq(word, "Declared") {
+                                                      0b1 => Some(Strength(GDeclared)),
+                                                      _ =>
+                                                      None
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ;
+
+// ── Vec (local token-stream list; mirrors Rust's growable `Vec<Spanned>` as a cons-list — the
+// established stdlib representation for a growable sequence, since the surface has no array/Vec
+// primitive; std.core/std.diag use the identical convention) ───────────────────────────────────
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// tok_count: the number of tokens in a Vec[Spanned] (structural spine-walk; matches only Nil/Cons,
+// never Tok itself — cheap and safe, see FLAG-lex-6).
+fn tok_count(v: Vec[Spanned]) => Binary{32} =
+  match v {
+    Nil => 0b0000_0000_0000_0000_0000_0000_0000_0000,
+    Cons(_, rest) => add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, tok_count(rest))
+  };
+
+// nth: the token at 0-based index `n`, or `None` if out of range. Lets a differential test inspect
+// ONE token's `Tok`/`Pos` at a time without ever matching multiple `Tok` sites in the same nodule
+// check pass (FLAG-lex-6's mitigation).
+fn nth(v: Vec[Spanned], n: Binary{32}) => Option[Spanned] =
+  match v {
+    Nil => None,
+    Cons(x, rest) => match eq(n, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+      0b1 => Some(x),
+      _ => nth(rest, sub_u(n, 0b0000_0000_0000_0000_0000_0000_0000_0001))
+    }
+  };
+
+// ── LexErr ───────────────────────────────────────────────────────────────────────────────────────
+// A lex failure at a source position (mirrors error.rs::ParseError's token-relevant shape — DN-26
+// §7.1's small token<->error 2-cycle). The message is a STATIC Bytes literal, not interpolated with
+// the offending value (FLAG-lex-7): the Stage-1 gate (DN-26 §7.3) is defined over the ACCEPT
+// corpus, which by definition never triggers a lex error, so message-content fidelity is not
+// load-bearing for this stage; never-silent POSITION + occurrence still holds (an error is always
+// an explicit Err, never a panic/silent skip).
+type LexErr = LE(Pos, Bytes);
+
+// ── St (lexer position/cursor state; explicit, threaded — no mutation in a value-semantics
+// language) ──────────────────────────────────────────────────────────────────────────────────────
+type St = S(Binary{32}, Binary{32}, Binary{32});
+
+fn st_i(s: St) => Binary{32} =
+  match s { S(i, _, _) => i };
+
+fn st_line(s: St) => Binary{32} =
+  match s { S(_, l, _) => l };
+
+fn st_col(s: St) => Binary{32} =
+  match s { S(_, _, c) => c };
+
+fn st_pos(s: St) => Pos =
+  P(st_line(s), st_col(s));
+
+// ── empty_bytes ──────────────────────────────────────────────────────────────────────────────────
+// A zero-length Bytes value. The `0x…` literal form REQUIRES at least one hex digit (lexer.rs's own
+// never-silent "0x has no hex digits" rule), so there is no direct empty-Bytes literal; a zero-width
+// `bytes_slice` (start == end, a valid non-inverted range) is the honest construction.
+fn empty_bytes() => Bytes =
+  bytes_slice(0x00, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000);
+
+// ── byte classification (Exact; total via `lt`/`eq` + the bool bridge, mirrors std.text's
+// is_ascii_byte/is_cont_byte pattern) ────────────────────────────────────────────────────────────
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn bool_or(a: Bool, b: Bool) => Bool =
+  match a { True => True, False => b };
+
+fn eq_b(a: Binary{8}, b: Binary{8}) => Bool =
+  match eq(a, b) { 0b1 => True, _ => False };
+
+fn lt_b(a: Binary{8}, b: Binary{8}) => Bool =
+  match lt(a, b) { 0b1 => True, _ => False };
+
+// le_b: a <= b, i.e. NOT (b < a).
+fn le_b(a: Binary{8}, b: Binary{8}) => Bool =
+  match lt(b, a) { 0b1 => False, _ => True };
+
+fn in_range(c: Binary{8}, lo: Binary{8}, hi: Binary{8}) => Bool =
+  bool_and(le_b(lo, c), le_b(c, hi));
+
+// UTF-8 continuation byte: 0x80..0xBF (mirrors lib/std/text.myc::is_cont_byte exactly).
+fn is_cont_byte(c: Binary{8}) => Bool =
+  in_range(c, 0b1000_0000, 0b1011_1111);
+
+fn is_digit(c: Binary{8}) => Bool =
+  in_range(c, 0b0011_0000, 0b0011_1001); // '0'..'9'
+
+fn is_upper(c: Binary{8}) => Bool =
+  in_range(c, 0b0100_0001, 0b0101_1010); // 'A'..'Z'
+
+fn is_lower(c: Binary{8}) => Bool =
+  in_range(c, 0b0110_0001, 0b0111_1010); // 'a'..'z'
+
+fn is_alpha(c: Binary{8}) => Bool =
+  bool_or(is_upper(c), is_lower(c));
+
+fn is_ident_start(c: Binary{8}) => Bool =
+  bool_or(is_alpha(c), eq_b(c, 0b0101_1111)); // '_'
+
+fn is_ident_continue(c: Binary{8}) => Bool =
+  bool_or(is_ident_start(c), is_digit(c));
+
+fn is_hex_digit(c: Binary{8}) => Bool =
+  bool_or(is_digit(c), bool_or(in_range(c, 0b0110_0001, 0b0110_0110), in_range(c, 0b0100_0001, 0b0100_0110))); // 'a'-'f' / 'A'-'F'
+
+fn is_bin_digit(c: Binary{8}) => Bool =
+  bool_or(eq_b(c, 0b0011_0000), eq_b(c, 0b0011_0001)); // '0' / '1'
+
+fn is_trit_glyph(c: Binary{8}) => Bool =
+  bool_or(eq_b(c, 0b0010_1011), bool_or(eq_b(c, 0b0011_0000), eq_b(c, 0b0010_1101))); // '+' / '0' / '-'
+
+fn is_underscore(c: Binary{8}) => Bool =
+  eq_b(c, 0b0101_1111);
+
+fn is_ascii_ws(c: Binary{8}) => Bool =
+  bool_or(eq_b(c, 0b0010_0000), bool_or(eq_b(c, 0b0000_1001), bool_or(eq_b(c, 0b0000_1101), eq_b(c, 0b0000_1010)))); // ' ' \t \r \n
+
+fn is_nl_or_cr(c: Binary{8}) => Bool =
+  bool_or(eq_b(c, 0b0000_1010), eq_b(c, 0b0000_1101)); // \n / \r
+
+// ── source access + position advance ─────────────────────────────────────────────────────────────
+fn src_peek(src: Bytes, i: Binary{32}) => Option[Binary{8}] =
+  match lt(i, bytes_len(src)) { 0b1 => Some(bytes_get(src, i)), _ => None };
+
+// step_pos: the position AFTER consuming byte `c` (FLAG-lex-1: bumps line on '\n', else bumps
+// column only on a non-continuation byte — "count codepoints, not bytes").
+fn step_pos(c: Binary{8}, s: St) => St =
+  match eq_b(c, 0b0000_1010) {
+    True => S(add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001), add_u(st_line(s), 0b0000_0000_0000_0000_0000_0000_0000_0001), 0b0000_0000_0000_0000_0000_0000_0000_0001),
+    False => match is_cont_byte(c) {
+      True => S(add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001), st_line(s), st_col(s)),
+      False => S(add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001), st_line(s), add_u(st_col(s), 0b0000_0000_0000_0000_0000_0000_0000_0001))
+    }
+  };
+
+// bump: consume one byte at the current position (never-silent no-op at EOF — total).
+fn bump(src: Bytes, s: St) => St =
+  match src_peek(src, st_i(s)) { None => s, Some(c) => step_pos(c, s) };
+
+// advance_n: bump `n` times (used after a run-length scan to jump the cursor past a lexeme).
+fn advance_n(src: Bytes, s: St, n: Binary{32}) => St =
+  match eq(n, 0b0000_0000_0000_0000_0000_0000_0000_0000) { 0b1 => s, _ => advance_n(src, bump(src, s), sub_u(n, 0b0000_0000_0000_0000_0000_0000_0000_0001)) };
+
+// ── trivia (whitespace + `//` comments; discarded, never captured — FLAG-lex-5) ────────────────
+fn skip_to_eol(src: Bytes, s: St) => St =
+  match src_peek(src, st_i(s)) {
+    None => s,
+    Some(c) => match is_nl_or_cr(c) { True => s, False => skip_to_eol(src, bump(src, s)) }
+  };
+
+fn skip_trivia(src: Bytes, s: St) => St =
+  match src_peek(src, st_i(s)) {
+    None => s,
+    Some(c) => match is_ascii_ws(c) {
+      True => skip_trivia(src, bump(src, s)),
+      False => match eq_b(c, 0b0010_1111) { // '/'
+        True => match src_peek(src, add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001)) {
+          Some(c2) => match eq_b(c2, 0b0010_1111) {
+            True => skip_trivia(src, skip_to_eol(src, s)),
+            False => s
+          },
+          None => s
+        },
+        False => s
+      }
+    }
+  };
+
+// ── run-length scanners (return a length/Pair; the lexeme itself is taken via bytes_slice) ─────
+fn run_len_ident(src: Bytes, i: Binary{32}) => Binary{32} =
+  match src_peek(src, i) {
+    None => 0b0000_0000_0000_0000_0000_0000_0000_0000,
+    Some(c) => match is_ident_continue(c) { True => add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, run_len_ident(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001))), False => 0b0000_0000_0000_0000_0000_0000_0000_0000 }
+  };
+
+fn run_len_digits(src: Bytes, i: Binary{32}) => Binary{32} =
+  match src_peek(src, i) {
+    None => 0b0000_0000_0000_0000_0000_0000_0000_0000,
+    Some(c) => match is_digit(c) { True => add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, run_len_digits(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001))), False => 0b0000_0000_0000_0000_0000_0000_0000_0000 }
+  };
+
+// scan_bin_run: Pair(total run length INCLUDING `_` separators, count of actual `0`/`1` digits).
+fn scan_bin_run(src: Bytes, i: Binary{32}) => Pair[Binary{32}, Binary{32}] =
+  match src_peek(src, i) {
+    None => Pr(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000),
+    Some(c) => match is_bin_digit(c) {
+      True => match scan_bin_run(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001)) { Pr(l, d) => Pr(add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, l), add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, d)) },
+      False => match is_underscore(c) {
+        True => match scan_bin_run(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001)) { Pr(l, d) => Pr(add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, l), d) },
+        False => Pr(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000)
+      }
+    }
+  };
+
+// scan_hex_run: Pair(total run length INCLUDING `_` separators, count of actual hex digits).
+fn scan_hex_run(src: Bytes, i: Binary{32}) => Pair[Binary{32}, Binary{32}] =
+  match src_peek(src, i) {
+    None => Pr(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000),
+    Some(c) => match is_hex_digit(c) {
+      True => match scan_hex_run(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001)) { Pr(l, d) => Pr(add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, l), add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, d)) },
+      False => match is_underscore(c) {
+        True => match scan_hex_run(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001)) { Pr(l, d) => Pr(add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, l), d) },
+        False => Pr(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000)
+      }
+    }
+  };
+
+// scan_trit_run: total count of trit glyphs (`+`/`0`/`-`; no `_` separator in the trit grammar).
+fn scan_trit_run(src: Bytes, i: Binary{32}) => Binary{32} =
+  match src_peek(src, i) {
+    None => 0b0000_0000_0000_0000_0000_0000_0000_0000,
+    Some(c) => match is_trit_glyph(c) { True => add_u(0b0000_0000_0000_0000_0000_0000_0000_0001, scan_trit_run(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001))), False => 0b0000_0000_0000_0000_0000_0000_0000_0000 }
+  };
+
+// ── string literal escape decode (M-910/M-911; \n \t \\ \" \0 \r) ──────────────────────────────
+// scan_string_escape: `s` is the position of the char AFTER the backslash. Returns the decoded
+// single-byte payload + the position after the escape's closing char.
+fn scan_string_escape(src: Bytes, s: St) => Result[Pair[Bytes, St], LexErr] =
+  match src_peek(src, st_i(s)) {
+    None => Err(LE(st_pos(s), "unterminated string literal (trailing backslash)")),
+    Some(c) =>
+      match eq_b(c, 0b0110_1110) { True => Ok(Pr(0x0a, bump(src, s))), False => // \n
+      match eq_b(c, 0b0111_0100) { True => Ok(Pr(0x09, bump(src, s))), False => // \t
+      match eq_b(c, 0b0101_1100) { True => Ok(Pr(0x5c, bump(src, s))), False => // \\
+      match eq_b(c, 0b0010_0010) { True => Ok(Pr(0x22, bump(src, s))), False => // \"
+      match eq_b(c, 0b0011_0000) { True => Ok(Pr(0x00, bump(src, s))), False => // \0
+      match eq_b(c, 0b0111_0010) { True => Ok(Pr(0x0d, bump(src, s))), False => // \r
+      Err(LE(st_pos(s), "unknown escape sequence (supported: \\n \\t \\\\ \\\" \\0 \\r)"))
+      }}}}}}
+};
+
+// scan_string: `s` is the position right after the opening `"`. Returns the DECODED content + the
+// position right after the closing `"` (never-silent: unterminated / raw newline / bad escape are
+// explicit `Err`, matching lexer.rs::lex_string's contract — see FLAG-lex-7 for message fidelity).
+fn scan_string(src: Bytes, s: St) => Result[Pair[Bytes, St], LexErr] =
+  match src_peek(src, st_i(s)) {
+    None => Err(LE(st_pos(s), "unterminated string literal (EOF)")),
+    Some(c) => match eq_b(c, 0b0010_0010) { // closing '"'
+      True => Ok(Pr(empty_bytes(), bump(src, s))),
+      False => match is_nl_or_cr(c) {
+        True => Err(LE(st_pos(s), "unterminated string literal (raw newline)")),
+        False => match eq_b(c, 0b0101_1100) { // '\'
+          True => match scan_string_escape(src, bump(src, s)) {
+            Err(e) => Err(e),
+            Ok(pr1) => match pr1 {
+              Pr(esc, s2) => match scan_string(src, s2) {
+                Err(e) => Err(e),
+                Ok(pr2) => match pr2 { Pr(rest, s3) => Ok(Pr(bytes_concat(esc, rest), s3)) }
+              }
+            }
+          },
+          False => match scan_string(src, bump(src, s)) {
+            Err(e) => Err(e),
+            Ok(pr) => match pr {
+              Pr(rest, s3) => Ok(Pr(bytes_concat(bytes_slice(src, st_i(s), add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001)), rest), s3))
+            }
+          }
+        }
+      }
+    }
+  };
+
+// ── multi-char operator dispatchers (each `s` at the FIRST byte, not yet consumed) ──────────────
+fn lex_rangle(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0011_1110) { True => Pr(Shr, bump(src, s1)), False => Pr(RAngle, s1) },
+    None => Pr(RAngle, s1)
+  };
+
+fn lex_langle(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0011_1100) { True => Pr(Shl, bump(src, s1)), False => Pr(LAngle, s1) },
+    None => Pr(LAngle, s1)
+  };
+
+fn lex_amp(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0010_0110) { True => Pr(AmpAmp, bump(src, s1)), False => Pr(Amp, s1) },
+    None => Pr(Amp, s1)
+  };
+
+fn lex_pipe(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0111_1100) { True => Pr(PipePipe, bump(src, s1)), False => Pr(Pipe, s1) },
+    None => Pr(Pipe, s1)
+  };
+
+fn lex_bang(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0011_1101) { True => Pr(BangEq, bump(src, s1)), False => Pr(Bang, s1) },
+    None => Pr(Bang, s1)
+  };
+
+fn lex_eq(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0011_1110) { True => Pr(FatArrow, bump(src, s1)), False => // '>'
+      match eq_b(c, 0b0011_1101) { True => Pr(EqEq, bump(src, s1)), False => Pr(Eq, s1) } }, // '='
+    None => Pr(Eq, s1)
+  };
+
+fn lex_dash(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  match src_peek(src, st_i(s1)) {
+    Some(c) => match eq_b(c, 0b0011_1110) { True => Pr(Arrow, bump(src, s1)), False => Pr(Minus, s1) }, // '>'
+    None => Pr(Minus, s1)
+  };
+
+// `@` vs the atomic `@std-sys` nodule-header marker (M-661; mirrors lexer.rs::lex_at exactly, now
+// expressible directly via the `bytes_eq` prim, M-912).
+fn lex_at(src: Bytes, s: St) => Pair[Tok, St] =
+  let s1 = bump(src, s) in
+  let i1 = st_i(s1) in
+  match lt(bytes_len(src), add_u(i1, 0b0000_0000_0000_0000_0000_0000_0000_0111)) {
+    0b1 => Pr(At, s1), // fewer than 7 bytes remain: cannot be "std-sys"
+    _ => match bytes_eq(bytes_slice(src, i1, add_u(i1, 0b0000_0000_0000_0000_0000_0000_0000_0111)), "std-sys") {
+      0b1 => match src_peek(src, add_u(i1, 0b0000_0000_0000_0000_0000_0000_0000_0111)) {
+        None => Pr(AtStdSys, advance_n(src, s1, 0b0000_0000_0000_0000_0000_0000_0000_0111)),
+        Some(nc) => match is_ident_continue(nc) {
+          True => Pr(At, s1), // e.g. "@std-system" is NOT the marker (whole-word check)
+          False => Pr(AtStdSys, advance_n(src, s1, 0b0000_0000_0000_0000_0000_0000_0000_0111))
+        }
+      },
+      _ => Pr(At, s1)
+    }
+  };
+
+// ── literal lexers ───────────────────────────────────────────────────────────────────────────────
+fn lex_ident(src: Bytes, s: St) => Pair[Tok, St] =
+  let n = run_len_ident(src, st_i(s)) in
+  let word = bytes_slice(src, st_i(s), add_u(st_i(s), n)) in
+  let s2 = advance_n(src, s, n) in
+  match keyword(word) { Some(t) => Pr(t, s2), None => Pr(Ident(word), s2) };
+
+// lex_int: a non-negative decimal digit run, verbatim (FLAG-lex-2: no float extension, no eager
+// numeric conversion — a structural deviation from lexer.rs, deliberately scoped, no accept-corpus
+// input exercises the gap).
+fn lex_int(src: Bytes, s: St) => Pair[Tok, St] =
+  let n = run_len_digits(src, st_i(s)) in
+  let word = bytes_slice(src, st_i(s), add_u(st_i(s), n)) in
+  Pr(Int(word), advance_n(src, s, n));
+
+fn lex_binlit(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  let s1 = advance_n(src, s, 0b0000_0000_0000_0000_0000_0000_0000_0010) in // consume "0b"
+  match scan_bin_run(src, st_i(s1)) {
+    Pr(len, digits) => match eq(digits, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+      0b1 => Err(LE(st_pos(s), "binary literal `0b` has no digits")),
+      _ => let word = bytes_slice(src, st_i(s1), add_u(st_i(s1), len)) in
+           Ok(Pr(BinLit(word), advance_n(src, s1, len)))
+    }
+  };
+
+// Even-hex-digit-count check (RFC-0032 D4: a byte is two hex chars): `and(digits, 1)` masks the
+// low bit — `0` iff `digits` is even. `and` requires same-width operands; the bare `1` anchors to
+// `digits`'s width (Binary{32}, RFC-0012 ambient bare-decimal inference).
+fn lex_hexlit(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  let s1 = advance_n(src, s, 0b0000_0000_0000_0000_0000_0000_0000_0010) in // consume "0x"
+  match scan_hex_run(src, st_i(s1)) {
+    Pr(len, digits) => match eq(digits, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+      0b1 => Err(LE(st_pos(s), "byte-string literal `0x` has no hex digits")),
+      _ => match eq(and(digits, 0b0000_0000_0000_0000_0000_0000_0000_0001), 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+        0b1 => Ok(Pr(BytesLit(bytes_slice(src, st_i(s1), add_u(st_i(s1), len))), advance_n(src, s1, len))),
+        _ => Err(LE(st_pos(s), "byte-string literal `0x` has an odd hex-digit count"))
+      }
+    }
+  };
+
+fn lex_tritlit(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  let s1 = advance_n(src, s, 0b0000_0000_0000_0000_0000_0000_0000_0010) in // consume "0t"
+  let n = scan_trit_run(src, st_i(s1)) in
+  match eq(n, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+    0b1 => Err(LE(st_pos(s), "balanced-ternary literal `0t` has no trits")),
+    _ => Ok(Pr(TritLit(bytes_slice(src, st_i(s1), add_u(st_i(s1), n))), advance_n(src, s1, n)))
+  };
+
+fn lex_string(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  match scan_string(src, bump(src, s)) {
+    Err(e) => Err(e),
+    Ok(pr) => match pr { Pr(content, s2) => Ok(Pr(StrLit(content), s2)) }
+  };
+
+// `0` followed by `b`/`x`/`t` opens a base-prefixed literal; otherwise a plain decimal int.
+fn lex_zero_prefixed(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  match src_peek(src, add_u(st_i(s), 0b0000_0000_0000_0000_0000_0000_0000_0001)) {
+    Some(c2) =>
+      match eq_b(c2, 0b0110_0010) { True => lex_binlit(src, s), False => // 'b'
+      match eq_b(c2, 0b0111_1000) { True => lex_hexlit(src, s), False => // 'x'
+      match eq_b(c2, 0b0111_0100) { True => lex_tritlit(src, s), False => // 't'
+      Ok(lex_int(src, s))
+      }}},
+    None => Ok(lex_int(src, s))
+  };
+
+// ── next_token: the per-token dispatcher (mirrors lexer.rs::Lexer::run's big `match c { ... }`) ──
+fn next_token(src: Bytes, s: St) => Result[Pair[Tok, St], LexErr] =
+  match src_peek(src, st_i(s)) {
+    None => Ok(Pr(Eof, s)),
+    Some(c) =>
+      match eq_b(c, 0b0010_1000) { True => Ok(Pr(LParen, bump(src, s))), False => // (
+      match eq_b(c, 0b0010_1001) { True => Ok(Pr(RParen, bump(src, s))), False => // )
+      match eq_b(c, 0b0111_1011) { True => Ok(Pr(LBrace, bump(src, s))), False => // {
+      match eq_b(c, 0b0111_1101) { True => Ok(Pr(RBrace, bump(src, s))), False => // }
+      match eq_b(c, 0b0101_1011) { True => Ok(Pr(LBracket, bump(src, s))), False => // [
+      match eq_b(c, 0b0101_1101) { True => Ok(Pr(RBracket, bump(src, s))), False => // ]
+      match eq_b(c, 0b0011_1110) { True => Ok(lex_rangle(src, s)), False => // >
+      match eq_b(c, 0b0100_0000) { True => Ok(lex_at(src, s)), False => // @
+      match eq_b(c, 0b0011_1010) { True => Ok(Pr(Colon, bump(src, s))), False => // :
+      match eq_b(c, 0b0010_1100) { True => Ok(Pr(Comma, bump(src, s))), False => // ,
+      match eq_b(c, 0b0011_1011) { True => Ok(Pr(Semi, bump(src, s))), False => // ;
+      match eq_b(c, 0b0010_1110) { True => Ok(Pr(Dot, bump(src, s))), False => // .
+      match eq_b(c, 0b0111_1100) { True => Ok(lex_pipe(src, s)), False => // |
+      match eq_b(c, 0b0010_0001) { True => Ok(lex_bang(src, s)), False => // !
+      match eq_b(c, 0b0010_1011) { True => Ok(Pr(Plus, bump(src, s))), False => // +
+      match eq_b(c, 0b0010_1010) { True => Ok(Pr(Star, bump(src, s))), False => // *
+      match eq_b(c, 0b0010_1111) { True => Ok(Pr(Slash, bump(src, s))), False => // /
+      match eq_b(c, 0b0010_0101) { True => Ok(Pr(Percent, bump(src, s))), False => // %
+      match eq_b(c, 0b0101_1110) { True => Ok(Pr(Caret, bump(src, s))), False => // ^
+      match eq_b(c, 0b0010_0110) { True => Ok(lex_amp(src, s)), False => // &
+      match eq_b(c, 0b0011_1100) { True => Ok(lex_langle(src, s)), False => // <
+      match eq_b(c, 0b0011_1101) { True => Ok(lex_eq(src, s)), False => // =
+      match eq_b(c, 0b0010_1101) { True => Ok(lex_dash(src, s)), False => // -
+      match eq_b(c, 0b0010_0010) { True => lex_string(src, s), False => // "
+      match eq_b(c, 0b0011_0000) { True => lex_zero_prefixed(src, s), False => // 0
+      match is_digit(c) { True => Ok(lex_int(src, s)), False =>
+      match is_ident_start(c) { True => Ok(lex_ident(src, s)), False =>
+      Err(LE(st_pos(s), "unexpected character"))
+      }}}}}}}}}}}}}}}}}}}}}}}}}}}
+};
+
+// ── run / lex ────────────────────────────────────────────────────────────────────────────────────
+fn run(src: Bytes, s: St) => Result[Vec[Spanned], LexErr] =
+  let s1 = skip_trivia(src, s) in
+  match src_peek(src, st_i(s1)) {
+    None => Ok(Cons(Sp(Eof, st_pos(s1)), Nil)),
+    Some(_) => match next_token(src, s1) {
+      Err(e) => Err(e),
+      Ok(pr) => match pr {
+        Pr(tok, s2) => match run(src, s2) {
+          Err(e) => Err(e),
+          Ok(rest) => Ok(Cons(Sp(tok, st_pos(s1)), rest))
+        }
+      }
+    }
+  };
+
+// lex: tokenize `src` into a `Spanned` stream terminated by `Eof` (mirrors lexer.rs::lex). Comments
+// are discarded (FLAG-lex-5); never-silent on any lexically invalid input (an explicit `Err`, never
+// a panic or a silently-skipped character).
+fn lex(src: Bytes) => Result[Vec[Spanned], LexErr] =
+  run(src, S(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0001, 0b0000_0000_0000_0000_0000_0000_0000_0001));

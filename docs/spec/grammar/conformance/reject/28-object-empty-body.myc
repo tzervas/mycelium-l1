@@ -1,0 +1,7 @@
+// rejected: an `object` body must start with a constructor clause (`Name(T1, T2);`) before any
+// `via`, `impl`, or `fn` items — an empty body is a never-silent parse error (DN-53 §A.2.1;
+// M-811; G2). The constructor is the data form that `object` desugars its `TypeDecl` from;
+// without it the desugar has no `Ctor` and the lowering is undefined.
+nodule bad.composition;
+object NoData {
+}

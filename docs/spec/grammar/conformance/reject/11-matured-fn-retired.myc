@@ -1,0 +1,7 @@
+// rejected: `matured` is no longer a fn/definition modifier (RFC-0017, 2026-06-18). Maturation is
+// declared per `nodule`/`phylum` in the header (`// @matured: true`) or per program in the manifest —
+// the unit of maturation is the SCOPE, not the function. The diagnostic teaches the scope form.
+// `matured` stays a reserved word (the header key), so this is a reserved-word-misuse parse error,
+// never a silent accept. (De-maturation of one def uses `thaw fn …`; RFC-0017 §4.3.)
+nodule kernel;
+matured fn identity(x: Binary{8}) => Binary{8} = x

@@ -1,0 +1,14 @@
+// exercises: a trait declaration with a coherent instance that type-checks — the stage-1 trait
+// surface (M-659 / RFC-0019 §4.1/§4.5; RFC-0007 §12). The `impl Trait<args> for T { fn … }`
+// production and a single-parameter trait both parse; the instance is coherent (orphan rule
+// satisfied — both the trait and the type are local; global uniqueness holds: one instance per
+// (trait, type-head)).
+nodule algebra;
+
+trait Negate[A] {
+    fn negate(x: A) => A;
+};
+
+impl Negate[Ternary{6}] for Ternary{6} {
+    fn negate(x: Ternary{6}) => Ternary{6} = neg(x);
+};

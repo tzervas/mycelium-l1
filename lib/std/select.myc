@@ -1,0 +1,580 @@
+// nodule: std.select
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted structural selection/decision surface — a reified, total decision table
+nodule std.select;
+
+//   whose every selection emits a mandatory, inspectable Explanation (EXPLAIN-able choice logic
+//   as language code); ports the EXPRESSIBLE surface of crates/mycelium-std-select (M-928,
+//   E29-1, RFC-0031 §5 D5; kickoff opp; docs/spec/stdlib/select.md).
+// ── Surface-check (D5 row 1, Empirical, 2026-07-02) ─────────────────────────────────────────────
+//
+// crates/mycelium-std-select's public surface = 5 exported ops (build/policy_ref/select/explain/
+// select_with_override), the guarantee matrix as data (GuaranteeRow/GuaranteeTag/ExplainAble/
+// GUARANTEE_MATRIX), and re-exports of the kernel `mycelium-select` vocabulary (Predicate/Rule/
+// Action/Candidate/CostModel/SelectionInputs/SelectionPolicy/Explanation/CandidateCost/
+// PolicyError/SelectError/ParadigmKind/DecodeFacts/DecodeMethod/PolicyRegistry + the site
+// adapters). Checked against today's `.myc` surface (parser/checker in crates/mycelium-l1/src):
+//
+// PORTED (the structural selection surface — RFC-0005 §2's form, verbatim where expressible):
+// - ParadigmKind (→ `Kind`, K-prefixed), ScalarKind (→ Sk-prefixed: `F16`/`BF16`/`F32`/`F64` are
+//   reserved scalar-kind type keywords), a structural Repr descriptor (`ReprDesc`, all six kernel
+//   paradigm kinds incl. recursive Seq) + `kind_of`.
+// - The exact storage-bits cost model over Repr candidates (RFC-0005 §2: declared unit = bits;
+//   DN-01 two-bit-per-trit; dim × dtype-bits for Dense; 64/96 bits per component for Vsa
+//   dense/sparse; len × elem-bits for Seq; 0 for Bytes — the honest static lower bound).
+// - The Predicate structural language: Always, SrcKindIs, DtypeIs, GuaranteeAtLeast (kernel
+//   rank ≤, Exact ⊐ Proven ⊐ Empirical ⊐ Declared), DeclaredSparse, And/Or/Not (see the arity
+//   substitution below) — total structural recursion, not Turing-complete (RFC-0005 §2.1).
+// - Action (Choose/Cheapest with deterministic ties-to-lowest-index), Rule (first match wins —
+//   fixed declared precedence), SelectionPolicy (name is a `Bytes` string literal — the
+//   load-bearing string payload of the Rust `impl Into<String>` field), `build` validation
+//   (NoCandidates / IndexOutOfRange — C1: never a silent completion of a non-total table).
+// - select / explain / select_with_override, each emitting the mandatory `Explanation`
+//   {policy_name, inputs considered, cost of EVERY candidate (the full ranking), matched rule,
+//   chosen index + candidate, override state} — C3: no code path returns a choice without one.
+// - The guarantee matrix as CHECKED DATA (diag-port precedent) for the 4 ported ops.
+//
+// FLAGGED — NOT expressible today, no enabler landed (never forced, VR-5/G2):
+// - FLAG-select-1 (`PolicyRef`/`policy_ref`/`Explanation.policy`): the content address is a
+//   kernel `mycelium_core::ContentHash` — BLAKE3 over a serde-canonical JSON encoding (RFC-0005
+//   §3; ADR-003). No content-hash primitive is exposed to `.myc` (RFC-0031 D1 — the kernel stays
+//   Rust; same boundary as FLAG-recover-1). `Explanation` carries `policy_name` (the Bytes
+//   payload); the hash field is NOT fabricated. "Which policy chose this?" remains answerable by
+//   name here; by content address only through the retained Rust oracle.
+// - FLAG-select-2 (float domain): `CostModel.storage_weight: f64`, `PolicyError::BadCost`,
+//   `PolicyError::BadPredicateLiteral`, and `Predicate::ErrorEpsAtMost(f64)` need a float
+//   surface `.myc` does not have (the float workstream is its own epic — ADR-040/M-895). The
+//   ported cost IS the raw declared storage-bits integer (equivalent to the oracle at
+//   storage_weight = 1.0, which is what the differential pins); the two build refusals and the
+//   eps predicate are captured here, not faked.
+// - FLAG-select-3 (site adapters — the D1 kernel-dispatch boundary the kickoff named):
+//   select_swap_target / select_packing / select_decode_method / select_layout /
+//   record_packing_layout, BITNET_PACKINGS / layout_of / bitnet_packing_policy, and the
+//   `Candidate::Packing`/`Candidate::Decode` arms. These dispatch on kernel `Repr`/`PackScheme`/
+//   `PhysicalLayout`/`Meta` values and carry fractional bits/element costs (1.6 / 1.67 — float
+//   domain again). `Cand` here has only the `CRepr` arm; `SelectError::WrongSiteKind` and
+//   `SelectError::NonTernarySource` (site-adapter refusals) consequently have no `.myc` analog.
+// - FLAG-select-4 (decode-site predicates + non-ported inputs fields): CapacityAtMost (u128),
+//   FactorsAtMost, InResonatorRegime, `DecodeFacts`, and the `SelectionInputs.bound`/`sparsity`/
+//   `decode` fields — u128/f64/kernel-`Bound` domain, and they exist for the FLAG-select-3
+//   decode adapter. `Inputs` here carries the two fields the ported predicates read: the source
+//   descriptor and the guarantee strength. DeclaredSparse reads the src descriptor (as the
+//   kernel's does — `Repr::Vsa { sparsity: Sparse, .. }`), not the dropped sparsity observation.
+// - FLAG-select-5 (`PolicyRegistry`): keyed by ContentHash (FLAG-select-1); a name-keyed
+//   substitute needs a `bytes_eq` prim RFC-0032 D4 does not expose (the known gap std.diag /
+//   std.recover FLAGged). Not ported.
+//
+// SUBSTITUTIONS made honestly (never a silent signature change — VR-5/G2):
+// - `Predicate::All(Vec<_>)`/`Any(Vec<_>)` are the BINARY connectives `PAnd`/`POr` (direct
+//   self-recursion, the Vec cons-list precedent): any n-ary form is expressed by nesting —
+//   `All([p,q,r])` ≡ `PAnd(p, PAnd(q, r))`, the empty `All([])` ≡ `PAlways`. Same denotation;
+//   only the arity of the constructor differs (documented, not silent).
+// - `usize` indices/counts are `Binary{8}` (domain 0..=255 — covers every table the Rust
+//   crate's own tests exercise); widths/dims/costs are `Binary{16}` (a Dense{8,F32} candidate
+//   already costs 256 bits). `lt`/`eq`/`add_u`/`mul_s` are the Exact kernel prims used.
+// - FLAG-select-6 (encapsulation gap): Rust `SelectionPolicy` has PRIVATE fields, so "every
+//   constructed policy is total by construction" (indices in range, validated by `new`). `.myc`
+//   v0 has no field visibility — `SPol` can be constructed without `build` — so `select` carries
+//   an explicit `DanglingChoice` refusal for a dangling index met at selection time (unreachable
+//   for any policy that came out of `build` — the differential exercises exactly those), and
+//   `explain` is consequently `Result`-typed where the Rust `explain` is total. The guarantee
+//   matrix below records THIS surface's fallibility honestly (explain: fallible here) — the
+//   Rust matrix's `explain: total` row rests on the private-field invariant this surface cannot
+//   state. Never silent, never a panic path.
+// - `Result`/`Option` are redeclared locally (single-nodule `include_str!` harness precedent —
+//   std.error/std.recover); `GuaranteeStrength` is mirrored as `Guarantee` with G-prefixed
+//   constructors (`Exact`/`Proven`/`Empirical`/`Declared` are reserved strength keywords —
+//   std.diag precedent). Policy-valued parameters are named `pol`/`p` (`policy` is a reserved
+//   swap-label keyword), the default arm is `dflt` (`default` is reserved), Escalate-style `to`/
+//   `with` names avoided (reserved).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as crates/mycelium-std-select, never
+// upgraded in translation):
+// - Every ported op is `Exact` (C2): the policy is a total predicate over *exact* integer
+//   metadata — nothing probabilistic, learned, or estimated. The `Exact` tag covers the
+//   *selection decision*, not downstream op accuracy (the crate's own C2 wording).
+// - The guarantee-matrix row DATA below is `Declared` (asserted, matching the Rust source's own
+//   structural tests — diag-port precedent).
+// - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) AND the live Rust-oracle
+//   EXPLAIN parity are `Empirical` (trials, std_select.rs — the M-928 DoD row).
+// ── local mirrors (single-nodule harness — see the substitution notes above) ────────────────────
+type Result[A, E] = Ok(A) | Err(E);
+
+type Option[OptA] = Some(OptA) | None;
+
+// Guarantee — the kernel `GuaranteeStrength` lattice `Exact ⊐ Proven ⊐ Empirical ⊐ Declared` as
+// VALUE-level data, G-prefixed (reserved-keyword substitution; std.diag precedent).
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// grank: the kernel `GuaranteeStrength::rank` verbatim (Exact = 0 strongest … Declared = 3
+// weakest; crates/mycelium-core/src/guarantee.rs). Total, Exact.
+fn grank(g: Guarantee) => Binary{8} =
+  match g {
+    GExact => 0b0000_0000,
+    GProven => 0b0000_0001,
+    GEmpirical => 0b0000_0010,
+    GDeclared => 0b0000_0011
+  };
+
+// ── ScalarKind (kernel mirror; Sk-prefixed — F16/BF16/F32/F64 are reserved type keywords) ───────
+type ScalarKind = SkF16 | SkBf16 | SkF32 | SkF64;
+
+// dtype_bits: bits per Dense element (kernel `dtype_bits` verbatim: F16/Bf16 = 16, F32 = 32,
+// F64 = 64). Total, Exact.
+fn dtype_bits(dt: ScalarKind) => Binary{16} =
+  match dt {
+    SkF16 => 0b0000_0000_0001_0000,
+    SkBf16 => 0b0000_0000_0001_0000,
+    SkF32 => 0b0000_0000_0010_0000,
+    SkF64 => 0b0000_0000_0100_0000
+  };
+
+// sk_eq: ScalarKind equality (typed ADT, never stringly). Total, Exact (finite domain).
+fn sk_eq(a: ScalarKind, b: ScalarKind) => Bool =
+  match a {
+    SkF16 => match b { SkF16 => True, _ => False },
+    SkBf16 => match b { SkBf16 => True, _ => False },
+    SkF32 => match b { SkF32 => True, _ => False },
+    SkF64 => match b { SkF64 => True, _ => False }
+  };
+
+// ── ReprDesc — the structural descriptor of the kernel `Repr` for the selection surface ─────────
+// Carries exactly what the ported predicates + cost model read: the paradigm kind and the exact
+// integer size facts (width / trits / dim / max_active / len). NOT the kernel type (FLAG-select-3:
+// kernel Repr values stay behind the D1 boundary); a descriptor of it, like the kernel's own
+// SelectionInputs is a queryable projection.
+//   RBinary(width) | RTernary(trits) | RDense(dim, dtype) | RVsaDense(dim) |
+//   RVsaSparse(max_active) | RSeq(elem, len) | RBytes
+type ReprDesc =
+    RBinary(Binary{16})
+  | RTernary(Binary{16})
+  | RDense(Binary{16}, ScalarKind)
+  | RVsaDense(Binary{16})
+  | RVsaSparse(Binary{16})
+  | RSeq(ReprDesc, Binary{16})
+  | RBytes;
+
+// ── Kind — the predicate-level paradigm discriminator (kernel `ParadigmKind`, K-prefixed) ───────
+type Kind = KBinary | KTernary | KDense | KVsa | KSeq | KBytes;
+
+// kind_of: kernel `kind_of` verbatim — the paradigm kind of a source descriptor. Total, Exact.
+fn kind_of(r: ReprDesc) => Kind =
+  match r {
+    RBinary(_) => KBinary,
+    RTernary(_) => KTernary,
+    RDense(_, _) => KDense,
+    RVsaDense(_) => KVsa,
+    RVsaSparse(_) => KVsa,
+    RSeq(_, _) => KSeq,
+    RBytes => KBytes
+  };
+
+// kind_eq: Kind equality (typed ADT). Total, Exact (finite domain).
+fn kind_eq(a: Kind, b: Kind) => Bool =
+  match a {
+    KBinary => match b { KBinary => True, _ => False },
+    KTernary => match b { KTernary => True, _ => False },
+    KDense => match b { KDense => True, _ => False },
+    KVsa => match b { KVsa => True, _ => False },
+    KSeq => match b { KSeq => True, _ => False },
+    KBytes => match b { KBytes => True, _ => False }
+  };
+
+// ── storage-bits cost model (RFC-0005 §2.1: a real, declared unit — bits — never "arbitrary
+// internal units"; kernel `repr_storage_bits` verbatim at storage_weight ≡ 1, FLAG-select-2) ─────
+// Binary{w} = w · Ternary{t} = 2t (DN-01 two-bit-per-trit reference packing) · Dense{dim,dt} =
+// dim × dtype_bits(dt) · Vsa dense = dim × 64 (f64 components) · Vsa sparse = max_active × 96
+// (32-bit index + f64 value per active component) · Seq{elem,len} = len × bits(elem) (RFC-0032
+// D3 recursion) · Bytes = 0 (RFC-0032 D4: the byte count rides the payload — the honest static
+// lower bound). Total, Exact on the in-range result; a product overflowing Binary{16} is the
+// kernel prim's explicit never-silent Overflow refusal (G2), never a wrap.
+fn repr_bits(r: ReprDesc) => Binary{16} =
+  match r {
+    RBinary(w) => w,
+    RTernary(t) => mul_s(0b0000_0000_0000_0010, t),
+    RDense(dim, dt) => mul_s(dim, dtype_bits(dt)),
+    RVsaDense(dim) => mul_s(dim, 0b0000_0000_0100_0000),
+    RVsaSparse(ma) => mul_s(ma, 0b0000_0000_0110_0000),
+    RSeq(e, len) => mul_s(len, repr_bits(e)),
+    RBytes => 0b0000_0000_0000_0000
+  };
+
+// ── Candidate — the selectable vocabulary (Repr site only; FLAG-select-3 for Packing/Decode) ────
+type Cand = CRepr(ReprDesc);
+
+// cand_bits: the deterministic cost of a candidate in declared storage bits. Total, Exact.
+fn cand_bits(c: Cand) => Binary{16} =
+  match c { CRepr(r) => repr_bits(r) };
+
+// ── Inputs — the queryable projection a policy may inspect (kernel `SelectionInputs`, the two
+// ported fields: src descriptor + disclosed guarantee; FLAG-select-4 for bound/sparsity/decode) ──
+type Inputs = SelIn(ReprDesc, Guarantee);
+
+// in_src / in_guarantee: field accessors (no field-projection surface in `.myc` v0). Total, Exact.
+fn in_src(i: Inputs) => ReprDesc =
+  match i { SelIn(src, _) => src };
+
+fn in_guarantee(i: Inputs) => Guarantee =
+  match i { SelIn(_, g) => g };
+
+// ── Predicate — the small, closed, NOT-Turing-complete structural language (RFC-0005 §2.1).
+// Evaluation is structural recursion on finite data → total and terminating on every input.
+// PAnd/POr are the binary form of the kernel's n-ary All/Any (see the substitution note). ────────
+type Predicate =
+    PAlways
+  | PSrcKindIs(Kind)
+  | PDtypeIs(ScalarKind)
+  | PGuaranteeAtLeast(Guarantee)
+  | PDeclaredSparse
+  | PAnd(Predicate, Predicate)
+  | POr(Predicate, Predicate)
+  | PNot(Predicate);
+
+// rank_lte: "the disclosed guarantee is at least this strong" — kernel: g.rank() <= req.rank()
+// (lattice rank ≤; lower rank = stronger). Total, Exact.
+fn rank_lte(g: Guarantee, req: Guarantee) => Bool =
+  match lt(grank(req), grank(g)) { 0b1 => False, _ => True };
+
+// eval_pred: kernel `Predicate::eval` — total: every predicate yields a Bool on every input, no
+// partiality, no side effects. Exact (a total predicate over exact metadata — C2).
+fn eval_pred(p: Predicate, i: Inputs) => Bool =
+  match p {
+    PAlways => True,
+    PSrcKindIs(k) => kind_eq(kind_of(in_src(i)), k),
+    PDtypeIs(dt) => match in_src(i) { RDense(_, d) => sk_eq(d, dt), _ => False },
+    PGuaranteeAtLeast(req) => rank_lte(in_guarantee(i), req),
+    PDeclaredSparse => match in_src(i) { RVsaSparse(_) => True, _ => False },
+    PAnd(a, b) => match eval_pred(a, i) { True => eval_pred(b, i), False => False },
+    POr(a, b) => match eval_pred(a, i) { True => True, False => eval_pred(b, i) },
+    PNot(q) => match eval_pred(q, i) { True => False, False => True }
+  };
+
+// ── Action + Rule — one row of the decision table (first match wins) ────────────────────────────
+type Action = AChoose(Binary{8}) | ACheapest;
+
+type Rule = When(Predicate, Action);
+
+// ── the finite, monomorphic lists of the table (cons-list precedent, std.collections) ───────────
+type CandList = CLNil | CLCons(Cand, CandList);
+
+type RuleList = RLNil | RLCons(Rule, RuleList);
+
+// cand_len: the candidate count. O(n) spine walk; > 255 candidates is add_u's explicit
+// never-silent Overflow refusal (G2), never a wrap. Exact on the in-range domain.
+fn cand_len(cs: CandList) => Binary{8} =
+  match cs { CLNil => 0b0000_0000, CLCons(_, t) => add_u(0b0000_0001, cand_len(t)) };
+
+// cand_at: the candidate at index `i`, or None if out of range (never-silent, G2). Declared
+// (type-level contract).
+fn cand_at(cs: CandList, i: Binary{8}) => Option[Cand] =
+  match cs {
+    CLNil => None,
+    CLCons(c, t) =>
+      match eq(i, 0b0000_0000) {
+        0b1 => Some(c),
+        _ => cand_at(t, sub_u(i, 0b0000_0001))
+      }
+  };
+
+// ── SelectionPolicy — the reified decision table (ADR-006; RFC-0005 §2/§3): name (Bytes — the
+// load-bearing string payload), finite candidates, ordered rules, mandatory default arm.
+// C4 note: the policy is an immutable VALUE (value semantics); its kernel content-address
+// identity is FLAG-select-1 (not fabricated here). ──────────────────────────────────────────────
+type SelectionPolicy = SPol(Bytes, CandList, RuleList, Binary{8});
+
+// pol_name / pol_cands / pol_rules / pol_dflt: field accessors. Total, Exact.
+fn pol_name(p: SelectionPolicy) => Bytes =
+  match p { SPol(nm, _, _, _) => nm };
+
+fn pol_cands(p: SelectionPolicy) => CandList =
+  match p { SPol(_, cs, _, _) => cs };
+
+fn pol_rules(p: SelectionPolicy) => RuleList =
+  match p { SPol(_, _, rs, _) => rs };
+
+fn pol_dflt(p: SelectionPolicy) => Binary{8} =
+  match p { SPol(_, _, _, d) => d };
+
+// ── PolicyError — why a policy could not be constructed (C1: validated up front; the float-
+// domain BadCost/BadPredicateLiteral arms are FLAG-select-2) ─────────────────────────────────────
+type PolicyError = NoCandidates | IndexOutOfRange(Binary{8});
+
+// first_bad_choose: the first rule Choose index outside `n`, or None when all are in range.
+// Total, Exact (structural recursion on the finite table).
+fn first_bad_choose(rs: RuleList, n: Binary{8}) => Option[Binary{8}] =
+  match rs {
+    RLNil => None,
+    RLCons(r, t) => match r {
+      When(_, a) => match a {
+        ACheapest => first_bad_choose(t, n),
+        AChoose(ci) => match lt(ci, n) { 0b1 => first_bad_choose(t, n), _ => Some(ci) }
+      }
+    }
+  };
+
+// build: validate totality up front — at least one candidate, the default arm and every
+// Choose(i) in range (kernel `SelectionPolicy::new` minus the FLAG-select-2 float checks).
+// Guarantee: Exact — either the policy is accepted (total, well-formed) or refused with an
+// explicit PolicyError; there is no silent completion of a non-total table (C1).
+fn build(
+  name: Bytes,
+  cands: CandList,
+  rules: RuleList,
+  dflt: Binary{8}
+) => Result[SelectionPolicy, PolicyError] =
+  match cands {
+    CLNil => Err(NoCandidates),
+    CLCons(_, _) => match lt(dflt, cand_len(cands)) {
+      0b0 => Err(IndexOutOfRange(dflt)),
+      _ => match first_bad_choose(rules, cand_len(cands)) {
+        Some(bad) => Err(IndexOutOfRange(bad)),
+        None => Ok(SPol(name, cands, rules, dflt))
+      }
+    }
+  };
+
+// ── the mandatory EXPLAIN record (M-221; RFC-0005 §2.2/§4) ──────────────────────────────────────
+// CandidateCost: one cost line — every candidate with its explicit cost (the full ranking, not
+// just the winner).
+type CandidateCost = CCost(Cand, Binary{16});
+
+type CostList = KNil | KCons(CandidateCost, CostList);
+
+// line_cand / line_cost: cost-line accessors. Total, Exact.
+fn line_cand(l: CandidateCost) => Cand =
+  match l { CCost(c, _) => c };
+
+fn line_cost(l: CandidateCost) => Binary{16} =
+  match l { CCost(_, x) => x };
+
+// costs_len: the ranking length. Exact on the in-range domain (add_u refusal past 255 — G2).
+fn costs_len(ks: CostList) => Binary{8} =
+  match ks { KNil => 0b0000_0000, KCons(_, t) => add_u(0b0000_0001, costs_len(t)) };
+
+// cost_at: the cost line at index `i`, or None if out of range (never-silent, G2). Declared.
+fn cost_at(ks: CostList, i: Binary{8}) => Option[CandidateCost] =
+  match ks {
+    KNil => None,
+    KCons(l, t) =>
+      match eq(i, 0b0000_0000) {
+        0b1 => Some(l),
+        _ => cost_at(t, sub_u(i, 0b0000_0001))
+      }
+  };
+
+// costs_of: every candidate's cost line, in candidate order. Total, Exact.
+fn costs_of(cs: CandList) => CostList =
+  match cs { CLNil => KNil, CLCons(c, t) => KCons(CCost(c, cand_bits(c)), costs_of(t)) };
+
+// Explanation — emitted on EVERY selection (C3: the module's reason to exist): policy_name (the
+// deciding policy by name; its content address is FLAG-select-1), the inputs considered, the
+// cost of each candidate, which rule matched (None = the default arm or an override), the chosen
+// index + candidate, and the override state. Deterministic and re-derivable from
+// (policy, inputs) alone.
+//   Expl(policy_name, inputs, costs, matched_rule, chosen_index, chosen, overridden)
+type Explanation = Expl(Bytes, Inputs, CostList, Option[Binary{8}], Binary{8}, Cand, Bool);
+
+// Explanation field accessors. Total, Exact.
+fn expl_policy_name(e: Explanation) => Bytes =
+  match e { Expl(nm, _, _, _, _, _, _) => nm };
+
+fn expl_inputs(e: Explanation) => Inputs =
+  match e { Expl(_, i, _, _, _, _, _) => i };
+
+fn expl_costs(e: Explanation) => CostList =
+  match e { Expl(_, _, ks, _, _, _, _) => ks };
+
+fn expl_matched_rule(e: Explanation) => Option[Binary{8}] =
+  match e { Expl(_, _, _, mr, _, _, _) => mr };
+
+fn expl_chosen_index(e: Explanation) => Binary{8} =
+  match e { Expl(_, _, _, _, ci, _, _) => ci };
+
+fn expl_chosen(e: Explanation) => Cand =
+  match e { Expl(_, _, _, _, _, c, _) => c };
+
+fn expl_overridden(e: Explanation) => Bool =
+  match e { Expl(_, _, _, _, _, _, ov) => ov };
+
+// Selected — the (choice, explanation) pair every selection returns (no tuple surface form).
+type Selected = Chosen(Cand, Explanation);
+
+fn sel_cand(s: Selected) => Cand =
+  match s { Chosen(c, _) => c };
+
+fn sel_expl(s: Selected) => Explanation =
+  match s { Chosen(_, e) => e };
+
+// ── SelectError — why a selection call failed: always explicit (G2), never a silent fallback
+// choice. OverrideOutOfRange(index, candidates) mirrors the kernel; DanglingChoice is the
+// FLAG-select-6 encapsulation-gap refusal (a dangling index met at selection time on a policy
+// that did not come out of `build` — unreachable for built policies, never a panic). ─────────────
+type SelectError = OverrideOutOfRange(Binary{8}, Binary{8}) | DanglingChoice(Binary{8});
+
+// MatchHit — the first matching rule: its table index and its action.
+type MatchHit = Hit(Binary{8}, Action);
+
+// find_rule: the first rule whose guard holds (table order — fixed declared precedence,
+// RFC-0005 §2.3), or None when no rule matches (the default arm decides). Total, Exact.
+fn find_rule(rs: RuleList, i: Inputs, idx: Binary{8}) => Option[MatchHit] =
+  match rs {
+    RLNil => None,
+    RLCons(r, t) => match r {
+      When(p, a) => match eval_pred(p, i) {
+        True => Some(Hit(idx, a)),
+        False => find_rule(t, i, add_u(idx, 0b0000_0001))
+      }
+    }
+  };
+
+// cheapest_from: index of the minimum-cost line over `ks`, seeded with the best so far; ties
+// break to the LOWEST index (strict `lt` — deterministic, kernel `cheapest` verbatim). Total,
+// Exact.
+fn cheapest_from(ks: CostList, best_i: Binary{8}, best_c: Binary{16}, i: Binary{8}) => Binary{8} =
+  match ks {
+    KNil => best_i,
+    KCons(l, t) => match lt(line_cost(l), best_c) {
+      0b1 => cheapest_from(t, i, line_cost(l), add_u(i, 0b0000_0001)),
+      _ => cheapest_from(t, best_i, best_c, add_u(i, 0b0000_0001))
+    }
+  };
+
+// cheapest_of: index of the minimum-cost candidate. The CLNil arm yields index 0, which every
+// downstream path refuses explicitly (`cand_at` on an empty list is None → DanglingChoice) —
+// no silent path survives an empty candidate set (G2; a built policy is non-empty by `build`).
+fn cheapest_of(cs: CandList) => Binary{8} =
+  match costs_of(cs) {
+    KNil => 0b0000_0000,
+    KCons(l, t) => cheapest_from(t, 0b0000_0000, line_cost(l), 0b0000_0001)
+  };
+
+// finish: assemble the mandatory Explanation for a decided index — there is NO code path that
+// returns a choice without one (C3). A dangling index is the explicit DanglingChoice refusal
+// (FLAG-select-6), never a fabricated candidate.
+fn finish(
+  nm: Bytes,
+  i: Inputs,
+  cands: CandList,
+  mr: Option[Binary{8}],
+  ci: Binary{8},
+  ov: Bool
+) => Result[Selected, SelectError] =
+  match cand_at(cands, ci) {
+    None => Err(DanglingChoice(ci)),
+    Some(c) => Ok(Chosen(c, Expl(nm, i, costs_of(cands), mr, ci, c, ov)))
+  };
+
+// run_select: the ONE selection mechanism (RFC-0005 §2/§4; kernel `select` verbatim over the
+// ported surface): honor a first-class forced override (recorded in the EXPLAIN trace, matched
+// rule None) or evaluate the decision table — first matching rule wins; no match → the mandatory
+// default arm. Guarantee: Exact — same (policy, inputs, forced) → same (choice, explanation),
+// deterministically. Errors are explicit: OverrideOutOfRange (never a snap to the nearest legal
+// choice — C1), DanglingChoice (FLAG-select-6).
+fn run_select(
+  pol: SelectionPolicy,
+  i: Inputs,
+  forced: Option[Binary{8}]
+) => Result[Selected, SelectError] =
+  match forced {
+    Some(fi) => match lt(fi, cand_len(pol_cands(pol))) {
+      0b1 => finish(pol_name(pol), i, pol_cands(pol), None, fi, True),
+      _ => Err(OverrideOutOfRange(fi, cand_len(pol_cands(pol))))
+    },
+    None => match find_rule(pol_rules(pol), i, 0b0000_0000) {
+      Some(h) => match h {
+        Hit(ri, a) => match a {
+          AChoose(ci) => finish(pol_name(pol), i, pol_cands(pol), Some(ri), ci, False),
+          ACheapest =>
+            finish(
+              pol_name(pol),
+              i,
+              pol_cands(pol),
+              Some(ri),
+              cheapest_of(pol_cands(pol)),
+              False
+            )
+        }
+      },
+      None => finish(pol_name(pol), i, pol_cands(pol), None, pol_dflt(pol), False)
+    }
+  };
+
+// select: evaluate the decision table and return the chosen candidate WITH its mandatory
+// Explanation — there is no code path that returns a choice without one (C3). Guarantee: Exact
+// (the selection decision over exact metadata — C2).
+fn select(pol: SelectionPolicy, i: Inputs) => Result[Selected, SelectError] =
+  run_select(pol, i, None);
+
+// explain: derive the mandatory Explanation for a (policy, inputs) pair without consuming the
+// choice — deterministic and re-derivable from (policy, inputs) alone (C3/C4). Guarantee: Exact.
+// Fallibility substitution (FLAG-select-6): Result-typed here where the Rust `explain` is total —
+// the totality rests on a private-field invariant `.myc` v0 cannot state; for any policy out of
+// `build` the Err arms are unreachable.
+fn explain(pol: SelectionPolicy, i: Inputs) => Result[Explanation, SelectError] =
+  match run_select(pol, i, None) { Ok(s) => Ok(sel_expl(s)), Err(er) => Err(er) };
+
+// select_with_override: a first-class deterministic override — force a candidate by index and
+// record the override state IN the Explanation (overridden = True; matched_rule = None), so the
+// overridden selection remains fully inspectable (RFC-0005 §2.4; C1/C3). An out-of-range forced
+// index is the explicit OverrideOutOfRange refusal, never a snap to the nearest legal choice.
+// Guarantee: Exact.
+fn select_with_override(
+  pol: SelectionPolicy,
+  i: Inputs,
+  forced_index: Binary{8}
+) => Result[Selected, SelectError] =
+  run_select(pol, i, Some(forced_index));
+
+// ── guarantee matrix (RFC-0016 §4.5) — CHECKED DATA for the 4 ported ops (diag-port precedent).
+// Row data is Declared (asserted, matching the Rust source's own structural tests); every tag is
+// GExact (C2 — carried at the SAME strength as the Rust matrix, VR-5). The Rust matrix's
+// `policy_ref` row is FLAG-select-1 (op not ported ⇒ no row fabricated); `explain` is fallible
+// HERE (FLAG-select-6 substitution — the Rust row's `total` rests on private-field validation). ──
+type ExplainAble = ExplainYes | ExplainNotApplicable;
+
+// GRow(op, tag, fallible, effects, explain_able) — mirrors mycelium-std-select::GuaranteeRow.
+type GRow = GR(Bytes, Guarantee, Bool, Bytes, ExplainAble);
+
+type GRowList = GLNil | GLCons(GRow, GRowList);
+
+// GRow field accessors. Total, Exact.
+fn grow_op(r: GRow) => Bytes =
+  match r { GR(op, _, _, _, _) => op };
+
+fn grow_tag(r: GRow) => Guarantee =
+  match r { GR(_, g, _, _, _) => g };
+
+fn grow_fallible(r: GRow) => Bool =
+  match r { GR(_, _, f, _, _) => f };
+
+fn grow_effects(r: GRow) => Bytes =
+  match r { GR(_, _, _, fx, _) => fx };
+
+fn grow_explain_able(r: GRow) => ExplainAble =
+  match r { GR(_, _, _, _, x) => x };
+
+// matrix_len: the row count. Exact on the in-range domain.
+fn matrix_len(rs: GRowList) => Binary{8} =
+  match rs { GLNil => 0b0000_0000, GLCons(_, t) => add_u(0b0000_0001, matrix_len(t)) };
+
+// matrix_all_exact: True iff every row carries the GExact tag (the VR-5 assertion the Rust
+// test suite makes over GUARANTEE_MATRIX). Total, Exact.
+fn matrix_all_exact(rs: GRowList) => Bool =
+  match rs {
+    GLNil => True,
+    GLCons(r, t) => match grow_tag(r) { GExact => matrix_all_exact(t), _ => False }
+  };
+
+// guarantee_matrix: the loaded matrix — 4 rows (the ported ops), all GExact, EXPLAIN-able = yes
+// for every selection op; `build` constructs a policy and is not itself a selection.
+fn guarantee_matrix() => GRowList =
+  [
+    GR("build", GExact, True, "none", ExplainNotApplicable),
+    GR("select", GExact, True, "none", ExplainYes),
+    GR("explain", GExact, True, "none", ExplainYes),
+    GR("select_with_override", GExact, True, "none", ExplainYes)
+  ];

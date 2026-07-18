@@ -1,0 +1,7 @@
+// rejected: a `phylum` header must be followed by at least one `nodule` (M-662; RFC-0006, DN-06 §6).
+// 'phylum' is now an ACTIVE construct — an optional 'phylum <path>' header that groups one-or-more
+// nodules — so a phylum naming a grouping with NO nodule is a never-silent parse refusal (G2), not a
+// silent empty program. (Pre-M-662 this fixture exercised 'phylum' as reserved-not-active; the keyword
+// activated with M-662, as 'colony'/'hypha' did with M-666. The runtime vocabulary that is still
+// reserved-not-active is exercised by reject/12.)
+phylum signals.demo

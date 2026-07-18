@@ -1,0 +1,12 @@
+// rejected: a malformed effect annotation — the effect `io` is listed twice in one `!{…}` set
+// (M-660 / RFC-0014 §4.5). A repeated effect name in a single annotation is a written redundancy and
+// a never-silent PARSE refusal: the parser rejects it explicitly rather than quietly de-duplicating
+// the set (G2). This is the parser-level guard on the new effect surface.
+//
+// (The *coverage* refusal — a fn that PERFORMS an effect it does not DECLARE, e.g. an unannotated
+// caller of an effectful fn — is a CHECKER refusal, not a parse error: such a program parses fine and
+// is rejected by `check_nodule`. That under-declaration case is exercised in `tests/check.rs`
+// (`an_unannotated_caller_of_an_effectful_fn_is_a_check_error`), since this conformance gate only
+// runs the parser. RFC-0014 I3.)
+nodule demo;
+fn a() => Binary{8} !{io, io} = 0b00000000

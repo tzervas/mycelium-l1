@@ -1,0 +1,4 @@
+// rejected: an empty `0x` byte-string literal carries no value — a never-silent lex refusal, never a
+// silently-empty token (RFC-0032 D4, M-750).
+nodule bad;
+fn f() => Bytes = 0x

@@ -1,0 +1,299 @@
+// nodule: compiler.nodule_header
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-05
+// @updated: 2026-07-05
+// @summary: Self-hosted nodule-header recogniser (M-740 Stage 2; DN-26 §7.3 row 2). A faithful
+//   port of crates/mycelium-l1/src/nodule.rs — the DN-06 §6 first-non-blank-line
+//   `// nodule[: name]` marker recogniser (a source-text concern: comments are lexer trivia, the
+//   marker never reaches the AST; metadata is not identity, ADR-003).
+nodule compiler.nodule_header;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 2). `crates/mycelium-l1/src/nodule.rs` stays the trusted
+// differential oracle (DN-26 §7.4); this file is checked against it by
+// `crates/mycelium-l1/tests/compiler_stage2.rs` (header-parse differential over the L1 conformance
+// corpus + every `lib/**.myc` nodule + a synthetic edge battery transcribed from the oracle's own
+// unit tests).
+//
+// The recogniser's contract (mirrors parse_nodule_header exactly):
+//   Ok(Some(h)) — a well-formed `// nodule` / `// nodule: <dotted.name>` marker on the first
+//                 non-blank line;
+//   Ok(None)    — the first non-blank line is not a nodule marker (ordinary comment, or code);
+//   Err(_)      — a NAMED marker (`// nodule:`) whose name is empty or not a dotted identifier —
+//                 a near-miss is flagged, never silently dropped (G2).
+//
+// Representation choices/deviations (each deliberate + honest — VR-5/G2):
+//
+// FLAG-nodule-1 (String -> Bytes; token.myc FLAG-token-1's convention). `NoduleHeader`'s name
+// segments and `NoduleHeaderError`'s message are `Bytes` (the surface's textual type), not Rust
+// `String` — same information, nothing dropped.
+//
+// FLAG-nodule-2 (ASCII-only trim; the FLAG-lex-4 narrowing — but with a SHARPER failure mode
+// here). Rust's `str::trim` trims the full Unicode White_Space set; `trim_start`/`trim_end` here
+// trim exactly space/tab/CR/LF. Rust's `str::lines` also strips one trailing `\r`; here the CR is
+// removed by the ASCII trim — the observable result is identical for `\r\n` sources. The real
+// divergence (review finding, PR #1165): a leading line consisting SOLELY of non-ASCII Unicode
+// whitespace (e.g. NBSP U+00A0) is not blank to this port, so `scan_lines` stops there and
+// returns `Ok(None)` — silently missing a real marker on a later line the Unicode-aware oracle
+// WOULD find. That flips the top-level Ok(None)/Ok(Some) classification (a silent wrong answer,
+// not a loud error), which is a stronger deviation than FLAG-lex-4's cosmetic analog. It is
+// PINNED as a known divergence in the Stage-2 gate
+// (compiler_stage2.rs::nodule_myc_known_divergence_non_ascii_whitespace_only_line), so lifting
+// the narrowing will fail the pin and force this FLAG's removal. No conformance/lib file uses
+// non-ASCII whitespace around its first non-blank line, so the gate's real corpus never
+// exercises the gap — reported + pinned, never silent (G2/VR-5).
+//
+// FLAG-nodule-3 (static error messages; the FLAG-lex-7 convention). `NoduleHeaderError`'s message
+// here is a static `Bytes` per error KIND; the Rust oracle interpolates the offending name/segment
+// into its message. Never-silent OCCURRENCE + 1-based LINE fidelity holds (the differential
+// asserts the Ok/None/Some/Err shape and the error line, not message content).
+//
+// FLAG-nodule-4 (self-contained — no cross-nodule `use`; token.myc FLAG-token-4 / M-982).
+// `Option`/`Result`/`Vec` are redeclared locally because cross-nodule EXECUTION is still staged
+// (`checkty.rs::check_phylum`'s own doc comment); a future stage lifts this duplication once
+// M-982 lands (tracked upstream, not this leaf's call to make).
+//
+// FLAG-nodule-5 (nodule NAME deviates from DN-26 §7.3's `compiler.nodule` — a real Stage-2
+// dogfooding finding). `nodule` is a reserved word (DN-02; token.rs: a reserved word is never a
+// silent identifier), so the surface declaration `nodule compiler.nodule;` cannot parse — the
+// second path segment lexes as the `Nodule` KEYWORD, not an identifier. This is the FLAG-token-3
+// keyword-collision class surfacing at the nodule-NAME level: DN-26 §7.3 named this row's nodule
+// `compiler.nodule` before the collision was hit. Renamed `compiler.nodule_header` (the file stays
+// `nodule.myc`, mirroring the Rust source's `nodule.rs`). Note the asymmetry, faithfully preserved:
+// the COMMENT-MARKER grammar (this file's own `parse_dotted` port) accepts `nodule` as a segment —
+// it validates raw identifier TEXT, exactly like the Rust oracle, which never keyword-filters
+// marker segments — only the surface `nodule <dotted>;` DECLARATION cannot spell it. Reported
+// upstream for DN-26's append-only changelog (integrator-owned), not silently renamed.
+//
+// TCO note (RFC-0041 §7 W7 amendment #11 — direct-tail-only TCO is an M-740 acceptance
+// criterion): every recursion bounded only by SOURCE LENGTH (`line_end`, `trim_start`,
+// `trim_end`, `next_dot`, `ident_run_ok`, `scan_lines`) recurses in direct tail position. The
+// two non-tail recursions (`split_dotted`, `join_segs`) are bounded by the segment COUNT of one
+// dotted name (a handful), never by source length.
+
+// ── Option / Result / Vec (local; no cross-leaf import — FLAG-nodule-4) ─────────────────────────
+type Option[A] = Some(A) | None;
+type Result[A, E] = Ok(A) | Err(E);
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// ── NoduleHeader (mirrors nodule.rs::NoduleHeader) ──────────────────────────────────────────────
+// NH(name): `None` = the bare `// nodule` marker (the name is supplied by inheritance / the
+// file's conventional location); `Some(segs)` = the declared dotted path within the phylum.
+type NoduleHeader = NH(Option[Vec[Bytes]]);
+
+fn nh_name(h: NoduleHeader) => Option[Vec[Bytes]] =
+  match h { NH(n) => n };
+
+// ── NoduleHeaderError (mirrors nodule.rs::NoduleHeaderError; the line is 1-based) ───────────────
+type NoduleHeaderError = NHE(Binary{32}, Bytes);
+
+fn nhe_line(e: NoduleHeaderError) => Binary{32} =
+  match e { NHE(l, _) => l };
+
+fn nhe_message(e: NoduleHeaderError) => Bytes =
+  match e { NHE(_, m) => m };
+
+// ── empty_bytes (the lex.myc construction: a zero-width slice of a 1-byte literal) ──────────────
+fn empty_bytes() => Bytes =
+  bytes_slice(0x00, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000);
+
+// ── dotted / canonical (mirror NoduleHeader::dotted / ::canonical) ──────────────────────────────
+// join_segs: the segments joined with '.' (the oracle's `segs.join(".")`). Non-tail, bounded by
+// the segment count of one name (TCO note above).
+fn join_segs(segs: Vec[Bytes]) => Bytes =
+  match segs {
+    Nil => empty_bytes(),
+    Cons(s, rest) => match rest {
+      Nil => s,
+      Cons(_, _) => bytes_concat(s, bytes_concat(".", join_segs(rest)))
+    }
+  };
+
+fn dotted(h: NoduleHeader) => Option[Bytes] =
+  match nh_name(h) { None => None, Some(segs) => Some(join_segs(segs)) };
+
+// canonical: the one-line spelling the formatter (M-142) emits.
+fn canonical(h: NoduleHeader) => Bytes =
+  match nh_name(h) {
+    None => "// nodule",
+    Some(segs) => bytes_concat("// nodule: ", join_segs(segs))
+  };
+
+// ── bool bridge + byte classification (redeclared from the lex.myc idiom — FLAG-nodule-4) ───────
+fn bool_or(a: Bool, b: Bool) => Bool =
+  match a { True => True, False => b };
+
+fn eq_b(a: Binary{8}, b: Binary{8}) => Bool =
+  match eq(a, b) { 0b1 => True, _ => False };
+
+// le_b: a <= b, i.e. NOT (b < a).
+fn le_b(a: Binary{8}, b: Binary{8}) => Bool =
+  match lt(b, a) { 0b1 => False, _ => True };
+
+fn in_range(c: Binary{8}, lo: Binary{8}, hi: Binary{8}) => Bool =
+  match le_b(lo, c) { True => le_b(c, hi), False => False };
+
+fn is_digit(c: Binary{8}) => Bool =
+  in_range(c, 0b0011_0000, 0b0011_1001); // '0'..'9'
+
+fn is_upper(c: Binary{8}) => Bool =
+  in_range(c, 0b0100_0001, 0b0101_1010); // 'A'..'Z'
+
+fn is_lower(c: Binary{8}) => Bool =
+  in_range(c, 0b0110_0001, 0b0111_1010); // 'a'..'z'
+
+fn is_alpha(c: Binary{8}) => Bool =
+  bool_or(is_upper(c), is_lower(c));
+
+// is_ident_start: mirrors nodule.rs::is_ident's first-char rule (ASCII letter or '_').
+fn is_ident_start(c: Binary{8}) => Bool =
+  bool_or(is_alpha(c), eq_b(c, 0b0101_1111)); // '_'
+
+// is_ident_continue: mirrors nodule.rs::is_ident's rest rule (ASCII alphanumeric or '_').
+fn is_ident_continue(c: Binary{8}) => Bool =
+  bool_or(is_ident_start(c), is_digit(c));
+
+// ASCII whitespace: space / tab / CR / LF (FLAG-nodule-2).
+fn is_ascii_ws(c: Binary{8}) => Bool =
+  bool_or(eq_b(c, 0b0010_0000), bool_or(eq_b(c, 0b0000_1001), bool_or(eq_b(c, 0b0000_1101), eq_b(c, 0b0000_1010))));
+
+// ── line / trim scanners (each direct-tail — TCO note above) ────────────────────────────────────
+// line_end: the index of the terminating '\n' at/after `i`, or bytes_len(src) if none.
+fn line_end(src: Bytes, i: Binary{32}) => Binary{32} =
+  match lt(i, bytes_len(src)) {
+    0b1 => match eq_b(bytes_get(src, i), 0b0000_1010) {
+      True => i,
+      False => line_end(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001))
+    },
+    _ => i
+  };
+
+// trim_start: the first index in [i, e) whose byte is not ASCII whitespace, or `e`.
+fn trim_start(src: Bytes, i: Binary{32}, e: Binary{32}) => Binary{32} =
+  match eq(i, e) {
+    0b1 => e,
+    _ => match is_ascii_ws(bytes_get(src, i)) {
+      True => trim_start(src, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), e),
+      False => i
+    }
+  };
+
+// trim_end: the end index of [i, e) with trailing ASCII whitespace dropped (>= i).
+fn trim_end(src: Bytes, i: Binary{32}, e: Binary{32}) => Binary{32} =
+  match eq(i, e) {
+    0b1 => e,
+    _ => match is_ascii_ws(bytes_get(src, sub_u(e, 0b0000_0000_0000_0000_0000_0000_0000_0001))) {
+      True => trim_end(src, i, sub_u(e, 0b0000_0000_0000_0000_0000_0000_0000_0001)),
+      False => e
+    }
+  };
+
+// ── dotted-name validation (mirrors nodule.rs::parse_dotted / ::is_ident) ───────────────────────
+// next_dot: the index of the next '.' at/after `i`, or bytes_len(name).
+fn next_dot(name: Bytes, i: Binary{32}) => Binary{32} =
+  match lt(i, bytes_len(name)) {
+    0b1 => match eq_b(bytes_get(name, i), 0b0010_1110) { // '.'
+      True => i,
+      False => next_dot(name, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001))
+    },
+    _ => i
+  };
+
+// ident_run_ok: every byte in [i, j) is a valid identifier-continue byte (caller keeps i <= j
+// and j <= bytes_len(name), so bytes_get stays in range).
+fn ident_run_ok(name: Bytes, i: Binary{32}, j: Binary{32}) => Bool =
+  match eq(i, j) {
+    0b1 => True,
+    _ => match is_ident_continue(bytes_get(name, i)) {
+      True => ident_run_ok(name, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), j),
+      False => False
+    }
+  };
+
+// seg_is_ident: name[i..j) is a valid identifier (letters, digits, '_'; not starting with a
+// digit). Caller guarantees i < j (the empty segment is refused before this is called).
+fn seg_is_ident(name: Bytes, i: Binary{32}, j: Binary{32}) => Bool =
+  match is_ident_start(bytes_get(name, i)) {
+    True => ident_run_ok(name, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), j),
+    False => False
+  };
+
+// split_dotted: validate + split `name[i..]` on '.' into segments (mirrors parse_dotted: a
+// never-silent Err for an empty segment — leading/trailing/doubled dots — or a non-identifier
+// segment). Non-tail, bounded by the segment count (TCO note above). Messages are static
+// (FLAG-nodule-3).
+fn split_dotted(name: Bytes, i: Binary{32}, line_no: Binary{32}) => Result[Vec[Bytes], NoduleHeaderError] =
+  let j = next_dot(name, i) in
+  match eq(i, j) {
+    0b1 => Err(NHE(line_no, "nodule name has an empty path segment (no leading/trailing/doubled dots)")),
+    _ => match seg_is_ident(name, i, j) {
+      False => Err(NHE(line_no, "nodule name segment is not a valid identifier (letters, digits, underscore; not starting with a digit)")),
+      True => match lt(j, bytes_len(name)) {
+        0b1 => match split_dotted(name, add_u(j, 0b0000_0000_0000_0000_0000_0000_0000_0001), line_no) {
+          Err(e) => Err(e),
+          Ok(rest) => Ok(Cons(bytes_slice(name, i, j), rest))
+        },
+        _ => Ok(Cons(bytes_slice(name, i, j), Nil))
+      }
+    }
+  };
+
+// ── the recogniser (mirrors nodule.rs::recognise) ───────────────────────────────────────────────
+// recognise_named: `body` is the trimmed comment body and is known to start with "nodule:"; the
+// name region is body[7..] with leading whitespace trimmed (its end is already trimmed — `body`
+// comes from a fully-trimmed line). An empty name is the explicit G2 near-miss error.
+fn recognise_named(body: Bytes, line_no: Binary{32}) => Result[Option[NoduleHeader], NoduleHeaderError] =
+  let ns = trim_start(body, 0b0000_0000_0000_0000_0000_0000_0000_0111, bytes_len(body)) in
+  match eq(ns, bytes_len(body)) {
+    0b1 => Err(NHE(line_no, "a nodule marker with a colon must name the nodule (its dotted path); for an unnamed nodule use the bare marker")),
+    _ => match split_dotted(bytes_slice(body, ns, bytes_len(body)), 0b0000_0000_0000_0000_0000_0000_0000_0000, line_no) {
+      Err(e) => Err(e),
+      Ok(segs) => Ok(Some(NH(Some(segs))))
+    }
+  };
+
+// recognise: classify one TRIMMED, non-empty first-non-blank line. Must be a `//` line comment to
+// be a marker at all; then exactly `nodule` (bare) or `nodule:<name>` (named); anything else is an
+// ordinary comment (Ok(None)) — e.g. `/// nodule` and `// nodule is a word` are NOT markers.
+fn recognise(line: Bytes, line_no: Binary{32}) => Result[Option[NoduleHeader], NoduleHeaderError] =
+  match lt(bytes_len(line), 0b0000_0000_0000_0000_0000_0000_0000_0010) {
+    0b1 => Ok(None),
+    _ => match bytes_eq(bytes_slice(line, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0010), "//") {
+      0b1 =>
+        let ts = trim_start(line, 0b0000_0000_0000_0000_0000_0000_0000_0010, bytes_len(line)) in
+        let body = bytes_slice(line, ts, bytes_len(line)) in
+        match bytes_eq(body, "nodule") {
+          0b1 => Ok(Some(NH(None))),
+          _ => match lt(bytes_len(body), 0b0000_0000_0000_0000_0000_0000_0000_0111) {
+            0b1 => Ok(None),
+            _ => match bytes_eq(bytes_slice(body, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0111), "nodule:") {
+              0b1 => recognise_named(body, line_no),
+              _ => Ok(None)
+            }
+          }
+        },
+      _ => Ok(None)
+    }
+  };
+
+// ── entry (mirrors nodule.rs::parse_nodule_header) ──────────────────────────────────────────────
+// scan_lines: walk lines from byte `i` (1-based `line_no`), skip blank (whitespace-only) lines,
+// and classify the FIRST non-blank line. All-blank / empty source is Ok(None). Direct tail.
+fn scan_lines(src: Bytes, i: Binary{32}, line_no: Binary{32}) => Result[Option[NoduleHeader], NoduleHeaderError] =
+  match lt(i, bytes_len(src)) {
+    0b1 =>
+      let e = line_end(src, i) in
+      let ts = trim_start(src, i, e) in
+      let te = trim_end(src, ts, e) in
+      match eq(ts, te) {
+        0b1 => scan_lines(src, add_u(e, 0b0000_0000_0000_0000_0000_0000_0000_0001), add_u(line_no, 0b0000_0000_0000_0000_0000_0000_0000_0001)),
+        _ => recognise(bytes_slice(src, ts, te), line_no)
+      },
+    _ => Ok(None)
+  };
+
+// parse_nodule_header: recognise the optional nodule marker on the first non-blank line of `src`.
+//   Ok(Some(h)) — well-formed marker; Ok(None) — not a marker; Err — ill-formed NAMED marker (G2).
+fn parse_nodule_header(src: Bytes) => Result[Option[NoduleHeader], NoduleHeaderError] =
+  scan_lines(src, 0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0001);

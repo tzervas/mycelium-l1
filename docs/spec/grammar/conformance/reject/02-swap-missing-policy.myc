@@ -1,0 +1,4 @@
+// rejected: swap must carry an explicit policy (S1/WF2 — a swap is never silent)
+nodule bad;
+fn widen(x: Binary{8}) => Ternary{6} =
+    swap(x, to: Ternary{6})

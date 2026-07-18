@@ -1,0 +1,635 @@
+// nodule: compiler.ast
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-05
+// @updated: 2026-07-05
+// @summary: Self-hosted L1 surface-AST data types (M-740 Stage 3a; DN-26 §7.3 row 3). A faithful
+//   port of crates/mycelium-l1/src/ast.rs's data-type vocabulary (RFC-0006 §3; DN-02) — pure
+//   types + a handful of small helper impls, no upward deps (DN-26 §7.1: "ast -> (none)"). The
+//   parser that PRODUCES these values is `compiler.parse` (sibling nodule, DN-26 §7.3 row 3).
+nodule compiler.ast;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 3a). `crates/mycelium-l1/src/ast.rs` stays the trusted
+// differential oracle (DN-26 §7.4) until M-741 ratifies the port. This file is checked against it
+// structurally by `crates/mycelium-l1/tests/compiler_stage3_ast.rs` (parse+check_nodule gate +
+// a ported-constructor inventory, `Declared`/audited — the ACTUAL AST-shape differential over the
+// full L1 conformance corpus is `compiler.parse`'s job, DN-26 §7.3 row 3, and arrives with that
+// sibling leaf).
+//
+// Representation choices/deviations (each deliberate, honest, DOCUMENTED — VR-5/G2 — never a
+// silent divergence):
+//
+// FLAG-ast-1 (String -> Bytes; the token.myc FLAG-token-1 / nodule.myc FLAG-nodule-1 convention).
+// Every Rust `String` field (names, path segments, trait/type names, VSA model ids, …) is `Bytes`
+// here — the surface's textual type (no first-class `String`, RFC-0031 D1). Same information,
+// nothing dropped.
+//
+// FLAG-ast-2 (u32 -> Binary{32}; i64 -> Binary{64}). Every Rust `u32` field (widths, dims, lens,
+// field indices, …) is `Binary{32}` (mirrors token.myc's `Pos` fields). `Literal::Int`/
+// `Literal::AmbientInt`'s `i64` payload is `Binary{64}` — this is LOSSLESS, not a narrowing: the
+// grammar's decimal-literal production is an unsigned digit run (negation is the separate RFC-0025
+// prefix operator `-a` => `neg(a)`, never part of the literal token itself — confirmed against
+// `crates/mycelium-l1/src/token.rs`'s digit-run lexing), so every `Literal::Int`/`AmbientInt` value
+// is non-negative and fits `Binary{64}` bit-for-bit.
+//
+// FLAG-ast-3 (self-contained; local Option/Vec — M-982, the token.myc FLAG-token-4 / nodule.myc
+// FLAG-nodule-4 / lex.myc FLAG-lex-0 convention). `compiler.ast` is a DN-26 §7.1 leaf ("ast ->
+// none" — no structural Rust-side dep on token/lexer/nodule), but it still redeclares `Option`/
+// `Vec` locally rather than `use`-ing a sibling nodule, both for the established self-containment
+// convention AND because cross-nodule EXECUTION is still staged (`checkty.rs::check_phylum`'s own
+// doc comment) — a future stage can `use compiler.<sibling>` once that gap lifts (not this leaf's
+// call to make, FLAGged up).
+//
+// Recursive VALUE types need no `Box`/indirection marker: Mycelium's checker registers every
+// `type` declaration in a nodule as an empty "shell" (name + arity) in one pass BEFORE resolving
+// any constructor's field types in a second pass (`crates/mycelium-l1/src/checkty.rs::
+// register_types`, ~line 1652 — "Insert a shell first so recursive field references resolve"), so
+// self-recursive (`Vec[A] = Nil | Cons(A, Vec[A])`, already established stdlib-wide) AND
+// mutually-recursive type pairs (`TypeRef` <-> `BaseType`, `Expr` <-> `Literal` <-> `Pattern` <->
+// `Arm` <-> `Hypha` below) resolve regardless of declaration order — verified empirically during
+// authoring with a standalone two-type-cycle smoke program (`type Tree = Leaf | Node(Binary{8},
+// Forest); type Forest = FNil | FCons(Tree, Forest);`, both declaration orders) through
+// `myc-check` directly. So every Rust `Box<T>` field below is ported as a plain `T` field — no
+// wrapper type is needed or added.
+//
+// FLAG-ast-4 (reserved-keyword spelling collisions — the token.myc FLAG-token-3 class, hit again
+// here because several of ast.rs's OWN Rust variant names are spelled identically to a reserved
+// word IN THIS SAME GRAMMAR). Renamed, each with the SAME prefix convention already established
+// (reusing token.myc's exact ScalarTok/StrengthTok naming where the concept is identical, and
+// `lib/std/select.myc::Kind`'s K-prefix precedent for a fresh repr-kind enum):
+//   `Paradigm`      (P-prefix — Vsa doesn't itself collide, prefixed anyway for consistency):
+//                   Binary -> PBinary, Ternary -> PTernary, Dense -> PDense, Vsa -> PVsa
+//   `AmbientParams` (AP-prefix — Size/Vsa don't themselves collide with a keyword, but are
+//                   prefixed anyway; see FLAG-ast-5 for why Vsa still needs renaming here):
+//                   Size -> APSize, Dense -> APDense, Vsa -> APVsa
+//   `BaseType`      (Kw-prefix, exactly `Tok`'s own repr-keyword convention — only the 7 that
+//                   collide; `Vsa`/`Named`/`Ambient`/`Tuple` don't collide and stay bare, `Fn` is
+//                   renamed for a DIFFERENT reason, see FLAG-ast-5):
+//                   Binary -> KwBinary, Ternary -> KwTernary, Dense -> KwDense,
+//                   Substrate -> KwSubstrate, Seq -> KwSeq, Bytes -> KwBytes, Float -> KwFloat
+//   `Sparsity`      (Sp-prefix — BOTH variants collide): Dense -> SpDense, Sparse -> SpSparse
+//   `Scalar`        (S-prefix — REUSES token.myc's `ScalarTok` naming verbatim, same concept):
+//                   F16 -> SF16, Bf16 -> SBf16 (doesn't itself collide, prefixed for uniformity —
+//                   token.myc's own FLAG-token-3 rationale), F32 -> SF32, F64 -> SF64
+//   `Strength`      (G-prefix — REUSES token.myc's `StrengthTok` / lib/std/core.myc's `Guarantee`
+//                   naming verbatim, same concept, all four collide): Exact -> GExact,
+//                   Proven -> GProven, Empirical -> GEmpirical, Declared -> GDeclared
+// `Item`'s own keyword-shaped variants (`Use`/`Default`/`Type`/`Trait`/`Impl`/`Fn`/`Object`/
+// `Lower`/`Derive`) do NOT collide — Rust's capitalized variant spelling never exactly matches the
+// lowercase keyword spelling (the exact reasoning `token.myc`'s own `Tok::Use`/`Tok::Type`/
+// `Tok::Fn`/… variants already rely on) — so these stay bare, unrenamed, verbatim.
+//
+// FLAG-ast-5 (cross-type constructor-name collisions — a DIFFERENT class from FLAG-ast-4, newly
+// surfaced at ast.rs's scale). Mycelium's constructor namespace is FLAT per nodule (pattern
+// matching uses bare constructor names with no type qualifier — `match s { Circle(r) => …,
+// Square(w) => … }`), so two DIFFERENT Rust enums that happen to reuse the same bare variant name
+// (legal in Rust — variants are namespaced per-enum there) COLLIDE here even when neither name is a
+// reserved word. This is not a new problem — `lib/std/collections.myc` already solved the identical
+// issue by hand (`Vec`'s own `Nil`/`Cons` forced `Map` to use `MNil`/`MCons` and `Set` to use
+// `SNil`/`SCons` rather than reusing `Nil`/`Cons`) — this port just hits it at a much larger scale.
+// Found (transcribed during authoring by diffing every bare Rust variant/struct-ctor name against
+// every other): `Vsa` (in `Paradigm`, `AmbientParams`, AND `BaseType` — resolved by FLAG-ast-4's
+// P-/AP-prefixing, leaving `BaseType::Vsa` the one bare survivor), `Dense` (same 3, plus
+// `Sparsity::Dense` — a 4-way clash, resolved the same way, leaving `BaseType::KwDense` needing its
+// OWN keyword-collision rename too), `Lit` (`WidthRef::Lit`, `Expr::Lit`, `Pattern::Lit` — 3-way;
+// `Expr::Lit` kept bare as the most central usage, `WidthRef::Lit` -> `WLit`, `Pattern::Lit` ->
+// `PLit`), `Tuple` (`BaseType::Tuple`, `Pattern::Tuple` — `BaseType`'s kept bare, `Pattern`'s ->
+// `PTuple`), `Fn` (`Item::Fn`, `BaseType::Fn` — `Item::Fn` kept bare per FLAG-ast-4's reasoning,
+// `BaseType::Fn` (the `A => B` function-type arrow) -> `FnArrow`), `Impl` (`Item::Impl`,
+// `LowerRhs::Impl` — `Item::Impl` kept bare, `LowerRhs::Impl` -> `LRImpl`; `LowerRhs::Expr` renamed
+// to the matching `LRExpr` for symmetry), `Type` (`Item::Type`, `ParamKind::Type` — `Item::Type`
+// kept bare, `ParamKind::Type`/`Width` -> `PkType`/`PkWidth` for symmetry). `Pattern`'s remaining
+// variants (`Wildcard`/`Ctor`/`Ident`/`Or`) are additionally P-prefixed (`PWildcard`/`PCtor`/
+// `PIdent`/`POr`) purely for READABILITY consistency within the one enum that most needed
+// disambiguation — none of the four themselves collide with anything.
+//
+// FLAG-ast-6 (`BTreeMap<String, u64>` -> `Vec[EffectBudget]`, an ordered association list).
+// `FnSig::effect_budgets` is a Rust `BTreeMap` (sorted, deduplicated). The `.myc` surface has no
+// map primitive available self-contained (M-982); an ordered `Vec` of `EB(name, bound)` pairs
+// carries the same information but neither sorts nor deduplicates automatically — a real,
+// documented narrowing (the parser leaf must not construct a duplicate-keyed list; nothing here
+// enforces that).
+//
+// FLAG-ast-7 (`WidthRef`'s `Display` impl is NOT ported). Rust's `impl Display for WidthRef`
+// writes `WidthRef::Lit(n)` as the decimal string of `n`; that needs an int-to-decimal-string
+// conversion helper this self-contained leaf does not have (no `use` of a stdlib text/fmt nodule
+// per FLAG-ast-3, and writing a fresh digit-extraction loop is out of this pure-data leaf's scope).
+// Honest narrowing, not a silent drop — `Paradigm`'s own (trivial, fixed 4-string lookup)
+// `Display` equivalent IS ported as `paradigm_to_bytes` below.
+//
+// FLAG-ast-8 (`#[non_exhaustive]` on `Literal` has no `.myc` analog). It is a Rust
+// API-evolution/semver marker (external crates must keep a wildcard match arm); it names no
+// runtime or type-checked behavior this checked language represents, so it is dropped — noted,
+// not silently.
+
+// ── Option / Vec (local; no cross-nodule import — FLAG-ast-3) ──────────────────────────────────
+type Option[A] = Some(A) | None;
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// ── Vis (mirrors ast.rs::Vis — M-662 cross-nodule visibility) ──────────────────────────────────
+// Private = no `pub` marker (default); Pub = exported to the phylum's other nodules.
+type Vis = Private | Pub;
+
+fn vis_is_pub(v: Vis) => Bool =
+  match v { Private => False, Pub => True };
+
+// ── Path (mirrors ast.rs::Path — a dotted path or bare name) ────────────────────────────────────
+type Path = Pth(Vec[Bytes]);
+
+fn path_segs(p: Path) => Vec[Bytes] =
+  match p { Pth(segs) => segs };
+
+// ── UsePath (mirrors ast.rs::UsePath — M-662 cross-nodule import target) ───────────────────────
+// `path`; `glob` = True for `use a.b.*`, False for a specific `use a.b.Item`.
+type UsePath = UP(Path, Bool);
+
+fn usepath_path(u: UsePath) => Path =
+  match u { UP(p, _) => p };
+
+fn usepath_glob(u: UsePath) => Bool =
+  match u { UP(_, g) => g };
+
+// ── Paradigm (mirrors ast.rs::Paradigm — FLAG-ast-4 P-prefix) ──────────────────────────────────
+type Paradigm = PBinary | PTernary | PDense | PVsa;
+
+// paradigm_to_bytes: mirrors `impl Display for Paradigm` (FLAG-ast-7 note: this one IS ported —
+// a trivial fixed 4-string lookup, unlike WidthRef's).
+fn paradigm_to_bytes(p: Paradigm) => Bytes =
+  match p {
+    PBinary => "Binary",
+    PTernary => "Ternary",
+    PDense => "Dense",
+    PVsa => "VSA"
+  };
+
+// ── Scalar (mirrors ast.rs::Scalar — FLAG-ast-4 S-prefix, reuses token.myc::ScalarTok naming) ──
+type Scalar = SF16 | SBf16 | SF32 | SF64;
+
+// ── Sparsity (mirrors ast.rs::Sparsity — FLAG-ast-4 Sp-prefix, both variants collide) ──────────
+type Sparsity = SpDense | SpSparse(Binary{32});
+
+// ── AmbientParams (mirrors ast.rs::AmbientParams — RFC-0012 §4.2 paradigm-less repr params;
+// FLAG-ast-4/5 AP-prefix) ────────────────────────────────────────────────────────────────────────
+type AmbientParams =
+    APSize(Binary{32})
+  | APDense(Binary{32}, Scalar)
+  | APVsa(Bytes, Binary{32}, Sparsity);
+
+// ── Strength (mirrors ast.rs::Strength — the guarantee-lattice tag; FLAG-ast-4 G-prefix) ───────
+type Strength = GExact | GProven | GEmpirical | GDeclared;
+
+// strength_rank: mirrors `Strength::rank` (u8 -> Binary{8}; Declared=0 .. Exact=3).
+fn strength_rank(s: Strength) => Binary{8} =
+  match s {
+    GDeclared => 0b0000_0000,
+    GEmpirical => 0b0000_0001,
+    GProven => 0b0000_0010,
+    GExact => 0b0000_0011
+  };
+
+// strength_meet: mirrors `Strength::meet` — the weaker (less-trusted) of the two grades.
+fn strength_meet(a: Strength, b: Strength) => Strength =
+  match lt(strength_rank(b), strength_rank(a)) {
+    0b1 => b,
+    _ => a
+  };
+
+// strength_satisfies: mirrors `Strength::satisfies` — `self.rank() >= demand.rank()`.
+fn strength_satisfies(actual: Strength, demand: Strength) => Bool =
+  match lt(strength_rank(actual), strength_rank(demand)) {
+    0b1 => False,
+    _ => True
+  };
+
+// ── WidthRef (mirrors ast.rs::WidthRef — DN-42/M-753 v1 width slot; FLAG-ast-4/5 W-prefix) ─────
+type WidthRef = WLit(Binary{32}) | WName(Bytes);
+
+// FLAG-ast-7: no `widthref_to_bytes` — the Display impl needs int-to-decimal-string conversion,
+// not available self-contained; honest narrowing, not silently dropped.
+
+// ── ParamKind (mirrors ast.rs::ParamKind — DN-42/M-753 v1; FLAG-ast-5 Pk-prefix) ────────────────
+type ParamKind = PkType | PkWidth;
+
+fn paramkind_eq(a: ParamKind, b: ParamKind) => Bool =
+  match a {
+    PkType => match b { PkType => True, PkWidth => False },
+    PkWidth => match b { PkType => False, PkWidth => True }
+  };
+
+// ── TraitRef (mirrors ast.rs::TraitRef — a bound-position trait reference) ─────────────────────
+type TraitRef = TRf(Bytes, Vec[TypeRef]);
+
+fn traitref_name(t: TraitRef) => Bytes =
+  match t { TRf(n, _) => n };
+
+fn traitref_args(t: TraitRef) => Vec[TypeRef] =
+  match t { TRf(_, a) => a };
+
+// ── TypeParam (mirrors ast.rs::TypeParam — a possibly-bounded fn type parameter) ────────────────
+type TypeParam = TP(Bytes, ParamKind, Vec[TraitRef]);
+
+fn typeparam_name(t: TypeParam) => Bytes =
+  match t { TP(n, _, _) => n };
+
+fn typeparam_kind(t: TypeParam) => ParamKind =
+  match t { TP(_, k, _) => k };
+
+fn typeparam_bounds(t: TypeParam) => Vec[TraitRef] =
+  match t { TP(_, _, b) => b };
+
+// typeparam_names_of_kind: shared filter for fn_sig_param_names / fn_sig_width_param_names below.
+// Non-tail, bounded by the fn's OWN type-parameter count (a handful) — not source length; the same
+// nesting-bounded shape nodule.myc's split_dotted/join_segs use (RFC-0041 §7 W7 amendment 11).
+fn typeparam_names_of_kind(ps: Vec[TypeParam], k: ParamKind) => Vec[Bytes] =
+  match ps {
+    Nil => Nil,
+    Cons(p, rest) =>
+      match paramkind_eq(typeparam_kind(p), k) {
+        True => Cons(typeparam_name(p), typeparam_names_of_kind(rest, k)),
+        False => typeparam_names_of_kind(rest, k)
+      }
+  };
+
+// ── EffectBudget (mirrors one entry of ast.rs::FnSig::effect_budgets — FLAG-ast-6) ──────────────
+type EffectBudget = EB(Bytes, Binary{64});
+
+// ── FnSig (mirrors ast.rs::FnSig — a fn/trait-requirement signature) ───────────────────────────
+// Fields, in order: name, params (bounded type params), value_params, ret, effects (declared
+// names), effect_budgets (FLAG-ast-6: an ordered Vec, not a BTreeMap).
+type FnSig = FS(Bytes, Vec[TypeParam], Vec[Param], TypeRef, Vec[Bytes], Vec[EffectBudget]);
+
+fn fnsig_name(s: FnSig) => Bytes =
+  match s { FS(n, _, _, _, _, _) => n };
+
+fn fnsig_params(s: FnSig) => Vec[TypeParam] =
+  match s { FS(_, p, _, _, _, _) => p };
+
+fn fnsig_value_params(s: FnSig) => Vec[Param] =
+  match s { FS(_, _, vp, _, _, _) => vp };
+
+fn fnsig_ret(s: FnSig) => TypeRef =
+  match s { FS(_, _, _, r, _, _) => r };
+
+fn fnsig_effects(s: FnSig) => Vec[Bytes] =
+  match s { FS(_, _, _, _, e, _) => e };
+
+fn fnsig_effect_budgets(s: FnSig) => Vec[EffectBudget] =
+  match s { FS(_, _, _, _, _, eb) => eb };
+
+// fnsig_param_names: mirrors `FnSig::param_names` (type-kind params only).
+fn fnsig_param_names(s: FnSig) => Vec[Bytes] =
+  typeparam_names_of_kind(fnsig_params(s), PkType);
+
+// fnsig_width_param_names: mirrors `FnSig::width_param_names` (width-kind params only).
+fn fnsig_width_param_names(s: FnSig) => Vec[Bytes] =
+  typeparam_names_of_kind(fnsig_params(s), PkWidth);
+
+// ── Param (mirrors ast.rs::Param — a value parameter `name: type`) ──────────────────────────────
+type Param = Prm(Bytes, TypeRef);
+
+fn param_name(p: Param) => Bytes =
+  match p { Prm(n, _) => n };
+
+fn param_ty(p: Param) => TypeRef =
+  match p { Prm(_, t) => t };
+
+// ── TypeRef / BaseType (mirror ast.rs::TypeRef / ast.rs::BaseType — mutually recursive; the
+// two-pass shell-then-resolve type registration handles this regardless of declaration order,
+// see the file header's Box/recursion note) ─────────────────────────────────────────────────────
+type TypeRef = TR(BaseType, Option[Strength]);
+
+fn typeref_base(t: TypeRef) => BaseType =
+  match t { TR(b, _) => b };
+
+fn typeref_guarantee(t: TypeRef) => Option[Strength] =
+  match t { TR(_, g) => g };
+
+// typeref_unguaranteed: mirrors `TypeRef::unguaranteed`.
+fn typeref_unguaranteed(b: BaseType) => TypeRef =
+  TR(b, None);
+
+// typeref_with_guarantee: mirrors `TypeRef::with_guarantee`.
+fn typeref_with_guarantee(b: BaseType, g: Strength) => TypeRef =
+  TR(b, Some(g));
+
+// BaseType: mirrors ast.rs::BaseType field-for-field. FLAG-ast-4 renames the 7 repr-keyword
+// collisions (Kw-prefix); FLAG-ast-5 renames `Fn` (cross-type collision with `Item::Fn`) to
+// `FnArrow`. `Vsa`/`Named`/`Ambient`/`Tuple` are bare (no collision after FLAG-ast-4's Paradigm/
+// AmbientParams renames leave them the sole survivor).
+type BaseType =
+    KwBinary(WidthRef)
+  | KwTernary(WidthRef)
+  | KwDense(Binary{32}, Scalar)
+  | Vsa(Bytes, Binary{32}, Sparsity)
+  | KwSubstrate(Bytes)
+  | KwSeq(TypeRef, Binary{32})
+  | KwBytes
+  | KwFloat
+  | Named(Bytes, Vec[TypeRef])
+  | Ambient(AmbientParams)
+  | FnArrow(TypeRef, TypeRef)
+  | Tuple(Vec[TypeRef]);
+
+// ── ExecutionMode (mirrors ast.rs::ExecutionMode — DN-58 §C `@tier(mode)` request) ──────────────
+type ExecutionMode = Interpreted | Compiled;
+
+// ── FnDecl (mirrors ast.rs::FnDecl — a function definition) ─────────────────────────────────────
+// Fields, in order: vis, thaw (bool), tier (Option[ExecutionMode]), sig, body.
+type FnDecl = FD(Vis, Bool, Option[ExecutionMode], FnSig, Expr);
+
+fn fndecl_vis(f: FnDecl) => Vis =
+  match f { FD(v, _, _, _, _) => v };
+
+fn fndecl_thaw(f: FnDecl) => Bool =
+  match f { FD(_, t, _, _, _) => t };
+
+fn fndecl_tier(f: FnDecl) => Option[ExecutionMode] =
+  match f { FD(_, _, t, _, _) => t };
+
+fn fndecl_sig(f: FnDecl) => FnSig =
+  match f { FD(_, _, _, s, _) => s };
+
+fn fndecl_body(f: FnDecl) => Expr =
+  match f { FD(_, _, _, _, b) => b };
+
+// ── Ctor (mirrors ast.rs::Ctor — one constructor of a TypeDecl) ─────────────────────────────────
+// M-1027 / DN-104: the 3rd field is the `sealed` flag — a `priv`-marked constructor of a `pub type`
+// exports the type NAME but withholds cross-nodule construction (the FR-N3 capability-gate). `False`
+// for an unmarked constructor (the default; backward-compatible).
+type Ctor = Ctr(Bytes, Vec[TypeRef], Bool);
+
+fn ctor_name(c: Ctor) => Bytes =
+  match c { Ctr(n, _, _) => n };
+
+fn ctor_fields(c: Ctor) => Vec[TypeRef] =
+  match c { Ctr(_, f, _) => f };
+
+// ctor_sealed: the per-constructor `priv` seal (M-1027 / DN-104).
+fn ctor_sealed(c: Ctor) => Bool =
+  match c { Ctr(_, _, s) => s };
+
+// ── TypeDecl (mirrors ast.rs::TypeDecl — `type Name<params> = Ctor | …`) ────────────────────────
+type TypeDecl = TD(Vis, Bytes, Vec[Bytes], Vec[Ctor]);
+
+fn typedecl_vis(t: TypeDecl) => Vis =
+  match t { TD(v, _, _, _) => v };
+
+fn typedecl_name(t: TypeDecl) => Bytes =
+  match t { TD(_, n, _, _) => n };
+
+fn typedecl_params(t: TypeDecl) => Vec[Bytes] =
+  match t { TD(_, _, p, _) => p };
+
+fn typedecl_ctors(t: TypeDecl) => Vec[Ctor] =
+  match t { TD(_, _, _, c) => c };
+
+// ── TraitDecl (mirrors ast.rs::TraitDecl — `trait Name<params> { fn … }`) ──────────────────────
+type TraitDecl = TrD(Vis, Bytes, Vec[Bytes], Vec[FnSig]);
+
+fn traitdecl_vis(t: TraitDecl) => Vis =
+  match t { TrD(v, _, _, _) => v };
+
+fn traitdecl_name(t: TraitDecl) => Bytes =
+  match t { TrD(_, n, _, _) => n };
+
+fn traitdecl_params(t: TraitDecl) => Vec[Bytes] =
+  match t { TrD(_, _, p, _) => p };
+
+fn traitdecl_sigs(t: TraitDecl) => Vec[FnSig] =
+  match t { TrD(_, _, _, s) => s };
+
+// ── ImplDecl (mirrors ast.rs::ImplDecl — `impl Trait<args> for T { fn … }`) ─────────────────────
+type ImplDecl = ImD(Bytes, Vec[TypeRef], TypeRef, Vec[FnDecl]);
+
+fn impldecl_trait_name(i: ImplDecl) => Bytes =
+  match i { ImD(n, _, _, _) => n };
+
+fn impldecl_trait_args(i: ImplDecl) => Vec[TypeRef] =
+  match i { ImD(_, a, _, _) => a };
+
+fn impldecl_for_ty(i: ImplDecl) => TypeRef =
+  match i { ImD(_, _, t, _) => t };
+
+fn impldecl_methods(i: ImplDecl) => Vec[FnDecl] =
+  match i { ImD(_, _, _, m) => m };
+
+// ── ViaDecl (mirrors ast.rs::ViaDecl — DN-53 M-811 `via <field_idx> : <Trait>` delegation) ──────
+type ViaDecl = VD(Binary{32}, Bytes, Vec[TypeRef]);
+
+fn viadecl_field_idx(v: ViaDecl) => Binary{32} =
+  match v { VD(i, _, _) => i };
+
+fn viadecl_trait_name(v: ViaDecl) => Bytes =
+  match v { VD(_, n, _) => n };
+
+fn viadecl_trait_args(v: ViaDecl) => Vec[TypeRef] =
+  match v { VD(_, _, a) => a };
+
+// ── ObjectDecl (mirrors ast.rs::ObjectDecl — DN-53 M-811 `object` composition surface) ──────────
+type ObjectDecl = OD(Vis, Bytes, Vec[Bytes], Ctor, Vec[ViaDecl], Vec[ImplDecl], Vec[FnDecl]);
+
+fn objectdecl_vis(o: ObjectDecl) => Vis =
+  match o { OD(v, _, _, _, _, _, _) => v };
+
+fn objectdecl_name(o: ObjectDecl) => Bytes =
+  match o { OD(_, n, _, _, _, _, _) => n };
+
+fn objectdecl_params(o: ObjectDecl) => Vec[Bytes] =
+  match o { OD(_, _, p, _, _, _, _) => p };
+
+fn objectdecl_ctor(o: ObjectDecl) => Ctor =
+  match o { OD(_, _, _, c, _, _, _) => c };
+
+fn objectdecl_via_decls(o: ObjectDecl) => Vec[ViaDecl] =
+  match o { OD(_, _, _, _, vd, _, _) => vd };
+
+fn objectdecl_impls(o: ObjectDecl) => Vec[ImplDecl] =
+  match o { OD(_, _, _, _, _, i, _) => i };
+
+fn objectdecl_fns(o: ObjectDecl) => Vec[FnDecl] =
+  match o { OD(_, _, _, _, _, _, f) => f };
+
+// ── InherentImplDecl (mirrors ast.rs::InherentImplDecl — M-664 + DN-103 `impl[T]? T { fn … }`) ────
+// First field: the impl-level type-parameter slot (DN-103 / M-1026 / ENB-3) — unbounded names, Nil
+// for the plain M-664 block.
+type InherentImplDecl = IID(Vec[Bytes], TypeRef, Vec[FnDecl]);
+
+fn inherentimpldecl_params(i: InherentImplDecl) => Vec[Bytes] =
+  match i { IID(p, _, _) => p };
+
+fn inherentimpldecl_for_ty(i: InherentImplDecl) => TypeRef =
+  match i { IID(_, t, _) => t };
+
+fn inherentimpldecl_methods(i: InherentImplDecl) => Vec[FnDecl] =
+  match i { IID(_, _, m) => m };
+
+// ── LowerRhs (mirrors ast.rs::LowerRhs — DN-54 §10 the RHS of a `lower` rule; FLAG-ast-5 LR-
+// prefix, both variants renamed since `Impl` collides with `Item::Impl`) ────────────────────────
+type LowerRhs = LRExpr(Expr) | LRImpl(ImplDecl);
+
+// ── LowerDecl (mirrors ast.rs::LowerDecl — `lower Name[params] = <rhs>`, DN-54 §3.2/M-812) ──────
+type LowerDecl = LD(Bytes, Vec[Bytes], LowerRhs);
+
+fn lowerdecl_name(l: LowerDecl) => Bytes =
+  match l { LD(n, _, _) => n };
+
+fn lowerdecl_params(l: LowerDecl) => Vec[Bytes] =
+  match l { LD(_, p, _) => p };
+
+fn lowerdecl_rhs(l: LowerDecl) => LowerRhs =
+  match l { LD(_, _, r) => r };
+
+// lowerdecl_expr_rhs: mirrors `LowerDecl::expr_rhs`.
+fn lowerdecl_expr_rhs(l: LowerDecl) => Option[Expr] =
+  match lowerdecl_rhs(l) {
+    LRExpr(e) => Some(e),
+    LRImpl(_) => None
+  };
+
+// lowerdecl_impl_rhs: mirrors `LowerDecl::impl_rhs`.
+fn lowerdecl_impl_rhs(l: LowerDecl) => Option[ImplDecl] =
+  match lowerdecl_rhs(l) {
+    LRImpl(i) => Some(i),
+    LRExpr(_) => None
+  };
+
+// ── DeriveDecl (mirrors ast.rs::DeriveDecl — `derive Name for T`, DN-54 §3.2/§8.1) ──────────────
+type DeriveDecl = DD(Bytes, TypeRef);
+
+fn derivedecl_name(d: DeriveDecl) => Bytes =
+  match d { DD(n, _) => n };
+
+fn derivedecl_for_ty(d: DeriveDecl) => TypeRef =
+  match d { DD(_, t) => t };
+
+// ── Item (mirrors ast.rs::Item — a top-level item; every variant is bare/unrenamed, none collide
+// per FLAG-ast-4's case-sensitivity reasoning) ──────────────────────────────────────────────────
+type Item =
+    Use(UsePath)
+  | Default(Paradigm)
+  | Type(TypeDecl)
+  | Trait(TraitDecl)
+  | Impl(ImplDecl)
+  | Fn(FnDecl)
+  | Object(ObjectDecl)
+  | Lower(LowerDecl)
+  | Derive(DeriveDecl)
+  | InherentImpl(InherentImplDecl);
+
+// ── Nodule (mirrors ast.rs::Nodule — a whole program: header + items) ──────────────────────────
+// Fields, in order: path, std_sys (the `@std-sys` header marker), items.
+type Nodule = Nd(Path, Bool, Vec[Item]);
+
+fn nodule_path(n: Nodule) => Path =
+  match n { Nd(p, _, _) => p };
+
+fn nodule_std_sys(n: Nodule) => Bool =
+  match n { Nd(_, s, _) => s };
+
+fn nodule_items(n: Nodule) => Vec[Item] =
+  match n { Nd(_, _, i) => i };
+
+// ── Phylum (mirrors ast.rs::Phylum — M-662/DN-06 the library-scale grouping above nodule) ───────
+type Phylum = Phy(Option[Path], Vec[Nodule]);
+
+fn phylum_path(p: Phylum) => Option[Path] =
+  match p { Phy(pa, _) => pa };
+
+fn phylum_nodules(p: Phylum) => Vec[Nodule] =
+  match p { Phy(_, n) => n };
+
+// phylum_of_one: mirrors `Phylum::of_one` — a phylum-of-one wrapping a single bare nodule.
+fn phylum_of_one(n: Nodule) => Phylum =
+  Phy(None, Cons(n, Nil));
+
+// ── Literal (mirrors ast.rs::Literal — a literal value; FLAG-ast-4/5 renames `Bytes` -> `LBytes`
+// and `Float` -> `LFloat` (both collide with a repr keyword AND with `BaseType::Bytes`/`Float`);
+// FLAG-ast-8: no `#[non_exhaustive]` analog) ────────────────────────────────────────────────────
+type Literal =
+    Bin(Bytes)
+  | Trit(Bytes)
+  | Int(Binary{64})
+  | AmbientInt(Paradigm, Binary{64})
+  | List(Vec[Expr])
+  | LBytes(Bytes)
+  | Str(Bytes)
+  | LFloat(Bytes);
+
+// literal_binary: mirrors `Literal::binary`.
+fn literal_binary(digits: Bytes) => Literal =
+  Bin(digits);
+
+// literal_ternary: mirrors `Literal::ternary`.
+fn literal_ternary(trits: Bytes) => Literal =
+  Trit(trits);
+
+// literal_string: mirrors `Literal::string`.
+fn literal_string(content: Bytes) => Literal =
+  Str(content);
+
+// literal_float: mirrors `Literal::float`.
+fn literal_float(text: Bytes) => Literal =
+  LFloat(text);
+
+// ── Pattern (mirrors ast.rs::Pattern — a match pattern; FLAG-ast-5 P-prefix throughout, since
+// `Lit`/`Tuple` each collide with another type and the rest are prefixed for consistency) ───────
+type Pattern =
+    PWildcard
+  | PLit(Literal)
+  | PCtor(Bytes, Vec[Pattern])
+  | PIdent(Bytes)
+  | PTuple(Vec[Pattern])
+  | POr(Vec[Pattern]);
+
+// ── Arm (mirrors ast.rs::Arm — one `match` arm) ─────────────────────────────────────────────────
+type Arm = Ar(Pattern, Expr);
+
+fn arm_pattern(a: Arm) => Pattern =
+  match a { Ar(p, _) => p };
+
+fn arm_body(a: Arm) => Expr =
+  match a { Ar(_, b) => b };
+
+// ── Hypha (mirrors ast.rs::Hypha — one `hypha <expr>` spawn inside a `colony` block) ────────────
+// Fields, in order: forage (an optional `@forage(policy)` literal-mask expression), body.
+type Hypha = Hy(Option[Expr], Expr);
+
+fn hypha_forage(h: Hypha) => Option[Expr] =
+  match h { Hy(f, _) => f };
+
+fn hypha_body(h: Hypha) => Expr =
+  match h { Hy(_, b) => b };
+
+// ── Expr (mirrors ast.rs::Expr — an expression; every variant is bare/unrenamed except where
+// FLAG-ast-4/5 note a collision elsewhere in this file) ─────────────────────────────────────────
+// FLAG-ast-9: the `Wrapping` variant (M-791) is now REPRESENTED here so this type mirrors
+// ast.rs::Expr's 20 variants field-for-field (incl. the DN-102 `Try` node), but the self-hosted
+// lexer/parser does NOT yet
+// PRODUCE it (no `wrapping` keyword; no parse rule) — surface parsing of `wrapping { e }` is
+// deferred remaining work (never-silent, G2). Represented and traversed, not yet parsed.
+type Expr =
+    Let(Bytes, Option[TypeRef], Expr, Expr)
+  | If(Expr, Expr, Expr)
+  | Match(Expr, Vec[Arm])
+  | For(Bytes, Expr, Bytes, Expr, Expr)
+  | Swap(Expr, TypeRef, Path)
+  | WithParadigm(Paradigm, Expr)
+  | Wild(Expr)
+  | Spore(Expr)
+  | Wrapping(Expr)
+  | Consume(Expr)
+  // DN-102 (M-1025 ENB-2): the `?` try-operator node. REPRESENTED + traversed here (like
+  // `Wrapping`/`Consume`), but the self-hosted lexer/parser does NOT yet PRODUCE it — the Rust
+  // reference frontend does (ast.rs::Expr::Try), and `myc check` (Rust-backed) handles `?` in a
+  // `.myc` file. Represented-not-produced (never-silent, G2; FLAG-try-3).
+  | Try(Expr)
+  | Colony(Vec[Hypha])
+  | Lambda(Vec[Param], Expr)
+  | App(Expr, Vec[Expr])
+  | Fuse(Expr, Expr)
+  | Reclaim(Expr, Expr)
+  | Path(Path)
+  | Lit(Literal)
+  | Ascribe(Expr, TypeRef)
+  | TupleLit(Vec[Expr]);

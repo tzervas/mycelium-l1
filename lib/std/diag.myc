@@ -1,0 +1,372 @@
+// nodule: std.diag
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted RFC-0016 §4.5 `std.diag` guarantee matrix — the 14-row honest-tag/
+nodule std.diag;
+
+//   fallibility/effects/EXPLAIN/never-silent table, ported to `.myc` as CHECKED DATA (M-926,
+//   kickoff `opp`, RFC-0031 D5). The kernel record half (`Diag`/`Locus`/`Trace`/`Code`/`Severity`,
+//   `mycelium-diag`) is NOT ported here — see the FLAG below (RFC-0031 D1 kernel boundary).
+// M-926 (E29-1, kickoff `opp`). RFC-0031 D5 port of `crates/mycelium-std-diag/src/guarantee_matrix.rs`
+// — the "load-bearing deliverable" the crate's own module doc names (RFC-0016 §4.5). Unblocked by
+// M-910/M-911 (textual string literals `"…"` land as `Bytes`, so the matrix's prose fields — `op`,
+// `error_set`, `effects`, `never_silent_property` — are now expressible; they were the reason the
+// prior M-926 attempt STOPPED).
+//
+// Surface-check (D5 row 1, Empirical, 2026-07-02): the crate's public surface has TWO parts —
+//   (a) the guarantee-matrix DATA (`guarantee_matrix::MATRIX`, `MatrixRow`, `Fallibility`,
+//       `Explainable`) — pure algebraic data + prose strings, no kernel dependency. EXPRESSIBLE
+//       today via ADTs + textual string literals. PORTED below.
+//   (b) the kernel-type re-exports (`Diag`/`Locus`/`Trace`/`Code`/`Severity` from `mycelium-diag`,
+//       re-exported verbatim by `mycelium-std-diag::lib.rs`) — these carry Rust `String`/`Vec<String>`
+//       fields, BLAKE3 content-hashing (`Diag::content_hash`), and `serde` JSON (de)serialization
+//       (`Diag::machine`/`from_json`) that have no `.myc`-surface equivalent (no FFI/kernel-type
+//       construction mechanism is exposed to `.myc` today, and RFC-0031 D1 keeps the kernel Rust —
+//       "the kernel stays Rust"). NOT PORTABLE without a D1-scoped FFI enabler. FLAGged, not forced
+//       (VR-5/G2) — this nodule ports ONLY the guarantee-matrix data (part a).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as `guarantee_matrix.rs`):
+// - Every row's `guarantee` field is `Exact` (RFC-0016 C2 — `diag` has no accuracy semantics of its
+//   own; a faithful re-presentation of an already-explicit error, never an approximation).
+// - The row DATA itself (the 14 hand-transcribed constructors below) is `Declared` — asserted, not
+//   machine-checked; matches the Rust source's own tests (`#[cfg(test)] mod tests` in
+//   guarantee_matrix.rs), which are themselves structural assertions over literal data, not proofs.
+// - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) over the structural checks below is
+//   `Empirical` (trials, std_diag.rs) — matches every other `opp`-wave port's harness tag.
+//
+// Bytes-comparison gap (FLAG, honest scope limit): RFC-0032 D4 exposes only `bytes_len`/`bytes_get`/
+// `bytes_slice`/`bytes_concat` over `Bytes` — there is no `bytes_eq`/substring-search prim yet. So the
+// Rust tests that do STRING-CONTENT assertions (`error_set.contains("UNCHANGED")`,
+// `effects.contains("io")`, `error_set.contains("X1")`, etc.) are NOT portable today; only
+// LENGTH-based (non-empty) and ADT-equality (`Guarantee`/`Fallibility`/`Explainable` are typed enums,
+// not stringly-typed — matching the kernel `Severity` precedent) structural checks are expressible.
+// The prose fields themselves ARE fully ported (byte-faithful transcriptions) — only the substring
+// ASSERTIONS over them are out of scope pending a `bytes_eq`/`bytes_contains` prim (route to `enb` if
+// wave demand justifies it — not requested by this port alone).
+// ── Guarantee ────────────────────────────────────────────────────────────────────────────────────
+// The lattice tag Exact ⊐ Proven ⊐ Empirical ⊐ Declared (VR-5). Typed — never stringly (mirrors the
+// kernel `Severity` precedent, mycelium-diag). All 14 matrix rows use `GExact` (RFC-0016 C2); the
+// other three variants are declared for lattice completeness (a future non-`diag` guarantee-matrix
+// port reuses this type unchanged).
+//
+// Naming (FLAG, surface note): `Exact`/`Proven`/`Empirical`/`Declared` are RESERVED (the
+// `T @ Exact` guarantee-strength type-annotation surface, `token.rs::StrengthTok` — a distinct,
+// type-level mechanism from this VALUE-level lattice-tag data). Constructors here are prefixed `G`
+// (`GExact`/`GProven`/`GEmpirical`/`GDeclared`) to avoid the keyword collision.
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// ── Fallibility ──────────────────────────────────────────────────────────────────────────────────
+// Mirrors `guarantee_matrix::Fallibility`: an op is either `Total` (always returns a value for all
+// well-formed inputs) or `Explicit` (yields an explicit Result/Option/Some(Result)).
+type Fallibility = Total | Explicit;
+
+// ── Explainable ──────────────────────────────────────────────────────────────────────────────────
+// Mirrors `guarantee_matrix::Explainable`: the op's C3 EXPLAIN classification.
+type Explainable = IsExplainRecord | ContentAddressedHandle | NotApplicable | ClosedVocabulary;
+
+// ── MatrixRow ────────────────────────────────────────────────────────────────────────────────────
+// Mirrors `guarantee_matrix::MatrixRow` field-for-field, in the same order:
+//   Row(op, guarantee, fallibility, error_set, effects, explainable, never_silent_property)
+// `op`/`error_set`/`effects`/`never_silent_property` are free-form prose (Bytes — textual string
+// literals, M-910/M-911); `guarantee`/`fallibility`/`explainable` are typed ADTs (never stringly).
+type MatrixRow = Row(Bytes, Guarantee, Fallibility, Bytes, Bytes, Explainable, Bytes);
+
+// ── Field accessors ──────────────────────────────────────────────────────────────────────────────
+fn row_op(r: MatrixRow) => Bytes =
+  match r { Row(op, _, _, _, _, _, _) => op };
+
+fn row_guarantee(r: MatrixRow) => Guarantee =
+  match r { Row(_, g, _, _, _, _, _) => g };
+
+fn row_fallibility(r: MatrixRow) => Fallibility =
+  match r { Row(_, _, f, _, _, _, _) => f };
+
+fn row_error_set(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, e, _, _, _) => e };
+
+fn row_effects(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, _, ef, _, _) => ef };
+
+fn row_explainable(r: MatrixRow) => Explainable =
+  match r { Row(_, _, _, _, _, x, _) => x };
+
+fn row_never_silent(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, _, _, _, n) => n };
+
+// ── Structural predicates (ADT equality — no bytes_eq needed) ───────────────────────────────────
+fn is_exact(g: Guarantee) => Bool =
+  match g { GExact => True, GProven => False, GEmpirical => False, GDeclared => False };
+
+fn is_total(f: Fallibility) => Bool =
+  match f { Total => True, Explicit => False };
+
+fn is_explicit(f: Fallibility) => Bool =
+  match f { Total => False, Explicit => True };
+
+fn is_explain_record(x: Explainable) => Bool =
+  match x {
+    IsExplainRecord => True,
+    ContentAddressedHandle => False,
+    NotApplicable => False,
+    ClosedVocabulary => False
+  };
+
+fn is_content_addressed_handle(x: Explainable) => Bool =
+  match x {
+    IsExplainRecord => False,
+    ContentAddressedHandle => True,
+    NotApplicable => False,
+    ClosedVocabulary => False
+  };
+
+// bool_and: local total conjunction (no cross-leaf import; mirrors std.cmp's bool_eq/bool_cmp
+// self-containedness convention). Total over Bool x Bool (Exact).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+// nonempty: True iff `b` has at least one byte. Delegates to the Exact `bytes_len` prim; the
+// zero-comparison is the Exact `eq` prim at Binary{32} (the width `bytes_len` returns). Total (Exact).
+fn nonempty(b: Bytes) => Bool =
+  match eq(bytes_len(b), 0b0000_0000_0000_0000_0000_0000_0000_0000) { 0b1 => False, _ => True };
+
+// ── The 14 rows (hand-transcribed verbatim from guarantee_matrix.rs::MATRIX, RFC-0016 §4.5) ───────
+// Each Rust multi-line `\`-continued literal is flattened to the single logical string it denotes
+// (Rust's `\` + newline strips the newline and leading whitespace — no content change, VR-5).
+// ── presentation / identity ─────────────────────────────────────────────────────────────────────
+fn row_present() => MatrixRow =
+  Row(
+    "present",
+    GExact,
+    Total,
+    "total — returns the error UNCHANGED alongside the diagnostic (I1); cannot fail in a way that drops it",
+    "none (pure)",
+    IsExplainRecord,
+    "the error is returned unchanged in Presentation.error — the structural proof that the renderer cannot suppress it (I1)"
+  );
+
+fn row_content_id() => MatrixRow =
+  Row(
+    "content_id",
+    GExact,
+    Total,
+    "total",
+    "none",
+    ContentAddressedHandle,
+    "pure identity function; no error path"
+  );
+
+// ── dual projection (G11 / RFC-0013 I3) ─────────────────────────────────────────────────────────
+fn row_to_human() => MatrixRow =
+  Row(
+    "to_human",
+    GExact,
+    Total,
+    "total",
+    "none",
+    IsExplainRecord,
+    "renders the diagnostic (level-graded); carries the content id (I3)"
+  );
+
+fn row_to_json() => MatrixRow =
+  Row(
+    "to_json",
+    GExact,
+    Total,
+    "total",
+    "none",
+    IsExplainRecord,
+    "lossless machine projection; carries the content id (I3)"
+  );
+
+fn row_from_json() => MatrixRow =
+  Row(
+    "from_json",
+    GExact,
+    Explicit,
+    "Err(ParseErr) on malformed input — explicit, never a partial/sentinel record (C1)",
+    "none",
+    NotApplicable,
+    "explicit Err on malformed input (never a silent partial record)"
+  );
+
+// ── error-class registry (X1 — looked up, never evaluated) ─────────────────────────────────────
+fn row_resolve_class() => MatrixRow =
+  Row(
+    "resolve (class)",
+    GExact,
+    Explicit,
+    "Err(UnknownClass) — class not in registry; no eval (X1)",
+    "none",
+    ClosedVocabulary,
+    "unknown class is an explicit error, never silently ignored (X1/G2)"
+  );
+
+fn row_register_class() => MatrixRow =
+  Row(
+    "register (class)",
+    GExact,
+    Total,
+    "total — known-set insert; extension is membership, never eval (X1)",
+    "none",
+    NotApplicable,
+    "pure insert; no error path"
+  );
+
+// ── reified policy (I4 — presentation/routing only) ─────────────────────────────────────────────
+fn row_on_policy() => MatrixRow =
+  Row(
+    "on (add policy rule)",
+    GExact,
+    Explicit,
+    "Err(UnknownClass) — rule names an unregistered class (X1)",
+    "none",
+    ContentAddressedHandle,
+    "unknown class is an explicit error; the resulting policy is content-addressed (EXPLAIN-able)"
+  );
+
+fn row_policy_ref() => MatrixRow =
+  Row(
+    "policy_ref",
+    GExact,
+    Total,
+    "total",
+    "none",
+    ContentAddressedHandle,
+    "pure content-hash projection; it IS the EXPLAIN handle"
+  );
+
+fn row_from_file() => MatrixRow =
+  Row(
+    "from_file (policy)",
+    GExact,
+    Explicit,
+    "Err(UnknownClass) — whole-file reject on first unknown class (X1); never partial",
+    "none",
+    IsExplainRecord,
+    "whole-file reject; never partially/silently applied (X1/G2)"
+  );
+
+// ── routes → RFC-0008 sinks (RT5 — honest delivery guarantees) ─────────────────────────────────
+fn row_resolve_route() => MatrixRow =
+  Row(
+    "resolve_route",
+    GExact,
+    Explicit,
+    "Err(UnknownRoute) — not in the closed v0 set; never a silent misroute",
+    "none",
+    ClosedVocabulary,
+    "unknown route is an explicit error, never a silent misroute (I1)"
+  );
+
+fn row_sink() => MatrixRow =
+  Row(
+    "sink (dispatch)",
+    GExact,
+    Explicit,
+    "Some(Err(UnknownRoute)) for a bad route; None for no route — OUTSIDE present, so it never gates propagation (I1)",
+    "io (the actual sink transport, RFC-0008; bounded, declared at the call)",
+    ContentAddressedHandle,
+    "dispatched OUTSIDE present (I1): the error has already surfaced; a null/unknown route cannot gate it"
+  );
+
+// ── honest reporting of delivery guarantee and audit bound ─────────────────────────────────────
+fn row_guarantee_of() => MatrixRow =
+  Row(
+    "guarantee (of a Delivery)",
+    GExact,
+    Total,
+    "total — REPORTS the sink's honest strength (None for Null; <= Declared in v0); never upgrades it (RT5/VR-5)",
+    "none",
+    IsExplainRecord,
+    "reports the delivery guarantee on the lattice; the null sink honestly says None (not delivered — RT5/VR-5)"
+  );
+
+fn row_audit_of() => MatrixRow =
+  Row(
+    "audit_of",
+    GExact,
+    Total,
+    "total — a crossing with no statically-derivable certificate reports honesty: None (unknown != Exact), never a fabricated bound (VR-5)",
+    "none",
+    IsExplainRecord,
+    "read-only audit projection (I5); honesty is READ OFF each certificate, never upgraded (VR-5)"
+  );
+
+// ── Vec (local, self-contained; mirrors std.collections' cons-list convention — no cross-leaf import) ──
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// matrix: the full 14-row table, in the same order as guarantee_matrix.rs::MATRIX.
+fn matrix() => Vec[MatrixRow] =
+  [
+    row_present(),
+    row_content_id(),
+    row_to_human(),
+    row_to_json(),
+    row_from_json(),
+    row_resolve_class(),
+    row_register_class(),
+    row_on_policy(),
+    row_policy_ref(),
+    row_from_file(),
+    row_resolve_route(),
+    row_sink(),
+    row_guarantee_of(),
+    row_audit_of()
+  ];
+
+// ── Structural checks over the matrix (the .myc analogs of guarantee_matrix.rs::tests) ───────────
+// Every check below is Empirical (trials, std_diag.rs three-way differential) over Declared data.
+// matrix_len: the row count, as Binary{8} (14 rows fits trivially). O(n) spine-walk (Declared,
+// mirrors std.collections::len).
+fn matrix_len(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// all_exact: True iff every row's guarantee is Exact (guarantee_matrix.rs::all_diag_ops_are_exact).
+fn all_exact(xs: Vec[MatrixRow]) => Bool =
+  match xs { Nil => True, Cons(r, rest) => bool_and(is_exact(row_guarantee(r)), all_exact(rest)) };
+
+// all_never_silent_nonempty: True iff every row states a non-empty never_silent_property
+// (guarantee_matrix.rs::every_row_states_never_silent_property).
+fn all_never_silent_nonempty(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(nonempty(row_never_silent(r)), all_never_silent_nonempty(rest))
+  };
+
+// all_effects_nonempty: True iff every row states its effects (guarantee_matrix.rs::every_row_states_effects).
+fn all_effects_nonempty(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(nonempty(row_effects(r)), all_effects_nonempty(rest))
+  };
+
+// explicit_ops_have_error_set: True iff every Explicit-fallibility row states a non-empty error_set
+// (guarantee_matrix.rs::explicit_ops_have_nonempty_error_set). A Total row is vacuously True.
+fn explicit_ops_have_error_set(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      bool_and(
+        match is_explicit(row_fallibility(r)) { True => nonempty(row_error_set(r)), False => True },
+        explicit_ops_have_error_set(rest)
+      )
+  };
+
+// present_is_i1_crux: the structural (non-substring) half of guarantee_matrix.rs::present_is_the_i1_crux
+// — present is Total, Exact, and IsExplainRecord. (The "error_set contains UNCHANGED" substring
+// assertion is FLAGged above as not portable — no bytes_eq/contains prim.)
+fn present_is_i1_crux() => Bool =
+  bool_and(is_exact(row_guarantee(row_present())),
+  bool_and(is_total(row_fallibility(row_present())),
+  is_explain_record(row_explainable(row_present()))));
+
+// content_id_and_policy_ref_are_handles: guarantee_matrix.rs::content_id_and_policy_ref_are_content_addressed_handles
+// — both rows are ContentAddressedHandle (fully portable: pure ADT equality, no substring needed).
+fn content_id_and_policy_ref_are_handles() => Bool =
+  bool_and(
+    is_content_addressed_handle(row_explainable(row_content_id())),
+    is_content_addressed_handle(row_explainable(row_policy_ref()))
+  );

@@ -1,0 +1,5 @@
+// exercises: the wild unsafe block + a Substrate affine-resource parameter
+nodule io;
+
+fn read(h: Substrate{Handle}) => Binary{8} =
+    wild { foreign_read(h) };

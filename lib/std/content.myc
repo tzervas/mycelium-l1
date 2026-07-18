@@ -1,0 +1,548 @@
+// nodule: std.content
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-09
+// @updated: 2026-07-09
+// @summary: Self-hosted surface of `std.content` — the content-addressing identity library
+nodule std.content;
+
+//   (M-1022, E33-1, kickoff `spw`, RFC-0031 D5). Hand-port of
+//   `crates/mycelium-std-content/src/{content_ref,error,guarantee_matrix,name_registry,lib}.rs`.
+//   The transpiler is a scaffold + gap-profiler (M-991 verdict, DN-34 §8.7–§8.9): its committed
+//   `checked_fraction` for this crate is 14.3% (5/35 items myc-check-clean; the draft `lib.myc`
+//   even carries a live CheckError, `unknown type ContentHash`). So the disjoint majority below is
+//   HAND-WRITTEN: Rust structs → positional ADTs, impls/free-fns → functions, the kernel
+//   `ContentHash` newtype expressed locally as `ContentHash(Bytes)`. The 4 clean draft types are
+//   graduated (RefKind/MalformedDigest verbatim; Fallibility/Explainable/MatrixRow verbatim).
+//
+// Surface-check (D5 row 1, Empirical, 2026-07-09) — re-confirmed against the CURRENT toolchain
+// (`myc-check` + the M-912 `bytes_eq`/`hash.blake3` prims, both present at this base):
+//   PORTED (expressible today, differentiated in std_content.rs):
+//     - `RefKind`, `ContentRef`, `ContentHash` (as a `Bytes` newtype), `MalformedDigest`,
+//       `Fallibility`/`Explainable`/`MatrixRow` — all algebraic data.
+//     - `digest_eq` (byte-equality of the two addresses — the M-912 `bytes_eq` prim closes the gap
+//       the diag/error/recover ports FLAGged; ContentHash-as-opaque-digest is expressible now).
+//     - `as_ref` + the `ContentRef` accessors (`kind`/`hash`/`into_hash`), `kind_prefix`,
+//       `as_str_repr` (via `bytes_concat`), `ref_kind_from_prefix` (via `bytes_eq`).
+//     - `MalformedDigest` constructor + `display` (the Rust `Display` impl, via `bytes_concat`).
+//     - `guarantee_matrix::MATRIX` as CHECKED DATA (the `fn matrix()` cons-chain — the exact
+//       `lib/std/core.myc` `fn matrix() => Vec[GuaranteeRow]` precedent) + its structural checks.
+//     - `NameRegistry` REDESIGNED as an assoc-list (see FLAG-content-2) + its read/write ops
+//       (`new`/`bind`/`resolve_name`/`names_of`/`len`/`is_empty`).
+//     - `parse_ref` + `content_ref_from_str` — the `<algo>:<digest>` / `<prefix>+<algo>:<digest>`
+//       shape scanners, hand-rolled recursive byte scans (there is no `find`/`split` prim; see the
+//       enabler note). Byte-faithful to `ContentHash::parse` + `lib.rs::parse_ref`'s 5-way
+//       diagnostic branching (differentiated case-for-case against the Rust oracle).
+//
+// FLAG-content-1 (hash_of_value / hash_of_def — NOT PORTED; kernel structural-hash boundary,
+//   RFC-0031 D1; route to `enb`): computing the STRUCTURAL content-hash of a runtime `Value` or an
+//   AST `Node` needs the kernel's normalizer (α-renaming-invariant canonicalization + types-with-
+//   `Repr` + static-contract serialization) that lives in `mycelium-core` and is not exposed to
+//   `.myc`. Only raw-bytes BLAKE3 is surfaced (M-912's `hash.blake3 : Bytes -> Bytes`); there is no
+//   `Value::content_hash`/`Node::content_hash` prim. This is the same boundary lib/std/swap.myc
+//   (FLAG-swap-1) and lib/std/recover.myc (FLAG-recover-1) document for ContentHash-adjacent ops.
+//   NOT forced (VR-5/G2): the two ops are excluded; their MATRIX rows are kept as pure data (the
+//   matrix describes the full spec surface — the `lib/std/core.myc` precedent of keeping FLAGged
+//   ops' rows as data). Candidate enabler: a kernel prim analogous to `hash.blake3` but over the
+//   interpreter's own `Value`/`Node`, OR full `Value`/`Node` self-hosting in `lib/compiler`
+//   (explicitly out of this leaf's scope — the `spw` kickoff holds `lib/compiler/**`).
+//
+// FLAG-content-2 (NameRegistry design — assoc-list, NOT the kernel hash-map; never-silent design
+//   substitution, G2): the Rust `NameRegistry` wraps `mycelium_core::content::Names`, a kernel
+//   O(1) hash-map. `.myc` has no kernel-map construction surface, so this port REIMPLEMENTS it as
+//   an O(n) association list `Reg(Vec[Entry])` over the local `Vec` (the lib/std/swap.myc
+//   `bin_to_tern` own-ops precedent — reimplement, don't wrap). It is semantically EQUIVALENT on
+//   the read/write surface the spec exposes (`resolve_name`/`names_of`/`bind`/`len`/`is_empty`,
+//   at-most-one-name-per-hash), differing only in complexity, never in observable result — stated
+//   here, never silently swapped. The Rust "one-name limitation" FLAG is carried forward:
+//   `names_of` returns a 0-or-1-element `Vec`.
+//
+// Pre-port polish (D5 row 2): RECORDED CLEAN — no Rust-side change. `mycelium-std-content` is the
+//   DN-66 frozen baseline (2026-07-01); its source is already unambiguous (G2: stated, not skipped).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as `mycelium-std-content`, never upgraded):
+//   - `digest_eq`, the `ContentRef`/`ContentHash`/`RefKind` accessors + constructors, `kind_prefix`,
+//     `ref_kind_from_prefix`, `as_str_repr`, `display`, `parse_ref`, `content_ref_from_str`,
+//     `name_registry_*` — `Exact`: total (or explicit-`Option`/`Result`), deterministic,
+//     match/prim-defined over a finite construction; no selection/conversion/approximation
+//     (RFC-0016 §4.1 C2 — the honest floor for a content-addressing surface, not an upgrade).
+//   - The 7 MATRIX rows (hand-transcribed constructors) are `Declared` — asserted data, mirroring
+//     the Rust source's own `#[cfg(test)]` structural assertions.
+//   - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) + the Rust-oracle comparison
+//     over the checks below is `Empirical` (trials, std_content.rs, driven against the live
+//     `mycelium_std_content` oracle).
+//
+// Enabler note (route to `enb`, recorded for the M-1006/M-935 ledger — ledger is orchestrator-
+//   owned, FLAGged up not edited here): no string/byte `find`/`split`/`contains` prim is registered
+//   (only `bytes.len`/`get`/`slice`/`concat`/`eq` + `hash.blake3`). `parse_ref`'s colon scan and
+//   `content_ref_from_str`'s `+`-split are therefore hand-rolled recursive byte scans over
+//   `Binary{32}` indices — expressible with today's primitive set, but genuine hand-written
+//   recursion with zero transpiler assist. A `bytes.find`/`bytes.split_once` prim would collapse
+//   these to a few lines; recorded so the enabler track knows this gap-class recurs (parser ports).
+// ── Local prelude types (self-contained — the single-nodule harness has no cross-nodule import; the
+//    lib/std/text.myc + lib/std/core.myc self-containedness convention) ────────────────────────────
+// `Option`/`Result`/`Pair`/`Vec` are declared here rather than imported (no `use` surface in the
+// D5 single-nodule harness). `Bool`/`True`/`False` and `Bytes`/`Binary{W}` are built-in.
+type Option[A] = Some(A) | None;
+
+type Result[A, E] = Ok(A) | Err(E);
+
+type Pair[A, B] = Pr(A, B);
+
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// ── Bool combinators (local, total, Exact — the lib/std/core.myc convention) ─────────────────────
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn bool_or(a: Bool, b: Bool) => Bool =
+  match a { True => True, False => b };
+
+fn bool_not(a: Bool) => Bool =
+  match a { True => False, False => True };
+
+// bit_true: bridge the `lt`/`eq` comparison bit (`Binary{1}`) to `Bool` (the M-747 bool-bridge
+// pattern, lib/std/text.myc::is_ascii_byte). Total (Exact).
+fn bit_true(x: Binary{1}) => Bool =
+  match x { 0b1 => True, _ => False };
+
+// ── ContentHash — the kernel `ContentHash` newtype, expressed locally as a `Bytes` newtype ───────
+// The kernel type is `ContentHash(String)` holding the `<algo>:<digest>` address (id.rs). Ported as
+// a `Bytes` newtype: this is exactly what resolves the draft `lib.myc` CheckError (`unknown type
+// ContentHash`) — the transpiler had no cross-nodule symbol for `mycelium_core::ContentHash`.
+type ContentHash = ContentHash(Bytes);
+
+// content_hash_str: the address as `Bytes` (the kernel `as_str`). Field read — Exact.
+fn content_hash_str(h: ContentHash) => Bytes =
+  match h { ContentHash(s) => s };
+
+// digest_eq: two content hashes are the same identity iff their addresses are byte-equal. Reflexive,
+// symmetric, transitive (a pure `bytes_eq`). Exact, total (lib.rs::digest_eq).
+fn digest_eq(a: ContentHash, b: ContentHash) => Bool =
+  bit_true(bytes_eq(content_hash_str(a), content_hash_str(b)));
+
+// ── RefKind — the role a `ContentRef` designates (graduated verbatim from the clean draft) ───────
+// `Value`/`Def`/`Policy`/`Spore`/`Operation`/`Other` are ordinary constructors: the reserved
+// keywords `spore`/`policy` are LOWERCASE (token.rs), so the capitalized forms do not collide.
+type RefKind = Value | Def | Operation | Policy | Spore | Other;
+
+// content_ref_kind_prefix: the canonical string prefix for a kind (lib.rs::kind_prefix). Match over
+// a finite domain onto fixed `Bytes` literals — total, Exact.
+fn content_ref_kind_prefix(k: RefKind) => Bytes =
+  match k {
+    Value => "value",
+    Def => "def",
+    Operation => "op",
+    Policy => "policy",
+    Spore => "spore",
+    Other => "other"
+  };
+
+// ref_kind_from_prefix: the inverse; `None` for an unrecognised prefix (lib.rs
+// `RefKind::from_prefix`). Byte-equality against each known prefix (the M-912 `bytes_eq` prim; no
+// string-match construct exists). Total → explicit `Option` (never-silent — G2), Exact.
+fn ref_kind_from_prefix(s: Bytes) => Option[RefKind] =
+  match bytes_eq(s, "value") {
+    0b1 => Some(Value),
+    _ => match bytes_eq(s, "def") {
+      0b1 => Some(Def),
+      _ => match bytes_eq(s, "op") {
+        0b1 => Some(Operation),
+        _ => match bytes_eq(s, "policy") {
+          0b1 => Some(Policy),
+          _ => match bytes_eq(s, "spore") {
+            0b1 => Some(Spore),
+            _ => match bytes_eq(s, "other") { 0b1 => Some(Other), _ => None }
+          }
+        }
+      }
+    }
+  };
+
+// ── ContentRef — a typed `(kind, hash)` pointer (positional ADT, the MatrixRow/draft precedent) ──
+type ContentRef = ContentRef(RefKind, ContentHash);
+
+// content_ref_new: build a ref from an explicit kind and hash (ContentRef::new). Total, Exact.
+fn content_ref_new(k: RefKind, h: ContentHash) => ContentRef =
+  ContentRef(k, h);
+
+// as_ref: the free-fn form, argument order `(hash, kind)` → `ContentRef(kind, hash)` (lib.rs::as_ref).
+fn as_ref(h: ContentHash, k: RefKind) => ContentRef =
+  content_ref_new(k, h);
+
+// content_ref_kind / content_ref_hash / content_ref_into_hash: the C3 "no black boxes" accessors —
+// both the kind and the inner hash are readable (ContentRef::kind/hash/into_hash). Field reads, Exact.
+fn content_ref_kind(r: ContentRef) => RefKind =
+  match r { ContentRef(k, _) => k };
+
+fn content_ref_hash(r: ContentRef) => ContentHash =
+  match r { ContentRef(_, h) => h };
+
+fn content_ref_into_hash(r: ContentRef) => ContentHash =
+  match r { ContentRef(_, h) => h };
+
+// content_ref_as_str_repr: the canonical `<kind-prefix>+<algo>:<digest>` form (ContentRef::
+// as_str_repr). `bytes_concat` composition — total, Exact. Round-trips through
+// `content_ref_from_str` (asserted three-way in std_content.rs).
+fn content_ref_as_str_repr(r: ContentRef) => Bytes =
+  bytes_concat(
+    bytes_concat(content_ref_kind_prefix(content_ref_kind(r)), "+"),
+    content_hash_str(content_ref_hash(r))
+  );
+
+// ── MalformedDigest — the only error the module produces (graduated verbatim from the clean draft) ─
+// Fields: (input, description) — both `Bytes`. In Rust `description` is `&'static str`; here both are
+// `Bytes` (M-910/M-911 textual literals), byte-faithful.
+type MalformedDigest = MalformedDigest(Bytes, Bytes);
+
+// malformed_digest_new: the constructor (MalformedDigest::new). Total, Exact.
+fn malformed_digest_new(input: Bytes, description: Bytes) => MalformedDigest =
+  MalformedDigest(input, description);
+
+fn malformed_digest_input(e: MalformedDigest) => Bytes =
+  match e { MalformedDigest(i, _) => i };
+
+fn malformed_digest_description(e: MalformedDigest) => Bytes =
+  match e { MalformedDigest(_, d) => d };
+
+// malformed_digest_display: the Rust `Display` impl, `format!("malformed content address {:?}: {}",
+// input, description)`. The `{:?}` on a `String` surrounds it with `"` quotes; reproduced byte-
+// faithfully via the `\"` escape. `bytes_concat` composition — total, Exact. (Differentiated against
+// the real Rust `to_string()` for inputs without embedded quotes/escapes — see std_content.rs.)
+fn malformed_digest_display(e: MalformedDigest) => Bytes =
+  bytes_concat(
+    bytes_concat(bytes_concat("malformed content address \"", malformed_digest_input(e)), "\": "),
+    malformed_digest_description(e)
+  );
+
+// ── parse_ref — the `<algo>:<digest>` shape scanner (hand-rolled recursive byte scan) ────────────
+// Byte-faithful to `mycelium_core::id::ContentHash::parse` (shape-only: `algo` is `[a-z0-9]+`,
+// `digest` is `[A-Za-z0-9_-]+`, single `:`) wrapped in `lib.rs::parse_ref`'s 5-way diagnostic
+// branching. `Exact` (deterministic); explicit `Result` on bad shape (never a coerced/zeroed digest
+// — C1/G2). ASCII byte thresholds are written as 8-bit binary literals; indices are `Binary{32}` (to
+// match `bytes_len`).
+// in_range8: `lo <= x < hi_excl` over a byte. Two `lt`+bridge comparisons. Total, Exact.
+fn in_range8(x: Binary{8}, lo: Binary{8}, hi_excl: Binary{8}) => Bool =
+  match lt(x, lo) { 0b1 => False, _ => bit_true(lt(x, hi_excl)) };
+
+// byte_eq8: byte `x` equals literal `v`. Total, Exact.
+fn byte_eq8(x: Binary{8}, v: Binary{8}) => Bool =
+  bit_true(eq(x, v));
+
+// Character classes (ASCII): 'a'..='z' = [0x61,0x7B) · '0'..='9' = [0x30,0x3A) ·
+// 'A'..='Z' = [0x41,0x5B) · '_' = 0x5F · '-' = 0x2D.
+fn is_lower(x: Binary{8}) => Bool =
+  in_range8(x, 0b0110_0001, 0b0111_1011);
+
+fn is_digit_ascii(x: Binary{8}) => Bool =
+  in_range8(x, 0b0011_0000, 0b0011_1010);
+
+fn is_upper(x: Binary{8}) => Bool =
+  in_range8(x, 0b0100_0001, 0b0101_1011);
+
+// is_algo_byte: `[a-z0-9]` — the algo charset (ContentHash::parse).
+fn is_algo_byte(x: Binary{8}) => Bool =
+  bool_or(is_lower(x), is_digit_ascii(x));
+
+// is_digest_byte: `[A-Za-z0-9_-]` — the digest charset (ContentHash::parse).
+fn is_digest_byte(x: Binary{8}) => Bool =
+  bool_or(bool_or(is_lower(x), bool_or(is_upper(x), is_digit_ascii(x))),
+  bool_or(byte_eq8(x, 0b0101_1111),
+  byte_eq8(x, 0b0010_1101)));
+
+// find_colon: first index in `[i, len)` whose byte is `:` (0x3A), else `None`. Recurses on `i+1`;
+// terminates at `i == len` (bounded by the input length; the L1 fuel guard is the never-silent
+// budget). Total → explicit `Option`, Exact.
+fn find_colon(s: Bytes, i: Binary{32}, len: Binary{32}) => Option[Binary{32}] =
+  match lt(i, len) {
+    0b1 => match eq(bytes_get(s, i), 0b0011_1010) {
+      0b1 => Some(i),
+      _ => find_colon(s, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), len)
+    },
+    _ => None
+  };
+
+// all_algo_class / all_digest_class: every byte in `[i, end)` is in the algo / digest charset.
+// Structural-over-index recursion; `True` on the empty range. Total, Exact.
+fn all_algo_class(s: Bytes, i: Binary{32}, end: Binary{32}) => Bool =
+  match lt(i, end) {
+    0b1 => match is_algo_byte(bytes_get(s, i)) {
+      True => all_algo_class(s, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), end),
+      False => False
+    },
+    _ => True
+  };
+
+fn all_digest_class(s: Bytes, i: Binary{32}, end: Binary{32}) => Bool =
+  match lt(i, end) {
+    0b1 => match is_digest_byte(bytes_get(s, i)) {
+      True => all_digest_class(s, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), end),
+      False => False
+    },
+    _ => True
+  };
+
+// parse_ref: validate the `<algo>:<digest>` shape, reproducing `lib.rs::parse_ref`'s diagnostic
+// order EXACTLY (missing-colon → algo-empty → digest-empty → algo-charset → digest-charset), so the
+// error `description` bytes match the Rust oracle case-for-case. `Ok(ContentHash(s))` on success.
+fn parse_ref(s: Bytes) => Result[ContentHash, MalformedDigest] =
+  match find_colon(s, 0b0000_0000_0000_0000_0000_0000_0000_0000, bytes_len(s)) {
+    None => Err(MalformedDigest(s, "missing ':' separator between algo and digest")),
+    Some(c) => match eq(c, 0b0000_0000_0000_0000_0000_0000_0000_0000) {
+      0b1 => Err(MalformedDigest(s, "algo part is empty")),
+      _ => match eq(add_u(c, 0b0000_0000_0000_0000_0000_0000_0000_0001), bytes_len(s)) {
+        0b1 => Err(MalformedDigest(s, "digest part is empty")),
+        _ => match all_algo_class(s, 0b0000_0000_0000_0000_0000_0000_0000_0000, c) {
+          False => Err(MalformedDigest(s, "algo must be [a-z0-9]+")),
+          True => match all_digest_class(
+                  s,
+                  add_u(c, 0b0000_0000_0000_0000_0000_0000_0000_0001),
+                  bytes_len(s)
+                ) {
+            False => Err(MalformedDigest(s, "digest must be [A-Za-z0-9_-]+")),
+            True => Ok(ContentHash(s))
+          }
+        }
+      }
+    }
+  };
+
+// parse_ref_ok: whether the address is well-formed (the accept/reject bit for the differential). Exact.
+fn parse_ref_ok(s: Bytes) => Bool =
+  match parse_ref(s) { Ok(_) => True, Err(_) => False };
+
+// parse_ref_description: the error description bytes (or `""` for an accepted address) — lets the
+// differential compare the diagnostic message against the Rust oracle. Exact.
+fn parse_ref_description(s: Bytes) => Bytes =
+  match parse_ref(s) { Ok(_) => "", Err(e) => malformed_digest_description(e) };
+
+// ── content_ref_from_str — `<kind-prefix>+<algo>:<digest>` (the `+`-split + parse_ref) ───────────
+// Byte-faithful to `ContentRef::from_str`: split at the first `+`, `ref_kind_from_prefix` the
+// prefix, `parse_ref` the tail. The inner parse error is collapsed to the fixed Rust message with
+// the WHOLE input (matching `from_str`'s `MalformedDigest::new(s, "malformed ...")`). Exact; explicit
+// `Result` (never-silent — G2).
+fn find_plus(s: Bytes, i: Binary{32}, len: Binary{32}) => Option[Binary{32}] =
+  match lt(i, len) {
+    0b1 => match eq(bytes_get(s, i), 0b0010_1011) {
+      0b1 => Some(i),
+      _ => find_plus(s, add_u(i, 0b0000_0000_0000_0000_0000_0000_0000_0001), len)
+    },
+    _ => None
+  };
+
+fn content_ref_from_str(s: Bytes) => Result[ContentRef, MalformedDigest] =
+  match find_plus(s, 0b0000_0000_0000_0000_0000_0000_0000_0000, bytes_len(s)) {
+    None => Err(MalformedDigest(s, "expected `<kind-prefix>+<algo>:<digest>` (missing `+`)")),
+    Some(p) =>
+      match ref_kind_from_prefix(bytes_slice(s, 0b0000_0000_0000_0000_0000_0000_0000_0000, p)) {
+        None => Err(MalformedDigest(s, "unknown content-ref kind prefix")),
+        Some(k) => match parse_ref(
+                bytes_slice(s, add_u(p, 0b0000_0000_0000_0000_0000_0000_0000_0001), bytes_len(s))
+              ) {
+          Ok(h) => Ok(content_ref_new(k, h)),
+          Err(_) => Err(MalformedDigest(s, "malformed `<algo>:<digest>` content address"))
+        }
+      }
+  };
+
+// content_ref_from_str_ok: the accept/reject bit for the differential. Exact.
+fn content_ref_from_str_ok(s: Bytes) => Bool =
+  match content_ref_from_str(s) { Ok(_) => True, Err(_) => False };
+
+// ── guarantee_matrix — the RFC-0016 §4.5 matrix as CHECKED DATA (the lib/std/core.myc precedent) ──
+// One row per exported op (all 7 spec ops, incl. the FLAG-content-1 `hash_of_value`/`hash_of_def`
+// whose rows are pure data). Fields mirror `guarantee_matrix::MatrixRow` field-for-field:
+//   MatrixRow(op, guarantee, fallibility, error_set, effects, explainable).
+type Fallibility = Total | Fallible;
+
+type Explainable = Yes | NotApplicable;
+
+type MatrixRow = MatrixRow(Bytes, Bytes, Fallibility, Bytes, Bytes, Explainable);
+
+fn row_op(r: MatrixRow) => Bytes =
+  match r { MatrixRow(op, _, _, _, _, _) => op };
+
+fn row_guarantee(r: MatrixRow) => Bytes =
+  match r { MatrixRow(_, g, _, _, _, _) => g };
+
+fn row_fallibility(r: MatrixRow) => Fallibility =
+  match r { MatrixRow(_, _, f, _, _, _) => f };
+
+fn row_error_set(r: MatrixRow) => Bytes =
+  match r { MatrixRow(_, _, _, es, _, _) => es };
+
+fn row_effects(r: MatrixRow) => Bytes =
+  match r { MatrixRow(_, _, _, _, ef, _) => ef };
+
+fn row_explainable(r: MatrixRow) => Explainable =
+  match r { MatrixRow(_, _, _, _, _, x) => x };
+
+// The 7 rows, hand-transcribed verbatim from `guarantee_matrix::MATRIX` (same order). Every row is
+// `"Exact"`, effect-free (`"none"`), and `NotApplicable` for EXPLAIN; `parse_ref`/`resolve_name` are
+// `Fallible` with a named error set, the rest `Total`.
+fn row_hash_of_value() => MatrixRow =
+  MatrixRow("hash_of_value", "Exact", Total, "", "none", NotApplicable);
+
+fn row_hash_of_def() => MatrixRow =
+  MatrixRow("hash_of_def", "Exact", Total, "", "none", NotApplicable);
+
+fn row_digest_eq() => MatrixRow =
+  MatrixRow("digest_eq", "Exact", Total, "", "none", NotApplicable);
+
+fn row_as_ref() => MatrixRow =
+  MatrixRow("as_ref", "Exact", Total, "", "none", NotApplicable);
+
+fn row_parse_ref() => MatrixRow =
+  MatrixRow(
+    "parse_ref",
+    "Exact",
+    Fallible,
+    "Err(MalformedDigest) on bad shape",
+    "none",
+    NotApplicable
+  );
+
+fn row_resolve_name() => MatrixRow =
+  MatrixRow("resolve_name", "Exact", Fallible, "None when name unbound", "none", NotApplicable);
+
+fn row_names_of() => MatrixRow =
+  MatrixRow("names_of", "Exact", Total, "", "none", NotApplicable);
+
+fn matrix() => Vec[MatrixRow] =
+  [
+    row_hash_of_value(),
+    row_hash_of_def(),
+    row_digest_eq(),
+    row_as_ref(),
+    row_parse_ref(),
+    row_resolve_name(),
+    row_names_of()
+  ];
+
+// matrix_len: the row count as `Binary{8}` (7 fits trivially). O(n) spine-walk (Declared data,
+// mirrors lib/std/core.myc::matrix_len).
+fn matrix_len(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// all_guarantee_exact: every row's guarantee is EXACTLY `"Exact"` (full content equality via
+// `bytes_eq`) — `guarantee_matrix::tests::every_row_is_exact`.
+fn all_guarantee_exact(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      bool_and(
+        bit_true(bytes_eq(row_guarantee(r), "Exact")),
+        all_guarantee_exact(rest)
+      )
+  };
+
+// all_effects_none: every row's effects field is EXACTLY `"none"` —
+// `guarantee_matrix::tests::every_row_declares_no_effects`.
+fn all_effects_none(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(bit_true(bytes_eq(row_effects(r), "none")), all_effects_none(rest))
+  };
+
+// fallible_count: how many rows are `Fallible` (Rust: exactly 2 — `parse_ref`, `resolve_name`) —
+// `guarantee_matrix::tests::exactly_two_fallible_ops`.
+fn fallible_count(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs {
+    Nil => 0b0000_0000,
+    Cons(r, rest) => match row_fallibility(r) {
+      Fallible => add_u(0b0000_0001, fallible_count(rest)),
+      Total => fallible_count(rest)
+    }
+  };
+
+// all_explain_na: every row is `NotApplicable` for EXPLAIN — `std.content` does no
+// selection/conversion/approximation (`guarantee_matrix::tests::every_row_is_not_applicable_for_explain`).
+fn all_explain_na(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      match row_explainable(r) {
+        NotApplicable => all_explain_na(rest),
+        Yes => False
+      }
+  };
+
+// ── NameRegistry — the `hash <-> name` side-table, REDESIGNED as an assoc-list (FLAG-content-2) ──
+type Entry = Entry(ContentHash, Bytes);
+
+type NameRegistry = Reg(Vec[Entry]);
+
+fn entry_hash(e: Entry) => ContentHash =
+  match e { Entry(h, _) => h };
+
+fn entry_name(e: Entry) => Bytes =
+  match e { Entry(_, n) => n };
+
+fn name_registry_new() => NameRegistry =
+  Reg(Nil);
+
+fn name_registry_entries(r: NameRegistry) => Vec[Entry] =
+  match r { Reg(es) => es };
+
+// entries_lookup: the first entry whose hash `digest_eq`s `h` (the assoc-list resolve). Linear scan,
+// `None` when unbound (never-silent — C1/G2). Exact.
+fn entries_lookup(es: Vec[Entry], h: ContentHash) => Option[Bytes] =
+  match es {
+    Nil => None,
+    Cons(e, rest) => match digest_eq(entry_hash(e), h) {
+      True => Some(entry_name(e)),
+      False => entries_lookup(rest, h)
+    }
+  };
+
+// name_registry_resolve_name: `Some(name)` when bound, else `None` (NameRegistry::resolve_name; C1).
+fn name_registry_resolve_name(r: NameRegistry, h: ContentHash) => Option[Bytes] =
+  entries_lookup(name_registry_entries(r), h);
+
+// name_registry_names_of: 0-or-1-element list per the carried one-name limitation (NameRegistry::
+// names_of). Empty `Vec` when unbound — never a sentinel (C1).
+fn name_registry_names_of(r: NameRegistry, h: ContentHash) => Vec[Bytes] =
+  match name_registry_resolve_name(r, h) { Some(n) => Cons(n, Nil), None => Nil };
+
+// entries_replace: bind `h -> name`, preserving the at-most-one-entry-per-hash invariant — replace
+// in place if present (returning the previous name), else append. Returns `(entries, previous)`.
+fn entries_replace(es: Vec[Entry], h: ContentHash, name: Bytes) => Pair[Vec[Entry], Option[Bytes]] =
+  match es {
+    Nil => Pr(Cons(Entry(h, name), Nil), None),
+    Cons(e, rest) => match digest_eq(entry_hash(e), h) {
+      True => Pr(Cons(Entry(h, name), rest), Some(entry_name(e))),
+      False =>
+        match entries_replace(rest, h, name) {
+          Pr(newrest, prev) => Pr(Cons(e, newrest), prev)
+        }
+    }
+  };
+
+// name_registry_bind: bind a name, returning `(new registry, previous name Option)` — the
+// NameRegistry::bind contract (re-binding does not change identity; the previous name is returned).
+fn name_registry_bind(
+  r: NameRegistry,
+  h: ContentHash,
+  name: Bytes
+) => Pair[NameRegistry, Option[Bytes]] =
+  match entries_replace(name_registry_entries(r), h, name) { Pr(es2, prev) => Pr(Reg(es2), prev) };
+
+// name_registry_insert / name_registry_bind_prev: the two projections of `bind` (registry-after, and
+// the previous-name Option) — ergonomic accessors for chaining in the differential.
+fn name_registry_insert(r: NameRegistry, h: ContentHash, name: Bytes) => NameRegistry =
+  match name_registry_bind(r, h, name) { Pr(r2, _) => r2 };
+
+fn name_registry_bind_prev(r: NameRegistry, h: ContentHash, name: Bytes) => Option[Bytes] =
+  match name_registry_bind(r, h, name) { Pr(_, prev) => prev };
+
+// name_registry_len / name_registry_is_empty: the entry count and the emptiness predicate
+// (NameRegistry::len/is_empty). O(n) spine-walk / nil-check. Exact.
+fn entries_len(es: Vec[Entry]) => Binary{8} =
+  match es { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, entries_len(rest)) };
+
+fn name_registry_len(r: NameRegistry) => Binary{8} =
+  entries_len(name_registry_entries(r));
+
+fn name_registry_is_empty(r: NameRegistry) => Bool =
+  match name_registry_entries(r) { Nil => True, Cons(_, _) => False };

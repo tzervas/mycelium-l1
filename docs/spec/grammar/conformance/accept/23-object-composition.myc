@@ -1,0 +1,35 @@
+// exercises: DN-53 §A.3.1 / M-811 — the `object` composition surface (now ACTIVE keyword). An
+// `object` block with a constructor clause (`Name(T1, T2);`), an explicit `impl` block, and an
+// inherent `fn`. This is a PARSE oracle (the gate runs only `parse_phylum`); the bodies need not
+// type-check or run. Pins that `object` at item position is accepted and that all internal clauses
+// (`via`, `impl`, `fn`) are accepted. Never-silent counterpart: reject/28-object-empty-body.myc.
+// Guarantee: `Empirical` (three-way differential in `tests/object_desugar.rs` — DN-53 §A.3.3).
+nodule composition.surface;
+
+trait Negate[A] {
+    fn negate(x: A) => A;
+};
+
+object Signed {
+    Mk(Binary{8});
+    impl Negate[Binary{8}] for Signed {
+        fn negate(x: Binary{8}) => Binary{8} = not(x);
+    };
+    fn make(v: Binary{8}) => Signed = Mk(v);
+};
+
+// `via` delegation: field index 0 delegates to `Negate`.
+object Wrapped {
+    Box(Binary{8});
+    via 0 : Negate;
+};
+
+// type-parametric `object`.
+object Box[T] {
+    Wrap(T);
+};
+
+// `pub object` — exports the type name (M-662).
+pub object PubPoint {
+    Pt(Binary{8}, Binary{8});
+};

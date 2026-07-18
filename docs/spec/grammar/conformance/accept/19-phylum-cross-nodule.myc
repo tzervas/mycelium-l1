@@ -1,0 +1,17 @@
+// accept: a phylum (M-662; RFC-0006 §4.3, DN-06 §6) — a 'phylum <path>' header grouping two nodules
+// in one source file. Exercises `pub` exports (pub fn / pub type / pub trait), a specific + a glob
+// `use`, a cross-nodule call, and a phylum-wide `impl` (the orphan rule generalized cross-nodule).
+// This is a PARSE fixture (the gate is parser-only); the cross-nodule type-check, the phylum-wide
+// orphan rule, and the never-silent resolution (absent / private / duplicate / glob-ambiguous) are
+// pinned in `crates/mycelium-l1/tests/phylum.rs`.
+phylum app.core
+nodule a;
+pub fn id(x: Binary{8}) => Binary{8} = x;
+pub type Flag = Off | On;
+pub trait Negate[A] { fn negate(x: A) => A; };
+nodule b;
+use a.id;
+use a.*;
+type T = Mk(Binary{8});
+fn use_imports(y: Binary{8}) => Binary{8} = id(y);
+impl Negate[T] for T { fn negate(x: T) => T = x; };
