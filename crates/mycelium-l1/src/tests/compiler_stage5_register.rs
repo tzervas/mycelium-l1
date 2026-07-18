@@ -754,8 +754,8 @@ fn encode_use_path(u: &crate::ast::UsePath) -> String {
 /// The FULL `Item` mirror (PR-2b + STEP 4's `ItUse`): every tuple-relevant item kind carries its data
 /// field-for-field. `Item::Use` now carries its `UsePath` (M-1013 STEP 4 — `resolve_imports` reads it
 /// directly; `collect_tuple_arities_item`'s `ItUse(_) => acc` arm keeps the tuple-walk a no-op, same
-/// as before). `Default`/`Derive` remain the tuple-free `ItOther` collapse (still unread by both
-/// consumers).
+/// as before). `Default`/`DefaultPolicy`/`Derive` remain the tuple-free `ItOther` collapse (still
+/// unread by both consumers — DN-142 §3.2's `DefaultPolicy` carries no tuple-relevant field either).
 fn encode_item(it: &Item) -> String {
     match it {
         Item::Type(td) => format!("ItType({})", encode_type_decl(td)),
@@ -766,7 +766,7 @@ fn encode_item(it: &Item) -> String {
         Item::Lower(ld) => format!("ItLower({})", encode_lower_decl(ld)),
         Item::InherentImpl(iid) => format!("ItInherentImpl({})", encode_inherent_impl_decl(iid)),
         Item::Use(up) => format!("ItUse({})", encode_use_path(up)),
-        Item::Default(_) | Item::Derive(_) => "ItOther".to_owned(),
+        Item::Default(_) | Item::DefaultPolicy(_) | Item::Derive(_) => "ItOther".to_owned(),
     }
 }
 

@@ -5,7 +5,7 @@ version     = "0.2.0"
 license     = "MIT"
 authors     = ["Tyler Zervas"]
 since       = "2026-06-23"
-summary     = "Mycelium-language standard library (self-hosted): core/prelude nodules std.result (M-649), std.option + std.cmp + std.iter (M-715, cmp now WIDTH-GENERIC over Binary{N}, M-718; iter first-order combinators map/filter/foldl/any/all/find over the cons-list); collections std.collections (M-716, #461, Map/Set lookup now width-generic over the key, M-718); width-generic arithmetic/logic std.math (M-718 — binary add/sub + bitwise + ternary add/sub/mul/neg over Binary{N}/Ternary{M}); text/format std.text + std.fmt (M-717, #462 — multi-byte UTF-8 decode + validity + slice/concat, hex fmt)."
+summary     = "Mycelium-language standard library (self-hosted): core/prelude nodules std.result (M-649), std.option + std.cmp + std.iter (M-715, cmp now WIDTH-GENERIC over Binary{N}, M-718; iter first-order combinators map/filter/foldl/any/all/find over the cons-list); collections std.collections (M-716, #461, Map/Set lookup now width-generic over the key, M-718); width-generic arithmetic/logic std.math (M-718 — binary add/sub + bitwise + ternary add/sub/mul/neg over Binary{N}/Ternary{M}); text/format std.text + std.fmt (M-717, #462 — multi-byte UTF-8 decode + validity + slice/concat, hex fmt); affine io + serialize scaffold std.io (G4-a / gap-analysis 2026-07-16 — in-memory Source/Sink, explicit Value-codec residual FLAG-io-2)."
 keywords    = ["stdlib", "self-hosting"]
 lang        = "mycelium-0"
 
@@ -15,7 +15,9 @@ lang        = "mycelium-0"
 # Phase-I `opp` wave (E29-1, M-926…M-934): nine Rust-reference nodules ported to self-hosted `.myc`
 # and added to the export surface — std.core, std.diag, std.error, std.recover, std.select,
 # std.spores, std.swaps, std.ternary, std.testing (transpiler-assist % recorded in the port ledger).
-exports     = ["std.result", "std.option", "std.cmp", "std.iter", "std.collections", "std.math", "std.text", "std.fmt", "std.core", "std.diag", "std.error", "std.recover", "std.select", "std.spores", "std.swaps", "std.ternary", "std.testing"]
+# G4-a (WAVE-G3-NEXT / expressibility): `io.myc` scaffold is myc-check-clean; export unblocks
+# phylum-mode cross-nodule `use std.io.*` for transpile Import resolution (M-1084 / std-io leaf).
+exports     = ["std.result", "std.option", "std.cmp", "std.iter", "std.collections", "std.math", "std.text", "std.fmt", "std.io", "std.core", "std.diag", "std.error", "std.recover", "std.select", "std.spores", "std.swaps", "std.ternary", "std.testing"]
 
 [toolchain]
 format      = "mycfmt-0"

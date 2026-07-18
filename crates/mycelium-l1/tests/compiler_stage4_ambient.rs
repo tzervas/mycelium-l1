@@ -532,6 +532,12 @@ mod fp {
             Item::Lower(l) => lowerdecl(tag(fp, 104), l),
             Item::Derive(d) => derivedecl(tag(fp, 105), d),
             Item::InherentImpl(i3) => inherentimpldecl(tag(fp, 106), i3),
+            // DN-142 §3.2 (W-B): `default policy <name>;` has no `ambient.myc` counterpart yet (a
+            // flagged, disclosed residual, exactly like `compiler_stage3.rs`'s own tag-111 arm for
+            // this same variant — the self-hosted port is a separate, not-yet-scheduled follow-on).
+            // No hand-transcribed `test_input_N` here constructs this variant, so this arm is
+            // currently unreachable in this differential, not lock-step-verified against `.myc`.
+            Item::DefaultPolicy(p) => path(tag(fp, 108), p),
         }
     }
 
@@ -925,6 +931,11 @@ fn ambient_error_kind(e: &AmbientError) -> u32 {
         AmbientError::ParadigmShapeMismatch { .. } => 3,
         AmbientError::BareDecimalNoEncoding { .. } => 4,
         AmbientError::DepthExceeded { .. } => 5,
+        // DN-142 §3.2 (W-B): a 6th refusal, `default policy`-only — no `test_input_errN` fixture
+        // here constructs it (none use `default policy`), and `ambient.myc`'s own
+        // `ambient_error_kind` has no matching arm yet (flagged residual, mirrors the `item`
+        // fingerprint arm above).
+        AmbientError::MultiplePolicyDefaults { .. } => 6,
     }
 }
 

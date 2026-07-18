@@ -486,8 +486,17 @@ impl Parser {
             Tok::Use => self.parse_use().map(Item::Use),
             Tok::Default => {
                 self.bump();
-                self.expect(&Tok::Paradigm, "`paradigm` after `default` (RFC-0012 §4.2)")?;
-                Ok(Item::Default(self.parse_paradigm()?))
+                if self.eat(&Tok::Paradigm) {
+                    Ok(Item::Default(self.parse_paradigm()?))
+                } else if self.eat(&Tok::Policy) {
+                    // `default policy <name>;` — the nodule-scope ambient-policy declaration
+                    // (DN-142 §3.2). The name is the same rejected-vocabulary-guarded production
+                    // `swap`'s `policy:` uses, so `default policy _;`/`auto`/`default` are refused
+                    // identically here (G2 — one guarded production, not two).
+                    Ok(Item::DefaultPolicy(self.parse_policy_ref()?))
+                } else {
+                    self.err("`paradigm` or `policy` after `default` (RFC-0012 §4.2; DN-142 §3.2)")
+                }
             }
             Tok::Type => self.parse_type_decl(Vis::Private).map(Item::Type),
             Tok::Trait => self.parse_trait_decl(Vis::Private).map(Item::Trait),
@@ -641,8 +650,9 @@ impl Parser {
             )),
             Tok::Default => Err(ParseError::new(
                 self.pos(),
-                "`pub default` is not a form — `default paradigm` is nodule-scope ambient state, \
-                 not an exportable item (M-662); drop the `pub`"
+                "`pub default` is not a form — `default paradigm`/`default policy` are \
+                 nodule-scope ambient state, not an exportable item (M-662; DN-142 §3.2); drop \
+                 the `pub`"
                     .to_owned(),
             )),
             _ => self.err(
@@ -2216,13 +2226,55 @@ impl Parser {
         )?;
         self.expect(&Tok::Policy, "the `policy:` label (mandatory — WF2)")?;
         self.expect(&Tok::Colon, "`:` after `policy`")?;
-        let policy = self.parse_path()?;
+        let policy = self.parse_policy_ref()?;
         self.expect(&Tok::RParen, "`)` to close the swap")?;
         Ok(Expr::Swap {
             value,
             target,
             policy,
         })
+    }
+
+    /// Parse a swap's (or a `default policy` declaration's) policy-name value (DN-142 §3.1): either
+    /// the **ambient** spelling `ambient` or an explicit catalog-name [`Path`] — both are ordinary
+    /// identifiers/paths syntactically, so this only needs to intercept the three **rejected
+    /// vocabulary** forms `_`/`auto`/`default` before falling through to [`Self::parse_path`].
+    ///
+    /// `default` is intercepted **before** calling [`Self::parse_path`] because it is a reserved
+    /// keyword (`Tok::Default`, used by `default paradigm`/`default policy` themselves) — it can
+    /// never reach `parse_path`'s identifier production, so left uncaught it would surface as a
+    /// generic "expected an identifier" parse error instead of the DN-142 teaching message every
+    /// other rejected form gets. `_` and `auto` are plain identifiers lexically, so they parse fine
+    /// via `parse_path` and are caught by inspecting the result.
+    ///
+    /// # Errors
+    /// A never-silent [`ParseError`] naming `ambient` as the one ratified spelling (DN-142 §3.1) when
+    /// the value is `_`, `auto`, or `default` — never a silent accept of the rejected word (G2).
+    fn parse_policy_ref(&mut self) -> Result<Path, ParseError> {
+        if self.at(&Tok::Default) {
+            return Err(self.rejected_policy_vocab_err("default"));
+        }
+        let path = self.parse_path()?;
+        if path.0.len() == 1 && matches!(path.0[0].as_str(), "_" | "auto") {
+            return Err(self.rejected_policy_vocab_err(&path.0[0]));
+        }
+        Ok(path)
+    }
+
+    /// The shared never-silent message for the DN-142 §3.1 **rejected policy vocabulary**
+    /// (`policy: _` / `policy: auto` / `policy: default`) — a hard parse error naming `ambient` as
+    /// the one ratified spelling for "use the scope's declared default policy," never a silent
+    /// accept of the rejected word (G2/VR-5: `default` in particular imports an unexamined-fallback
+    /// prior the transparency rule forbids).
+    fn rejected_policy_vocab_err(&self, word: &str) -> ParseError {
+        ParseError::new(
+            self.pos(),
+            format!(
+                "`{word}` is rejected vocabulary for a policy value — the ratified spelling for \
+                 \"use the scope's declared ambient policy\" is `ambient` (DN-142 §3.1); write \
+                 `policy: ambient` or an explicit catalog policy name, never `_`/`auto`/`default`"
+            ),
+        )
     }
 
     /// `with paradigm P { e }` — a block-scope ambient override (RFC-0012 §4.4). Not a conversion:

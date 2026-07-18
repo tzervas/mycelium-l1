@@ -71,8 +71,11 @@ const REJECT_EXPECTED: &[(&str, &str)] = &[
     ),
     ("08-imperative-while.myc", "`while` is not a Mycelium form"),
     (
+        // DN-142 §3.2: `default` now also accepts `policy` (`default policy <name>;`), so the
+        // teaching message names both legal continuations — updated together with that grammar
+        // change (the fixture itself is unchanged; it still omits the granularity keyword).
         "09-default-missing-paradigm.myc",
-        "expected `paradigm` after `default`",
+        "expected `paradigm` or `policy` after `default`",
     ),
     (
         // M-662: `phylum` is now ACTIVE, so a phylum header with no nodule is a never-silent parse

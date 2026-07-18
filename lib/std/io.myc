@@ -1,0 +1,198 @@
+// nodule: std.io
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-16
+// @updated: 2026-07-16
+// @summary: Honest minimal scaffold for `std.io` + `serialize` (M-514): error ADTs, the §4.5
+nodule std.io;
+
+// guarantee matrix as checked data, in-memory `Source`/`Sink` byte movement, and explicit
+// refusals where the M-104 `Value` codec or host `io` effect floor is not yet ported (G4-a /
+// gap-analysis leaf mycelium-std-io.md). Oracle: `crates/mycelium-std-io` (DN-66 frozen baseline).
+// Spec: `docs/spec/stdlib/io.md` (Accepted). Transpiler draft (`gen/myc-drafts/stdlib/std-io/`):
+// 6/59 items myc-check-clean in isolation — this hand scaffold unblocks the missing-file gap without
+// inventing a full host-effect runtime (FLAG-io-1 host bridge / M-1084; FLAG-io-2 kernel `Value`
+// (de)serialize / M-104 library form).
+//
+// PORTED (scaffold, expressible today):
+//   - `SerError`/`IoError`/`ReadValueError` + locus newtypes (`ByteOffset`, `FieldPath`, `ByteCount`).
+//   - `Format` (`Wire` | `Json`), `Budget` (`BCap` | `BUnbounded`), affine `Source`/`Sink`/`Substrate`.
+//   - In-memory `read_all`, `write`, `source_from_bytes`, `sink_new`, `sink_into_bytes`.
+//   - Eight-row guarantee `matrix()` + `matrix_len` structural witness (mirrors `lib/std/core.myc`).
+//
+// FLAG-io-1 (host `io` effect / OS substrate — orch-owned, DN-107 / RFC-0014 / spec §7-Q4):
+//   No `wild`/FFI and no `std-sys` OS-backed `Source`/`Sink` constructors (M-541). Byte movement
+//   here is an in-memory `Bytes` cursor only — the declared `io` effect is documented on signatures
+//   in comments until effect syntax is wired on exported ops. `read` and `read_value` refuse with
+//   `IoError::Refused` / `ReadValueError` rather than silent success (G2).
+//
+// FLAG-io-2 (kernel `Value` + M-104 codec — D1 boundary, same class as FLAG-content-1 / FLAG-swap-1):
+//   `serialize`/`deserialize`/`to_json`/`from_json` have no `Value` surface in `.myc` today. They
+//   return explicit `SerError::OutOfDomain` with a fixed diagnostic `Bytes` — never a partial value.
+//
+// Honesty (VR-5): matrix rows transcribed from `mycelium-std-io` guarantee_matrix.rs as `Declared`
+// data; in-memory io ops tagged `Exact` in matrix; round-trip rows stay `GEmpirical` without a corpus.
+// ── Local prelude (single-nodule harness — no cross-nodule `use`; `lib/std/content.myc` convention) ──
+type Option[A] = Some(A) | None;
+
+type Result[A, E] = Ok(A) | Err(E);
+
+type Pair[A, B] = Pr(A, B);
+
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn bit_true(x: Binary{1}) => Bool =
+  match x { 0b1 => True, _ => False };
+
+// `byte_len`: delegate to `bytes_len` (Exact), widened witness for slice bounds (`lib/std/text.myc`).
+fn byte_len(b: Bytes) => Binary{32} =
+  bytes_len(b);
+
+// ── Locus + error families (C1 — never-silent; RFC-0013 diagnostic record) ───────────────────────
+type ByteOffset = Off(Binary{64});
+
+type FieldPath = Fp(Bytes);
+
+type ByteCount = Cnt(Binary{64});
+
+type SerError =
+    Truncated(ByteOffset)
+  | Malformed(ByteOffset, Bytes)
+  | UnknownTag(FieldPath, Bytes)
+  | OutOfDomain(FieldPath, Bytes)
+  | BudgetExceeded(Bytes);
+
+type IoError = UnexpectedEof(ByteCount) | Refused(Bytes) | EffectBudget(Bytes);
+
+type ReadValueError = RvIo(IoError) | RvSer(SerError);
+
+// ── Serialize format tag (spec §3 — always explicit until M-540 ergonomics pass) ─────────────────
+type Format = Wire | Json;
+
+// ── Affine io surface (LR-8): in-memory substrate only (spec §7-Q4 FLAG) ───────────────────────
+type Budget = BCap(Binary{64}) | BUnbounded;
+
+// `MemCursor`: in-memory byte cursor (Rust `Substrate` — name avoided: `Substrate` is a reserved
+// affine kind token in the surface grammar, LR-8 / token.rs).
+type MemCursor = SData(Bytes, Binary{32});
+
+type Source = SFrom(MemCursor);
+
+type Sink = SInk(Bytes);
+
+fn mem_cursor_from_bytes(data: Bytes) => MemCursor =
+  SData(data, 0b0000_0000_0000_0000_0000_0000_0000_0000);
+
+fn source_from_bytes(data: Bytes) => Source =
+  SFrom(mem_cursor_from_bytes(data));
+
+fn sink_new() => Sink =
+  SInk("");
+
+fn sink_into_bytes(snk: Sink) => Bytes =
+  match snk { SInk(b) => b };
+
+// read_all: consume `Source` by-move; return all bytes from cursor to end (in-memory only).
+// Effects: io (declared — RFC-0014 §4.5; host floor FLAG-io-1). Guarantee: Exact (matrix row).
+fn read_all(src: Source) => Result[Bytes, IoError] =
+  match src { SFrom(SData(data, pos)) => Ok(bytes_slice(data, pos, byte_len(data))) };
+
+// read: chunked read — scaffold refuses until budgeted slice + linear threading is hand-ported.
+fn read(src: Source, budget: Budget) => Result[Pair[Bytes, Source], IoError] =
+  match budget {
+    BCap(_) => Err(Refused("read: chunked in-memory port residual (G4-a scaffold)")),
+    BUnbounded => Err(Refused("read: chunked in-memory port residual (G4-a scaffold)"))
+  };
+
+// write: thread `Sink` linearly; append bytes (in-memory). Effects: io (declared). Guarantee: Exact.
+fn write(snk: Sink, chunk: Bytes) => Result[Sink, IoError] =
+  match snk { SInk(buf) => Ok(SInk(bytes_concat(buf, chunk))) };
+
+// ── Serialize half — explicit residual (FLAG-io-2: no kernel `Value` / M-104 codec in `.myc`) ───
+fn serialize_residual(f: Format) => Result[Bytes, SerError] =
+  match f {
+    Wire => Err(OutOfDomain(Fp("serialize"), "Value codec not ported to .myc (M-104 / FLAG-io-2)")),
+    Json => Err(OutOfDomain(Fp("to_json"), "Value codec not ported to .myc (M-104 / FLAG-io-2)"))
+  };
+
+fn deserialize_residual(f: Format) => Result[Bytes, SerError] =
+  match f {
+    Wire =>
+      Err(
+        OutOfDomain(Fp("deserialize"), "Value codec not ported to .myc (M-104 / FLAG-io-2)")
+      ),
+    Json => Err(OutOfDomain(Fp("from_json"), "Value codec not ported to .myc (M-104 / FLAG-io-2)"))
+  };
+
+fn read_value_residual(src: Source, f: Format) => Result[Bytes, ReadValueError] =
+  match read_all(src) {
+    Ok(_) => Err(RvSer(OutOfDomain(Fp("read_value"), "Value decode not ported (FLAG-io-2)"))),
+    Err(e) => Err(RvIo(e))
+  };
+
+// ── Guarantee matrix (RFC-0016 §4.5) — data only, asserted structurally ─────────────────────────
+type GuaranteeTag = GExact | GEmpirical | GDeclared;
+
+type MatrixRow = MRow(Bytes, GuaranteeTag, Bytes, Bytes, Bytes, Bool);
+
+fn row_op(r: MatrixRow) => Bytes =
+  match r { MRow(op, _, _, _, _, _) => op };
+
+fn row_tag(r: MatrixRow) => GuaranteeTag =
+  match r { MRow(_, t, _, _, _, _) => t };
+
+fn row_fallibility(r: MatrixRow) => Bytes =
+  match r { MRow(_, _, f, _, _, _) => f };
+
+fn row_effects(r: MatrixRow) => Bytes =
+  match r { MRow(_, _, _, e, _, _) => e };
+
+fn row_explainable(r: MatrixRow) => Bool =
+  match r { MRow(_, _, _, _, _, x) => x };
+
+fn row_serialize() => MatrixRow =
+  MRow("serialize", GExact, "fallible", "Err(OutOfDomain)", "none", False);
+
+fn row_deserialize() => MatrixRow =
+  MRow("deserialize", GEmpirical, "fallible", "Err(SerError) @locus", "none", True);
+
+fn row_to_json() => MatrixRow =
+  MRow("to_json", GExact, "fallible", "Err(OutOfDomain)", "none", False);
+
+fn row_from_json() => MatrixRow =
+  MRow("from_json", GEmpirical, "fallible", "Err(SerError) @locus", "none", True);
+
+fn row_read_all() => MatrixRow =
+  MRow("read_all", GExact, "fallible", "Err(IoError)", "io", True);
+
+fn row_read() => MatrixRow =
+  MRow("read", GExact, "fallible", "Err(IoError)", "io + alloc(Budget)", True);
+
+fn row_write() => MatrixRow =
+  MRow("write", GExact, "fallible", "Err(IoError)", "io", True);
+
+fn row_read_value() => MatrixRow =
+  MRow("read_value", GEmpirical, "fallible", "Err(ReadValueError) @locus", "io", True);
+
+fn matrix() => Vec[MatrixRow] =
+  [
+    row_serialize(),
+    row_deserialize(),
+    row_to_json(),
+    row_from_json(),
+    row_read_all(),
+    row_read(),
+    row_write(),
+    row_read_value()
+  ];
+
+fn matrix_len(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// matrix_has_eight_rows: structural witness that the scaffold carries the full §4 matrix (Declared).
+fn matrix_has_eight_rows() => Bool =
+  bit_true(eq(matrix_len(matrix()), 0b0000_1000));

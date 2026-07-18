@@ -190,6 +190,15 @@ pub enum Item {
     /// `default paradigm P` — the nodule-scope ambient (RFC-0012 §4.2). At most one per nodule; the
     /// outermost ambient frame. Consumed (stripped) by the resolution pass ([`crate::ambient`]).
     Default(Paradigm),
+    /// `default policy <name>` — the nodule-scope **ambient policy** declaration (DN-142 §3.2; the
+    /// third instance of the RFC-0012 ambient/scoped-override mechanism, after paradigm ambient and
+    /// `@certification`/`CertMode` — `mycelium_proj::cert_scope`). At most one per nodule (checked by
+    /// [`crate::ambient::resolve`], mirroring [`Item::Default`]'s duplicate refusal). Unlike
+    /// `Item::Default`, this item is **not** stripped by ambient resolution — it carries no paradigm
+    /// state and needs the checked `(src, target)` pair to resolve, so it survives into `checkty` as
+    /// data and is resolved there ([`crate::ambient_policy`]) when a `swap`'s `policy: ambient` is
+    /// checked.
+    DefaultPolicy(Path),
     /// A data-type declaration.
     Type(TypeDecl),
     /// A trait declaration.
@@ -704,6 +713,18 @@ pub enum Strength {
 }
 
 impl Strength {
+    /// Every lattice point, in **rank order** (`Declared` weakest → `Exact` strongest) — for
+    /// exhaustive iteration in tests/tooling (mirrors `CertMode::ALL`/`PolicyScope::ALL`'s
+    /// closed-enumeration pattern elsewhere in this crate). A closed, 4-variant enum, so exhaustive
+    /// enumeration is a complete proof over the lattice, not a sample (W-C X2 overclaim-guard
+    /// property tests; `crate::grade_catalog`).
+    pub const ALL: [Strength; 4] = [
+        Strength::Declared,
+        Strength::Empirical,
+        Strength::Proven,
+        Strength::Exact,
+    ];
+
     /// The **trust rank** on the integrity lattice `Exact ⊐ Proven ⊐ Empirical ⊐ Declared`
     /// (RFC-0018 §4.1; Biba 1977, T3.2). Higher = more trusted: `Exact = 3 … Declared = 0`. This is
     /// the *only* place the chain's order is encoded; [`Self::meet`] and [`Self::satisfies`] derive

@@ -56,6 +56,15 @@ pub enum AmbientError {
         /// The second (rejected) declaration.
         second: Paradigm,
     },
+    /// Two nodule-scope `default policy` declarations (DN-142 §3.2) — mirrors
+    /// [`AmbientError::MultipleDefaults`]'s shape for the ambient-*policy* declaration: a nodule has
+    /// one ambient policy, not a stack of competing ones.
+    MultiplePolicyDefaults {
+        /// The first declared policy name.
+        first: crate::ast::Path,
+        /// The second (rejected) declaration.
+        second: crate::ast::Path,
+    },
     /// A paradigm-less repr `{…}` with **no enclosing ambient** (§4.3) — there is no implicit
     /// global fallback (that would be silent).
     UnresolvedAmbient {
@@ -99,6 +108,13 @@ impl core::fmt::Display for AmbientError {
                 f,
                 "two `default paradigm` declarations (`{first}` then `{second}`) — a nodule has one \
                  outer ambient (RFC-0012 §4.2); nest a `with paradigm` block for a local override"
+            ),
+            AmbientError::MultiplePolicyDefaults { first, second } => write!(
+                f,
+                "two `default policy` declarations (`{}` then `{}`) — a nodule has one ambient \
+                 policy (DN-142 §3.2)",
+                path_str(first),
+                path_str(second)
             ),
             AmbientError::UnresolvedAmbient { site } => write!(
                 f,
@@ -190,6 +206,25 @@ fn resolve_report_inner(nodule: &Nodule) -> Result<Resolved, AmbientError> {
         }
     }
 
+    // DN-142 §3.2: at most one nodule-scope `default policy` declaration (mirrors the paradigm
+    // check above). Unlike `default paradigm`, this declaration is **not** consumed here — it
+    // carries no paradigm state to fill and needs the checked `(src, target)` pair to resolve, so it
+    // is validated for uniqueness here (co-located with the paradigm check, same error shape) and
+    // passed through into the longhand twin's items, where `checkty::Cx::check_swap`
+    // (`crate::ambient_policy`) resolves it once types are known.
+    let mut policy_default: Option<&crate::ast::Path> = None;
+    for item in &nodule.items {
+        if let Item::DefaultPolicy(p) = item {
+            if let Some(first) = policy_default {
+                return Err(AmbientError::MultiplePolicyDefaults {
+                    first: first.clone(),
+                    second: p.clone(),
+                });
+            }
+            policy_default = Some(p);
+        }
+    }
+
     let mut r = Resolver { notes: Vec::new() };
     let mut items = Vec::with_capacity(nodule.items.len());
     for item in &nodule.items {
@@ -197,6 +232,9 @@ fn resolve_report_inner(nodule: &Nodule) -> Result<Resolved, AmbientError> {
             // The default declaration is consumed (it is metadata for resolution, not a runtime
             // item); the longhand twin carries no ambient.
             Item::Default(_) => {}
+            // DN-142 §3.2: passed through unchanged (module doc above) — a `Path` carries no
+            // ambient-paradigm state to resolve.
+            Item::DefaultPolicy(p) => items.push(Item::DefaultPolicy(p.clone())),
             Item::Use(p) => items.push(Item::Use(p.clone())),
             Item::Type(td) => items.push(Item::Type(r.type_decl(default, td)?)),
             Item::Trait(td) => items.push(Item::Trait(r.trait_decl(default, td)?)),
@@ -263,6 +301,7 @@ pub fn expand_to_source(nodule: &Nodule) -> String {
         let item_text = match item {
             Item::Use(u) => print_use(u),
             Item::Default(p) => format!("default paradigm {p}\n"),
+            Item::DefaultPolicy(p) => format!("default policy {}\n", path_str(p)),
             Item::Type(td) => print_type_decl(td),
             Item::Trait(td) => print_trait_decl(td),
             Item::Impl(id) => print_impl_decl(id),
