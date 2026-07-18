@@ -1,0 +1,31 @@
+// exercises: the complete worked program from the M-735 tutorial (docs/reference/tutorial.md).
+// Combines a sum type, pattern match (literal + wildcard arms), a let-in binding, a
+// guarantee-annotated return type (`Binary{8} @ Declared`, LR-6), an effect annotation (`!{io}`,
+// RFC-0014/M-660), bounded `for` iteration (a Total fold, RFC-0007 §4.8), and a never-silent
+// `swap` (S1/WF2 — both `to:` and `policy:` lexical). Every construct parses by mycelium.ebnf;
+// this fixture is the parser-verified ground truth the tutorial cites (tests/conformance.rs).
+nodule tutorial.classifier;
+
+type Reading = Empty | Cons(Binary{8}, Reading);
+
+type Class = Low | High;
+
+// A pure classifier: a single sample maps to a Low/High class. The literal arm matches the
+// all-zero byte; the wildcard arm covers every other byte (match exhaustiveness is checked).
+fn classify(sample: Binary{8}) => Class =
+  match sample {
+    0b00000000 => Low,
+    _          => High,
+  };
+
+// Sum the readings with a bounded `for` fold over the linearly-recursive `Reading` value. The
+// return type carries an honest guarantee tag: the running total is `Declared` (a stated
+// contract, not a proven bound — VR-5).
+fn total(rs: Reading) => Binary{8} @ Declared =
+  for r in rs, acc = 0b00000000 => add(acc, r);
+
+// Read a sample into the Ternary paradigm. The `!{io}` effect declares the side effect; the
+// representation change is a never-silent `swap` naming both its target and its policy.
+fn ingest(sample: Binary{8}) => Ternary{6} !{io} =
+  let widened: Binary{8} = sample in
+  swap(widened, to: Ternary{6}, policy: rt);

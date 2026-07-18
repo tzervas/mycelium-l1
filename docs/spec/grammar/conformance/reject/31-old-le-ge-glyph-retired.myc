@@ -1,0 +1,11 @@
+// reject: M-916 (RFC-0025 §4.2, resolved by RFC-0037 D1) — the two-character comparison glyphs
+// `<=`/`>=` are RETIRED. The two-char forms are precisely the ones that produce the most severe
+// type-arg-adjacent parsing ambiguity even after the `[…]` kind-split (D1 rationale), so only the
+// single-char `<`/`>` glyphs were kept; `<=`/`>=` have no glyph at all. Their word-canonical forms
+// `lte(a, b)`/`gte(a, b)` are the only valid spelling (ordinary calls — see accept/20).
+// `a <= b` lexes as `LAngle`, `Eq` (never a single retired-glyph token), so the parser reads it as
+// `a < (= b)`: `<` opens a valid comparison right-hand side, and `=` cannot start an expression —
+// a never-silent parse refusal, never a silent reinterpretation of the old glyph (G2).
+nodule bad;
+fn f(a: Binary{8}, b: Binary{8}) => Binary{8} =
+    a <= b

@@ -1,0 +1,395 @@
+// nodule: std.text
+// @version: 0.3.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-26
+// @updated: 2026-06-27
+// @summary: Self-hosted UTF-8 utilities: byte length, slice/concat over the kernel Bytes, ASCII/continuation classification, bounds-checked byte access, full multi-byte UTF-8 codepoint decode (1/2/3/4-byte) WITH validity rejection (overlong / surrogate / >U+10FFFF — M-717 complete).
+nodule std.text;
+
+// M-717 (E13-1, #462). UTF-8 over `bytes_get`/`bytes_len`/`width_cast`. Self-contained:
+// local Option<A>, Result<A,E> and Pair<A,B> types redeclared here so this nodule has no
+// cross-leaf import dependency (worktree discipline).
+//
+// Unblock (DN-41, M-798): the `width_cast(value, into)` prim (zero-extension widen / checked narrow)
+// now lets a Binary{8} byte index be widened to Binary{32} for the `lt`-against-length bounds check
+// — the gap wave-n1 flagged (FLAG-text-1). This increment closes `byte_at` and the multi-byte decode.
+//
+// Guarantee basis (transparency rule / VR-5):
+// - `byte_len` delegates to the Exact `bytes_len` prim (Exact).
+// - `is_ascii_byte`/`is_cont_byte` are total over Binary{8} via `lt`+match (Exact).
+// - `byte_at` is total: the `width_cast`-widened index is `lt`-compared against `bytes_len`; in range
+//   yields `Some(bytes_get …)`, out of range yields `None` (Declared contract; never-silent G2).
+// - `decode_one` is Declared (the codepoint-assembly is a structural composition of Exact bit ops;
+//   correct for well-formed UTF-8 by construction, never machine-proven). It now also rejects
+//   non-canonical / non-scalar codepoints via the `reject_two/three/four` validity gates (overlong,
+//   surrogate U+D800–DFFF, > U+10FFFF — M-717 validity layer COMPLETE). Differential agreement
+//   (L1-eval ≡ L0-interp ≡ AOT) is Empirical (trials, std_text.rs).
+// Never-silent (G2): a malformed lead byte, a missing/short continuation, or a non-continuation in a
+//   continuation slot produces `Err(Invalid(byte))`; an overlong/surrogate/out-of-range codepoint
+//   produces `Err(Overlong/Surrogate/TooLarge(lead))` — never U+FFFD substitution, never silent
+//   coercion, never a wrapped/truncated codepoint.
+//
+// Codepoint assembly without a shift prim: the surface has no `shl`/`shr` (or Binary multiply), so a
+// left-shift-by-6k is expressed as repeated doubling `add_u(v, v)` at Binary{32} width (each `dbl`
+// is one left shift; six `dbl`s = `<< 6`). All shifts happen at Binary{32} so no `add_u` overflow
+// is reachable for the U+0000..U+10FFFF range. The 6-bit continuation payloads are lifted to
+// Binary{32} via `width_cast` before the shift-accumulate, then OR-combined.
+//
+// Honesty boundary (FLAGs — VR-5; do NOT fake):
+// FLAG-text-3: CLOSED (DN-43, M-799). `bytes_slice`/`bytes_concat` are now surface-callable over the
+//   kernel `Bytes` — `slice`/`concat` below delegate to them. The diagnosis that they "needed their
+//   own prim" was off (corrected honestly): the kernel prims `bytes.slice`/`bytes.concat` already
+//   existed + were registered (RFC-0032 D4, M-750); only the *surface mapping* was missing (a
+//   `prim_kernel_name` entry + a `try_check_seq_bytes_prim` arm, the DN-41/`width_cast` shape). The
+//   `Bytes8` byte-cons model below is now superseded by these direct-`Bytes` ops (kept declared for
+//   append-only minimalism; a later cleanup may retire it). `decode_one` still returns a
+//   `Pair(codepoint, byte_width)` (the caller advances `i` by the returned width) — that is a decode
+//   convention, independent of slice availability.
+//
+// Scope (cumulative): byte_len, is_ascii_byte, byte_at, full decode_one (1/2/3/4-byte), and — added by
+// DN-43/M-799 — `slice`/`concat` over the kernel `Bytes`. All operations that execute three-way are
+// honest about their basis.
+// ── Local Option (redeclared; no cross-leaf import) ──────────────────────────────────────────────
+// Option<A>: the never-silent optional value. Redeclared here (not imported from std.option) to
+// keep this nodule self-contained per worktree discipline. Semantics identical to std.option.
+type Option[A] = Some(A) | None;
+
+// ── Local Result (redeclared; no cross-leaf import) ──────────────────────────────────────────────
+// Result<A, E>: the never-silent fallible value. Redeclared here (not imported from std.result).
+type Result[A, E] = Ok(A) | Err(E);
+
+// ── Local Pair (redeclared; no cross-leaf import) ────────────────────────────────────────────────
+// Pair<A, B>: a two-field product. `decode_one` returns `Pair(codepoint, byte_width)` — the decoded
+// Unicode scalar plus the number of bytes the sequence consumed (so the caller advances by it). A
+// `Bytes`-returning slice form is now available directly via `slice` below (DN-43/M-799).
+type Pair[A, B] = Pr(A, B);
+
+// ── Error type ─────────────────────────────────────────────────────────────────────────────────────
+// Utf8Error: never-silent (G2), never U+FFFD substitution. Each variant carries the offending sequence's
+// LEAD byte as a diagnostic — the byte that started the malformed/invalid unit (the surrogate/overlong/
+// too-large codepoint value is reconstructable from the bytes; the lead identifies which sequence failed):
+// - Invalid:   a structural malformation — a bad lead byte, a missing/short continuation, or a
+//              non-continuation in a continuation slot (M-717 wave-n2; carries the offending byte).
+// - Overlong:  a sequence that encodes a value in MORE bytes than canonical (e.g. 0xC0 0x80 for U+0000).
+// - Surrogate: a codepoint in the UTF-16 surrogate range U+D800..U+DFFF — not a Unicode scalar value.
+// - TooLarge:  a codepoint above the Unicode ceiling U+10FFFF.
+// The last three (the UTF-8 well-formedness / RFC-3629 scalar-value constraints) are the M-717 validity
+// layer; structural malformations remain `Invalid`.
+type Utf8Error =
+    Invalid(Binary{8})
+  | Overlong(Binary{8})
+  | Surrogate(Binary{8})
+  | TooLarge(Binary{8});
+
+// ── Byte cons-list (superseded by direct-`Bytes` slice/concat) ─────────────────────────────────────
+// Bytes8: a singly-linked cons-list of Binary{8} bytes — wave-n1's declared-only model for *future*
+// slice/concat. Superseded by `slice`/`concat` over the kernel `Bytes` (DN-43/M-799); retained only
+// for append-only minimalism (a later cleanup may retire it). Not the slice/concat mechanism.
+type Bytes8 = BNil | BCons(Binary{8}, Bytes8);
+
+// ── byte_len ───────────────────────────────────────────────────────────────────────────────────────
+// byte_len: the number of bytes in `b` as Binary{32}. Delegates directly to the Exact `bytes_len`
+// kernel prim — every input yields the exact byte count, no approximation (Exact).
+fn byte_len(b: Bytes) => Binary{32} =
+  bytes_len(b);
+
+// ── concat ─────────────────────────────────────────────────────────────────────────────────────────
+// concat: the byte-wise concatenation `b1 ++ b2` over the kernel `Bytes` (DN-43/M-799). A thin total
+// wrapper over the `Exact` `bytes_concat` kernel prim — every pair of byte strings concatenates, no
+// failure mode (Exact). This (with `slice`) closes FLAG-text-3 / M-717's slicing DoD clause.
+fn concat(b1: Bytes, b2: Bytes) => Bytes =
+  bytes_concat(b1, b2);
+
+// ── slice ──────────────────────────────────────────────────────────────────────────────────────────
+// slice: the half-open sub-slice `b[start, end)` over the kernel `Bytes` (DN-43/M-799). Delegates to
+// the never-silent `bytes_slice` kernel prim: an out-of-range (`end > len`) or inverted (`start > end`)
+// range is a never-silent refusal — NEVER a silent clamp/truncation (G2). This thin form returns
+// `Bytes` directly, surfacing that refusal as an evaluation error; for the refusal-as-data form use
+// `slice_opt` below.
+//
+// Guarantee: Exact over the in-range domain (`start <= end <= len`); the bounds contract is Declared/
+// never-silent (asserted + exhibited three-way by std_bytes_slice.rs, not machine-proven).
+fn slice(b: Bytes, start: Binary{32}, end: Binary{32}) => Bytes =
+  bytes_slice(b, start, end);
+
+// ── slice_opt ────────────────────────────────────────────────────────────────────────────────────────
+// slice_opt: a bounds-checked sub-slice — `Some(b[start, end))` when the range is in bounds and not
+// inverted, `None` otherwise. The analog of `byte_at` for ranges: it lifts the kernel's never-silent
+// out-of-range refusal into an explicit `None` (never-silent G2), so a caller that wants the refusal
+// as data — rather than as an evaluation error — uses this form. In bounds iff `start <= end` AND
+// `end <= byte_len(b)`; both predicates are Exact `lt`-based comparisons at the common Binary{32} width
+// (start/end are already Binary{32}, so no width-cast is needed, unlike `byte_at`'s Binary{8} index).
+//
+// The two out-of-bounds conditions are each a single `lt`: `lt(end, start)` true means the range is
+// inverted (`start > end`); `lt(byte_len(b), end)` true means it runs past the end (`end > len`).
+// Both false ⇒ in range ⇒ `Some(bytes_slice …)`. (Mirrors the kernel guard `start > end || end > len`.)
+//
+// Guarantee: Declared contract (the bounds predicate is Exact `lt`; the Option wrapping is the
+// never-silent contract). Never-silent (G2): out-of-range/inverted ⇒ explicit `None`.
+fn slice_opt(b: Bytes, start: Binary{32}, end: Binary{32}) => Option[Bytes] =
+  match lt(end, start) {
+    0b1 => None,
+    _ => match lt(byte_len(b), end) { 0b1 => None, _ => Some(bytes_slice(b, start, end)) }
+  };
+
+// ── is_ascii_byte ──────────────────────────────────────────────────────────────────────────────────
+// is_ascii_byte: True iff `x` < 0x80 (0b1000_0000), i.e. `x` has its high bit clear and is a
+// valid 7-bit ASCII byte. Total over Binary{8} via `lt` + match (Exact). The `lt` prim returns
+// Binary{1}; bridged to Bool via match { 0b1 => True, _ => False } (the bool-bridge pattern,
+// M-747 / enablement.rs bool_bridge_from_comparison_bit).
+fn is_ascii_byte(x: Binary{8}) => Bool =
+  match lt(x, 0b1000_0000) { 0b1 => True, _ => False };
+
+// ── is_cont_byte ───────────────────────────────────────────────────────────────────────────────────
+// is_cont_byte: True iff `x` is a UTF-8 continuation byte, i.e. 0x80 <= x <= 0xBF (the high two bits
+// are 0b10). Total over Binary{8} (Exact): `x` is a continuation byte iff `x` is NOT below 0x80 AND
+// IS below 0xC0. Both branches use the `lt`+match bool bridge.
+fn is_cont_byte(x: Binary{8}) => Bool =
+  match lt(x, 0b1000_0000) {
+    0b1 => False,
+    _ => match lt(x, 0b1100_0000) { 0b1 => True, _ => False }
+  };
+
+// ── byte_at ────────────────────────────────────────────────────────────────────────────────────────
+// byte_at: bounds-checked byte access — `Some(byte)` when `i` is in range, `None` otherwise.
+// The byte index `i` is Binary{8}; the length `bytes_len(b)` is Binary{32}. `width_cast(i, len32)`
+// zero-extends `i` to Binary{32} (Exact widen, DN-41) using the length itself as the width witness, so
+// the `lt` comparison is at a single common width (Binary{32}) — the exact pattern DN-41 §3 motivates.
+// In range (`lt` yields 0b1): `Some(bytes_get(b, i))`. Out of range: `None`.
+//
+// Guarantee: Declared contract (the bounds predicate is Exact `lt`/`width_cast`; the Option wrapping
+// is the never-silent contract). Never-silent (G2): an out-of-range index is an explicit `None`, never
+// a kernel refusal leaking through and never a silent wrap. This closes FLAG-text-1 (wave-n1).
+fn byte_at(b: Bytes, i: Binary{8}) => Option[Binary{8}] =
+  match lt(width_cast(i, bytes_len(b)), bytes_len(b)) { 0b1 => Some(bytes_get(b, i)), _ => None };
+
+// ── widen8 ─────────────────────────────────────────────────────────────────────────────────────────
+// widen8: zero-extend a Binary{8} value to Binary{32} (Exact widen, DN-41). The width witness is a
+// Binary{32} length probe (`bytes_len` of a 4-byte literal = the constant 4). The value 4 is
+// arbitrary and irrelevant — `bytes_len` returns a `Binary{32}`, and DN-41 §3's width-witness ABI
+// uses ONLY the witness's *type* (its `{32}` width), never its value; any expression of type
+// `Binary{32}` would serve identically. The 4-byte literal is just the cheapest such witness here.
+fn widen8(x: Binary{8}) => Binary{32} =
+  width_cast(x, bytes_len(0x00_00_00_00));
+
+// ── dbl / shl6 / shl12 / shl18 ───────────────────────────────────────────────────────────────────
+// dbl: one left shift of a Binary{32} value (multiply by two) via never-silent `add_u` (Exact for
+// the small values handled here — all decoded codepoints are < 2^21, so doubling never overflows
+// Binary{32}). shl6/shl12/shl18 compose `dbl` to shift a continuation payload into its codepoint slot.
+fn dbl(v: Binary{32}) => Binary{32} =
+  add_u(v, v);
+
+fn shl6(v: Binary{32}) => Binary{32} =
+  dbl(dbl(dbl(dbl(dbl(dbl(v))))));
+
+fn shl12(v: Binary{32}) => Binary{32} =
+  shl6(shl6(v));
+
+fn shl18(v: Binary{32}) => Binary{32} =
+  shl6(shl12(v));
+
+// ── cont_payload ───────────────────────────────────────────────────────────────────────────────────
+// cont_payload: the low 6 bits of a continuation byte, widened to Binary{32} (Exact). `and(c, 0x3F)`
+// masks off the 0b10 continuation marker; `widen8` lifts the 6-bit payload to Binary{32}.
+fn cont_payload(c: Binary{8}) => Binary{32} =
+  widen8(and(c, 0b0011_1111));
+
+// ── UTF-8 validity gates (M-717: overlong / surrogate / out-of-range rejection) ────────────────────
+//
+// reject_two/three/four take the ASSEMBLED codepoint `cp` (Binary{32}) and the sequence's lead byte,
+// and return Ok(Pr(cp, width)) iff `cp` is the CANONICAL well-formed encoding for that byte width —
+// else a never-silent Err carrying the lead byte (G2). They are the RFC-3629 well-formedness layer that
+// the structural decode_two/three/four delegate their final Ok to. Comparisons are Exact `lt` at the
+// common Binary{32} width; the bound constants are written as 32-bit BINARY literals (a `0x…` literal is
+// a `Bytes` value in this lexer, not a Binary{32} number — so the thresholds use `0b…` explicitly):
+//   0x80 = min 2-byte · 0x800 = min 3-byte · 0x10000 = min 4-byte (below ⇒ OVERLONG) ·
+//   0xD800..0xE000 = the surrogate gap (SURROGATE) · 0x10FFFF = the Unicode ceiling (above ⇒ TOOLARGE).
+// Guarantee: Declared (the Result wrapping is the never-silent contract; the predicate is Exact `lt`).
+// 2-byte: valid iff cp >= 0x80 (a 1-byte value here would be overlong). The 2-byte max (0x7FF) is below
+// both the surrogate gap and the ceiling, so only the overlong check applies. (0x80 = 1<<7.)
+fn reject_two(cp: Binary{32}, lead: Binary{8}) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match lt(cp, 0b0000_0000_0000_0000_0000_0000_1000_0000) {
+    0b1 => Err(Overlong(lead)),
+    _ => Ok(Pr(cp, 0b0000_0010))
+  };
+
+// 3-byte: valid iff cp >= 0x800 (else overlong) AND cp not in 0xD800..0xDFFF (else a surrogate — not a
+// Unicode scalar value). The 3-byte max (0xFFFF) is below the ceiling, so no too-large check.
+// (0x800 = 1<<11; 0xD800 = surrogate-gap low; 0xE000 = surrogate-gap high+1.)
+fn reject_three(cp: Binary{32}, lead: Binary{8}) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match lt(cp, 0b0000_0000_0000_0000_0000_1000_0000_0000) {
+    0b1 => Err(Overlong(lead)),
+    _ => match lt(cp, 0b0000_0000_0000_0000_1101_1000_0000_0000) {
+      0b1 => Ok(Pr(cp, 0b0000_0011)),
+      _ => match lt(cp, 0b0000_0000_0000_0000_1110_0000_0000_0000) {
+        0b1 => Err(Surrogate(lead)),
+        _ => Ok(Pr(cp, 0b0000_0011))
+      }
+    }
+  };
+
+// 4-byte: valid iff cp >= 0x10000 (else overlong) AND cp <= 0x10FFFF (else above the Unicode ceiling).
+// The 4-byte min (0x10000) is above the surrogate gap, so no surrogate check.
+// (0x10000 = 1<<16; 0x10FFFF = the maximum Unicode scalar value.)
+fn reject_four(cp: Binary{32}, lead: Binary{8}) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match lt(cp, 0b0000_0000_0000_0001_0000_0000_0000_0000) {
+    0b1 => Err(Overlong(lead)),
+    _ => match lt(0b0000_0000_0001_0000_1111_1111_1111_1111, cp) {
+      0b1 => Err(TooLarge(lead)),
+      _ => Ok(Pr(cp, 0b0000_0100))
+    }
+  };
+
+// ── decode_ascii ───────────────────────────────────────────────────────────────────────────────────
+// decode_ascii: decode the byte at position `i` in `b` — ASCII (< 0x80) fast-path only, returning the
+// codepoint as Binary{8}. Retained as the 1-byte fast path; `decode_one` folds the same logic into its
+// Binary{32}-returning ASCII arm (returning a Pair with byte_width 1).
+//
+// Returns Ok(codepoint_byte) if the byte at `i` is a valid ASCII byte (0x00–0x7F), or
+// Err(Invalid(byte)) if the byte has its high bit set. Never-silent (G2). The kernel `bytes_get` prim
+// refuses out-of-bounds access; for a bounds-checked variant use `byte_at`/`decode_one`.
+//
+// Guarantee: Declared (type-level contract; three-way differential agreement Empirical, std_text.rs).
+fn decode_ascii(b: Bytes, i: Binary{8}) => Result[Binary{8}, Utf8Error] =
+  let byte0 = bytes_get(b, i) in
+  match is_ascii_byte(byte0) { True => Ok(byte0), False => Err(Invalid(byte0)) };
+
+// ── decode_two / decode_three / decode_four ──────────────────────────────────────────────────────
+// Each decodes a fixed-length multi-byte sequence whose lead byte is already classified. They read the
+// remaining continuation bytes via `byte_at` (so a truncated sequence — index past end — is a
+// never-silent `Err`, not a kernel refusal), validate each continuation via `is_cont_byte` (a
+// non-continuation in a continuation slot is `Err(Invalid(that_byte))`), then assemble the Binary{32}
+// codepoint by shifting each payload into place and OR-combining. The returned Pair's second field is
+// the byte width (2/3/4) the caller advances by.
+//
+// 2-byte: lead 0b110xxxxx, cont 0b10yyyyyy yields cp = (lead & 0x1F) << 6 | (cont & 0x3F).
+fn decode_two(
+  b: Bytes,
+  i: Binary{8},
+  lead: Binary{8}
+) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match byte_at(b, add_u(i, 0b0000_0001)) {
+    None => Err(Invalid(lead)),
+    Some(c1) => match is_cont_byte(c1) {
+      False => Err(Invalid(c1)),
+      True => reject_two(or(shl6(widen8(and(lead, 0b0001_1111))), cont_payload(c1)), lead)
+    }
+  };
+
+// 3-byte: lead 0b1110xxxx, two conts yield cp = (lead & 0x0F) << 12 | (c1 & 0x3F) << 6 | (c2 & 0x3F).
+fn decode_three(
+  b: Bytes,
+  i: Binary{8},
+  lead: Binary{8}
+) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match byte_at(b, add_u(i, 0b0000_0001)) {
+    None => Err(Invalid(lead)),
+    Some(c1) => match is_cont_byte(c1) {
+      False => Err(Invalid(c1)),
+      True => match byte_at(b, add_u(i, 0b0000_0010)) {
+        None => Err(Invalid(c1)),
+        Some(c2) => match is_cont_byte(c2) {
+          False => Err(Invalid(c2)),
+          True =>
+            reject_three(
+              or(
+                or(shl12(widen8(and(lead, 0b0000_1111))), shl6(cont_payload(c1))),
+                cont_payload(c2)
+              ),
+              lead
+            )
+        }
+      }
+    }
+  };
+
+// 4-byte: lead 0b11110xxx, three conts yield
+//   cp = (lead & 0x07) << 18 | (c1 & 0x3F) << 12 | (c2 & 0x3F) << 6 | (c3 & 0x3F).
+fn decode_four(
+  b: Bytes,
+  i: Binary{8},
+  lead: Binary{8}
+) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match byte_at(b, add_u(i, 0b0000_0001)) {
+    None => Err(Invalid(lead)),
+    Some(c1) => match is_cont_byte(c1) {
+      False => Err(Invalid(c1)),
+      True => match byte_at(b, add_u(i, 0b0000_0010)) {
+        None => Err(Invalid(c1)),
+        Some(c2) => match is_cont_byte(c2) {
+          False => Err(Invalid(c2)),
+          True => match byte_at(b, add_u(i, 0b0000_0011)) {
+            None => Err(Invalid(c2)),
+            Some(c3) => match is_cont_byte(c3) {
+              False => Err(Invalid(c3)),
+              True =>
+                reject_four(
+                  or(
+                    or(
+                      or(shl18(widen8(and(lead, 0b0000_0111))), shl12(cont_payload(c1))),
+                      shl6(cont_payload(c2))
+                    ),
+                    cont_payload(c3)
+                  ),
+                  lead
+                )
+            }
+          }
+        }
+      }
+    }
+  };
+
+// ── decode_one ─────────────────────────────────────────────────────────────────────────────────────
+// decode_one: decode the UTF-8 sequence beginning at byte index `i` in `b`, returning
+// `Ok(Pair(codepoint, byte_width))` — the full Binary{32} Unicode scalar and the 1/2/3/4-byte width
+// the sequence consumed — or `Err(Invalid(byte))` on any malformation (never-silent, G2).
+//
+// Lead-byte classification (the canonical UTF-8 lead ranges):
+// - 0x00–0x7F (lt 0x80)                      yields 1-byte ASCII: cp = lead, width 1.
+// - 0x80–0xBF (a bare continuation, lt 0xC0) yields Err(Invalid(lead)) (a continuation cannot lead).
+// - 0xC0–0xDF (lt 0xE0)                      yields 2-byte: decode_two.
+// - 0xE0–0xEF (lt 0xF0)                      yields 3-byte: decode_three.
+// - 0xF0–0xF7 (lt 0xF8)                      yields 4-byte: decode_four.
+// - 0xF8–0xFF                                yields Err(Invalid(lead)) (no 5+-byte form in UTF-8).
+//
+// The lead byte is read via `byte_at` so an out-of-range start index is `Err(Invalid(0))` (a synthetic
+// offending byte — there is no byte to report) rather than a kernel refusal; the never-silent contract
+// holds at the surface.
+//
+// Guarantee: Declared (structural composition of Exact bit ops; correct for well-formed UTF-8 by
+// construction, not machine-proven). Differential agreement Empirical (std_text.rs). Never-silent (G2)
+// on every malformed path (bad lead, truncated sequence, non-continuation in a continuation slot).
+// Grounding: hand-computed codepoints, three-way verified (L1≡L0≡AOT); crates/mycelium-std-text exists
+// but exposes a different Ring-2 surface (no decode_one) — not the structural oracle.
+//
+// VALIDITY (M-717 — now CLOSED, the last M-717 remainder): the multi-byte arms reject OVERLONG
+// encodings (a value encodable in fewer bytes), SURROGATE-range codepoints (U+D800–DFFF), and
+// codepoints above U+10FFFF — each a never-silent `Err(Overlong/Surrogate/TooLarge(lead))` via the
+// `reject_two/three/four` gates (the assembled codepoint compared against the per-length minimum and
+// the surrogate/ceiling bounds with `lt` at Binary{32}). So `decode_one` yields only well-formed
+// Unicode scalar values (RFC-3629). Structural malformations (bad lead, missing/short continuation,
+// bad continuation) still surface as `Err(Invalid(byte))`. Boundary values (U+0080, U+0800, U+10000,
+// U+10FFFF) are accepted, not over-rejected (std_text.rs validity tests).
+fn decode_one(b: Bytes, i: Binary{8}) => Result[Pair[Binary{32}, Binary{8}], Utf8Error] =
+  match byte_at(b, i) {
+    None => Err(Invalid(0b0000_0000)),
+    Some(lead) => match lt(lead, 0b1000_0000) {
+      0b1 => Ok(Pr(widen8(lead), 0b0000_0001)),
+      _ => match lt(lead, 0b1100_0000) {
+        0b1 => Err(Invalid(lead)),
+        _ => match lt(lead, 0b1110_0000) {
+          0b1 => decode_two(b, i, lead),
+          _ => match lt(lead, 0b1111_0000) {
+            0b1 => decode_three(b, i, lead),
+            _ =>
+              match lt(lead, 0b1111_1000) {
+                0b1 => decode_four(b, i, lead),
+                _ => Err(Invalid(lead))
+              }
+          }
+        }
+      }
+    }
+  };

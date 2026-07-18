@@ -1,0 +1,18 @@
+// exercises: the first-class FUNCTION-TYPE `type_ref` production `A => B` (RFC-0024 §3; M-924
+// ebnf gap-fix) as a value-parameter's ANNOTATED TYPE — distinct from a fn_sig's own `=>` return
+// arrow. Covers: a bare `A => B` param type (`apply`), right-associativity (`A => B => C` parses
+// as `A => (B => C)`, `chain`), and `@ strength` binding tighter than `=>` (`A @ Exact => B`
+// parses as `(A @ Exact) => B`, `applyx`) — mirroring
+// `crates/mycelium-l1/src/tests/parse.rs::{simple_fn_type_parses_to_basetype_fn,
+// fn_type_is_right_associative, guarantee_binds_tighter_than_arrow}`. This is a PARSE oracle (the
+// gate runs only `parse_phylum`); the bodies need not type-check or run.
+nodule first_class_fn_type;
+
+// a bare `A => B` function-typed value parameter.
+fn apply[A, B](f: A => B, x: A) => B = f(x);
+
+// right-associative chain: `f : A => B => C` is `A => (B => C)`.
+fn chain[A, B, C](f: A => B => C) => A => B => C = f;
+
+// `@ strength` binds tighter than `=>`: `(A @ Exact) => B`.
+fn applyx[A, B](f: A @ Exact => B, x: A) => B = f(x);

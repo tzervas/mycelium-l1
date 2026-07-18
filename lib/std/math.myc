@@ -1,0 +1,116 @@
+// nodule: std.math
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-27
+// @summary: Self-hosted width-generic arithmetic/logic surface — binary add/sub + bitwise and/or/xor/not
+nodule std.math;
+
+// over Binary{N}, and balanced-ternary add/sub/mul/neg over Ternary{M} (M-718, E13-1, RFC-0031 §5 D4
+// Tier-1; DN-42 width-generics, RFC-0032 D2). Each op is WIDTH-GENERIC: one definition, monomorphized
+// to the concrete width the call site pins (M-753 / DN-42 Option A). Never claimed self-hosted ahead of
+// the prims (VR-5/G2): this surface wraps ONLY the kernel prims that are actually surfaced.
+//
+// Guarantee basis (transparency rule / VR-5), grounded in crates/mycelium-interp/src/prims.rs:
+// - badd/bsub delegate to `bit.add`/`bit.sub` — unsigned fixed-width ripple-carry add/subtract over
+//   Binary{N}. The result is **Exact** on the in-range domain; a carry-out (overflow) or borrow-out
+//   (underflow below 0) is an explicit never-silent `Overflow` refusal — NEVER a silent modular wrap
+//   (RFC-0032 §5 D2; G2). A wrapping `add` is intentionally absent (it would hide the carry).
+// - band/bor/bxor/bnot delegate to `bit.and`/`bit.or`/`bit.xor`/`bit.not` — total logical bit ops,
+//   **Exact** over the whole Binary{N} domain (no overflow mode).
+// - tadd/tsub/tmul delegate to `trit.add`/`trit.sub`/`trit.mul` — fixed-width balanced-ternary
+//   arithmetic, **Exact** on the in-range result; an out-of-range result is an explicit never-silent
+//   `Overflow` refusal (M-111). tneg delegates to `trit.neg` — digit-wise sign flip, always in range,
+//   **Exact** (balanced ternary has no sign asymmetry).
+// - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) is **Empirical** (trials, std_math.rs).
+//
+// Never-silent width discipline (G2/VR-5/DN-42 §4): the width param (`N` for binary, `M` for ternary)
+// is bound at the call site from the operands. An undetermined width is an explicit monomorphization
+// refusal; mixing two widths (e.g. badd(Binary{8}, Binary{16})) is a width-mismatch refusal — never a
+// silent coercion or guessed default. Paradigm is fixed per op: the binary ops take Binary{N}, the
+// ternary ops take Ternary{M}; there is no cross-paradigm arithmetic here (a binary/ternary mix is a
+// never-silent swap question, not arithmetic — see RFC-0034/ADR-032, out of scope for this nodule).
+//
+// Honesty boundary (FLAGs — VR-5; do NOT fake):
+// FLAG-math-1 (UPDATED, CU-1/CU-6): binary MULTIPLY is now provided (`bmul` below) — the `bit.mul`
+//   never-silent unsigned-multiply prim landed (RFC-0033 §4.1.2). Binary/ternary DIVISION is still not
+//   surfaced here (the `bin.div`/`bin.rem` prims exist but the width-generic self-hosted division
+//   surface is a future increment); it is never faked. Ternary multiply rides `tmul` (kernel `trit.mul`).
+// FLAG-math-3 (CU-6): bit ROTATE (`rotate_left`/`rotate_right`) and `reverse_bits`/`swap_bytes` are NOT
+//   provided width-generically. Rotate needs the width `N` as a runtime value to form the complementary
+//   shift `N - n`, and the naive `or(shl_u(x,n), shr_u(x, N-n))` mis-handles `n = 0` (a full-width `shr`
+//   refuses, shift-amount >= N) — so it is NOT a clean derivation from the surfaced prims. Faithful
+//   rotate is gated on either a dedicated `bit.rotl`/`bit.rotr` prim or a width-reflection surface;
+//   captured here, never faked (VR-5). popcount/clz/ctz ARE provided (`bpopcount`/`bclz`/`bctz`), the
+//   kernel `bit.popcount`/`bit.clz`/`bit.ctz` prims.
+// FLAG-math-2: NO epsilon/delta numerics surface (honest rounding / precision disclosure over the Dense
+//   representation) is provided here. That surface (RFC-0031 §5 D4 Tier-2; the ε-propagation machinery,
+//   ApproxRule, in prims.rs) is a Dense-numerics workstream (E2-1/E2-4), not yet self-hostable from the
+//   surfaced prim set. Captured, not claimed.
+// ── Binary arithmetic over Binary{N} (never-silent overflow/underflow) ─────────────────────────────
+// badd<N>: unsigned width-preserving addition. Exact on the in-range result; an overflow (carry-out)
+// is a never-silent `Overflow` refusal — never a modular wrap (G2).
+fn badd{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  add_u(a, b);
+
+// bsub<N>: unsigned width-preserving subtraction. Exact on the in-range result; an underflow
+// (borrow-out below 0) is a never-silent `Overflow` refusal — never a wrap to a large value (G2).
+fn bsub{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  sub_u(a, b);
+
+// ── Binary bitwise logic over Binary{N} (total, Exact) ─────────────────────────────────────────────
+// band<N>: bitwise AND. Total, Exact over Binary{N} x Binary{N}.
+fn band{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  and(a, b);
+
+// bor<N>: bitwise OR. Total, Exact.
+fn bor{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  or(a, b);
+
+// bxor<N>: bitwise XOR. Total, Exact.
+fn bxor{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  xor(a, b);
+
+// bnot<N>: bitwise NOT (one's complement). Total, Exact over Binary{N}.
+fn bnot{N}(a: Binary{N}) => Binary{N} =
+  not(a);
+
+// bmul<N>: unsigned width-preserving multiply (CU-1). Exact on the in-range result; a product that
+// overflows `U_N` is a never-silent `Overflow` refusal — never a modular wrap (G2). Closes the
+// FLAG-math-1 "no binary multiply" gap (kernel `bit.mul`).
+fn bmul{N}(a: Binary{N}, b: Binary{N}) => Binary{N} =
+  mul_u(a, b);
+
+// ── Binary bit-manipulation counts over Binary{N} (total, Exact — kernel bit.popcount/clz/ctz) ──────
+// bpopcount<N>: population count (number of set bits), as the N-bit count. Total, Exact.
+fn bpopcount{N}(a: Binary{N}) => Binary{N} =
+  popcount(a);
+
+// bclz<N>: count leading zeros; N for the all-zero value. Total, Exact.
+fn bclz{N}(a: Binary{N}) => Binary{N} =
+  clz(a);
+
+// bctz<N>: count trailing zeros; N for the all-zero value. Total, Exact.
+fn bctz{N}(a: Binary{N}) => Binary{N} =
+  ctz(a);
+
+// ── Balanced-ternary arithmetic over Ternary{M} (never-silent overflow) ────────────────────────────
+// tadd<M>: balanced-ternary addition. Exact on the in-range result; an out-of-range result is a
+// never-silent `Overflow` refusal (G2).
+fn tadd{M}(a: Ternary{M}, b: Ternary{M}) => Ternary{M} =
+  add(a, b);
+
+// tsub<M>: balanced-ternary subtraction. Exact on the in-range result; out-of-range is never-silent
+// `Overflow` (G2).
+fn tsub{M}(a: Ternary{M}, b: Ternary{M}) => Ternary{M} =
+  sub(a, b);
+
+// tmul<M>: balanced-ternary multiplication. Exact on the in-range result; out-of-range is never-silent
+// `Overflow` (G2).
+fn tmul{M}(a: Ternary{M}, b: Ternary{M}) => Ternary{M} =
+  mul(a, b);
+
+// tneg<M>: balanced-ternary negation (digit-wise sign flip). Always in range, Exact — value(-t) =
+// -value(t) (balanced ternary has no sign asymmetry).
+fn tneg{M}(a: Ternary{M}) => Ternary{M} =
+  neg(a);

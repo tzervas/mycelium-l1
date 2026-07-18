@@ -1,0 +1,19 @@
+// exercises: stage-1 effect annotations on fn signatures (M-660 / RFC-0014 §3.4/§4.5). The optional
+// `!{ eff, ... }` after the return type declares a fn's effect set; an unannotated fn is pure
+// (RFC-0014 I5). Effect names are plain identifiers (the closed kernel kinds retry|alloc|io|cascade|
+// time plus user `Named` effects), never reserved words. Coverage rule (checked above the parser):
+// a fn's declared effects must be a superset of the effects it performs (the union of its callees'
+// declared effects). Here `source` declares `io`, `relay` declares `io` and calls `source` (covered),
+// and `wide` over-declares `io, time` (allowed — a declaration is a contract). `pure_one` writes the
+// explicit empty set `!{}`; `plain` is unannotated — both are pure.
+nodule effects;
+
+fn source() => Binary{8} !{io} = 0b00000000;
+
+fn relay() => Binary{8} !{io} = source();
+
+fn wide() => Binary{8} !{io, time} = source();
+
+fn pure_one() => Binary{8} !{} = 0b00000000;
+
+fn plain() => Binary{8} = 0b00000000;

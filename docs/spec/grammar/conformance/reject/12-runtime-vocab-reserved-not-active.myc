@@ -1,0 +1,9 @@
+// rejected: 'mesh' is a DN-03 §4 runtime-vocabulary reserved word (distributed runtime mesh,
+// RFC-0008) — it is reserved-not-active: it lexes as a keyword (never a silent identifier, G2)
+// but no construct consumes it, so it cannot appear at item position. The parser emits a teaching
+// diagnostic naming RFC-0008. The other still-reserved runtime-tier names (graft, cyst, xloc,
+// forage, backbone) are reserved the same way (see unit tests).
+// ('hypha'/'colony' LEFT this reserved set with M-666; 'fuse'/'reclaim'/'tier' LEFT with M-667
+// / DN-58 — they are now active constructs. See accept/24-fuse-reclaim-tier.myc.)
+nodule demo;
+mesh worker

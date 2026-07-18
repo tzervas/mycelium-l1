@@ -1,0 +1,5 @@
+// exercises: representation-typed literals (compact balanced-ternary, list, type args)
+nodule literals;
+
+fn samples() => List[Ternary{6}] =
+    [ 0t+0--0+, 0t000000, 0t------ ];

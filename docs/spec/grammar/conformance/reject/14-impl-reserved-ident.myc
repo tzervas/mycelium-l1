@@ -1,0 +1,7 @@
+// rejected: 'impl' is a reserved word (trait-instance / inherent-method block — DN-03 §1, RFC-0019
+// §3.2 `impl Trait for T`, RFC-0007 §12) reserved by M-658, so it can never be used as an identifier
+// (G2 — never a silent identifier). Here it is used as a function name, which the lexer now lexes as
+// the `impl` keyword, so the parser refuses where an identifier is required. The `impl … for …`
+// (instances) and `impl T { … }` (inherent methods) productions land with M-659 / M-664.
+nodule demo;
+fn impl(x: Binary{8}) => Binary{8} = x

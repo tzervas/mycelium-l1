@@ -1,0 +1,22 @@
+// exercises: the RFC-0037 surface forms this corpus migrated to — `[T]` type parameters, `{N}`
+// const/width parameters (and the combined `[T]{N}` kind-split), the `=>` return arrow, a `0t…`
+// balanced-ternary literal, and a `lambda(x: …) => …` abstraction. This is a PARSE oracle (the gate
+// runs only `parse_phylum`); the bodies need not type-check or run. The four forms below are the
+// retired-syntax counterparts now refused in reject/22–25, kept here so the new spelling is pinned
+// positively alongside the never-silent refusal of the old (G2).
+nodule rfc0037.surface;
+
+// `[T]` type parameter + `=>` arrow.
+fn id[T](x: T) => T = x;
+
+// `{N}` const/width parameter feeding a `Binary{N}` width slot.
+fn widen{N}(x: Binary{N}) => Binary{N} = x;
+
+// combined `[T]{N}` kind-split: `T` is a type param, `N` a width param.
+fn pick[T]{N}(x: Binary{N}, y: T) => T = y;
+
+// `0t…` balanced-ternary literal (the angle form `<+0-+>` is retired — reject/25).
+fn trits() => Ternary{4} = 0t+0-+;
+
+// a `lambda(x: …) => …` abstraction applied in expression position.
+fn apply(x: Binary{8}) => Binary{8} = (lambda(z: Binary{8}) => z)(x);

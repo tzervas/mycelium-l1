@@ -1,0 +1,1756 @@
+// nodule: compiler.ambient
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-06
+// @updated: 2026-07-06
+// @summary: Self-hosted ambient-representation resolution (M-740 Stage 4; DN-26 §7.3 row 4). A
+//   faithful port of crates/mycelium-l1/src/ambient.rs (RFC-0012 §4.3/§4.4): a surface->surface
+//   "expand to longhand" pass (`resolve`/`resolve_report`) plus the canonical pretty-printer
+//   (`expand_to_source`/`expand_phylum_to_source`), over a SELF-CONTAINED copy of the AST
+//   vocabulary (mirroring compiler.ast) — per M-982, cross-nodule EXECUTION is still staged, so
+//   this nodule cannot `use compiler.ast.*` and RUN it; it redeclares the full AST it dispatches
+//   over (Item/Expr/BaseType/Literal/Pattern, TWICE — once for the resolver, once for the
+//   printer), matching crate::ambient's own `resolve(&Nodule) -> Result<Nodule, AmbientError>` /
+//   `expand_to_source(&Nodule) -> String` shape directly.
+nodule compiler.ambient;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 4). `crates/mycelium-l1/src/ambient.rs` stays the trusted
+// differential oracle (DN-26 §7.4) until M-741 ratifies the port. This file is checked against it
+// by `crates/mycelium-l1/tests/compiler_stage4_ambient.rs`.
+//
+// ── FLAG-ambient-1 (self-contained; own copy of the AST, not `use`-ing the sibling `compiler.ast`
+// nodule). Per M-982 (restating FLAG-parse-1/FLAG-ast-3): cross-nodule EXECUTION is still staged,
+// so this nodule incorporates its OWN copy of the AST data types (same spellings as `compiler.ast`
+// / `compiler.parse`, per the established FLAG-ast-4/5 renaming conventions) then adds the
+// resolver + printer on top. A future stage (post-M-741) can delete this duplication and `use
+// compiler.ast.*` instead — not this leaf's call to make, FLAGged up for DN-26/M-741.
+//
+// ── FLAG-ambient-2 (provenance NOTES are NOT threaded through the resolver — `Resolved.notes` is
+// always `Nil`). The Rust oracle's `Resolver` holds a single `&mut self.notes: Vec<ResolutionNote>`
+// mutated at every ambient fill site — ordinary shared mutable state, trivial in Rust. Porting that
+// faithfully into this pure-functional surface would require threading a `Vec[ResolutionNote]`
+// accumulator through EVERY recursive resolve_* function (type_ref/expr/literal/pattern and every
+// item-level resolver) ALONGSIDE the existing `depth: Binary{32}` thread and the `Result` fallibility
+// — roughly doubling this already-1300-line port's plumbing for a payload (the human-facing "where
+// did this paradigm come from?" EXPLAIN string, §4.3) that (a) is provenance/tooling metadata, not
+// part of RFC-0012's I1/I2 semantic invariants, and (b) is not exercised by any existing self-hosted
+// gate. `resolve`/`resolve_report`'s STRUCTURAL transformation (the resolved twin `Nodule` the
+// differential's fingerprint checks) is fully, faithfully ported; `resolve_report` returns a real
+// `Resolved` value with the correct `nodule` field and an (honestly, visibly) empty `notes` field.
+// Never a silent drop (G2) — flagged here, and `resolve_report`'s own doc comment below repeats it.
+//
+// ── FLAG-ambient-3 (AmbientError message TEXT is not ported — only variant CLASSIFICATION, mirroring
+// FLAG-parse-8's "error position/message fidelity is not compared, only Ok/Err classification").
+// The Rust `impl Display for AmbientError` interpolates `site`/`paradigm`/`detail`/`limit` into full
+// prose refusal messages. This port keeps the five `AmbientError` variants and their exact fields
+// (so a caller can inspect `site`/`paradigm`/`detail`/`limit` directly) but does not render prose —
+// `ambient_error_kind` below gives a 5-way classification code instead, which is what the
+// differential actually compares (Ok/Err + which refusal fired), matching the established
+// message-fidelity-not-required precedent.
+//
+// ── FLAG-ambient-4 (`mycelium_stack::with_deep_stack` has no `.myc` analogue). The Rust
+// `resolve_report` wraps its work on a 256 MiB deep worker stack so the HOST call stack never
+// bounds the traversal — `MAX_AMBIENT_DEPTH` (below) is what bounds it instead. This self-hosted
+// port has no host-stack concept at all (the L1 evaluator has its OWN separate depth budget,
+// mirroring FLAG-parse-11's finding); `enter_depth`'s explicit counter is the ONLY depth guard here,
+// faithfully porting the Rust guard's LOGIC (not its "which stack" plumbing, which does not exist
+// on this side).
+//
+// ── FLAG-ambient-5 (`DepthExceeded` is present but NOT exercised at scale in the differential).
+// `MAX_AMBIENT_DEPTH = 4096` is a `.myc`-internal constant, not adjustable per-call the way the L1
+// evaluator's OWN depth budget is (`Evaluator::with_depth`, FLAG-parse-11's mechanism) — and the
+// evaluator's own default depth budget is ALSO 4096, incrementing in near lock-step with this
+// counter for any real recursive input, so reliably tripping THIS module's `DepthExceeded` before
+// (or independent of) the evaluator's own native guard would need on the order of 4096 hand-authored
+// nested `TypeRef`/`Expr` literals — impractical to hand-transcribe identically on both the Rust and
+// `.myc` sides for this leaf's budget. `enter_depth`'s logic is a direct, faithful port (same
+// increment-then-compare-then-refuse shape as the oracle); its refusal path is exercised at SMALL
+// scale is not (an honest, documented gap — G2/VR-5 — not a silent one).
+//
+// ── FLAG-ambient-6 (differential corpus scope: hand-built SYNTHETIC nodules only, no real
+// conformance-corpus files). Unlike `compiler.parse` (which parses SOURCE TEXT and can therefore
+// differential directly against the `docs/spec/grammar/conformance/*` corpus files), `compiler.ambient`
+// operates on an ALREADY-PARSED `Nodule` VALUE — this self-hosted nodule has no parser of its own
+// (`crate::ambient` depends only on `crate::ast`, never `crate::parse`). Feeding a real corpus file
+// through this differential would require either (a) a self-hosted parser callable from this same
+// nodule (not available — cross-nodule execution is staged, FLAG-ambient-1), or (b) a Rust-side
+// AST-to-L1-Value serializer converting a live `mycelium_l1::parse(source)` result into a `.myc`
+// `Nodule` value bit-for-bit — a nontrivial, separate piece of machinery this leaf's budget does not
+// cover. The differential (`tests/compiler_stage4_ambient.rs`) therefore hand-transcribes a small,
+// representative set of SYNTHETIC nodules identically on both the Rust and `.myc` sides (mirroring
+// the task brief's own fallback guidance: "an honest small-but-real differential beats a silently
+// narrowed or timing-out one"). Full corpus coverage is deferred, not silently skipped.
+
+// ── prelude (self-contained; FLAG-ambient-1's own copy of the token.myc/parse.myc convention) ────
+type Option[A] = Some(A) | None;
+type Result[A, E] = Ok(A) | Err(E);
+type Vec[A] = Nil | Cons(A, Vec[A]);
+type Pair[A, B] = Pr(A, B);
+
+// rev_acc: the direct-tail list-reversal underpinning every accumulator+reverse list-building loop
+// below (M-985) — `rev_acc(xs, acc)` = reverse(xs) ++ acc, one direct tail call per cell.
+fn rev_acc[A](xs: Vec[A], acc: Vec[A]) => Vec[A] =
+  match xs { Nil => acc, Cons(h, rest) => rev_acc(rest, Cons(h, acc)) };
+
+// ── AST copy-in (mirrors compiler.ast verbatim — same spellings, FLAG-ambient-1) ─────────────────
+type Vis = Private | Pub;
+type Path = Pth(Vec[Bytes]);
+type UsePath = UP(Path, Bool);
+type Paradigm = PBinary | PTernary | PDense | PVsa;
+type Scalar = SF16 | SBf16 | SF32 | SF64;
+type Sparsity = SpDense | SpSparse(Binary{32});
+type AmbientParams =
+    APSize(Binary{32})
+  | APDense(Binary{32}, Scalar)
+  | APVsa(Bytes, Binary{32}, Sparsity);
+type Strength = GExact | GProven | GEmpirical | GDeclared;
+type WidthRef = WLit(Binary{32}) | WName(Bytes);
+type ParamKind = PkType | PkWidth;
+type TraitRef = TRf(Bytes, Vec[TypeRef]);
+type TypeParam = TP(Bytes, ParamKind, Vec[TraitRef]);
+type EffectBudget = EB(Bytes, Binary{64});
+type FnSig = FS(Bytes, Vec[TypeParam], Vec[Param], TypeRef, Vec[Bytes], Vec[EffectBudget]);
+type Param = Prm(Bytes, TypeRef);
+type TypeRef = TR(BaseType, Option[Strength]);
+type BaseType =
+    KwBinary(WidthRef)
+  | KwTernary(WidthRef)
+  | KwDense(Binary{32}, Scalar)
+  | Vsa(Bytes, Binary{32}, Sparsity)
+  | KwSubstrate(Bytes)
+  | KwSeq(TypeRef, Binary{32})
+  | KwBytes
+  | KwFloat
+  | Named(Bytes, Vec[TypeRef])
+  | Ambient(AmbientParams)
+  | FnArrow(TypeRef, TypeRef)
+  | Tuple(Vec[TypeRef]);
+type ExecutionMode = Interpreted | Compiled;
+type FnDecl = FD(Vis, Bool, Option[ExecutionMode], FnSig, Expr);
+// M-1027 / DN-104: the 3rd field is the `sealed` (`priv`) flag (surface parity with ast.rs::Ctor).
+type Ctor = Ctr(Bytes, Vec[TypeRef], Bool);
+type TypeDecl = TD(Vis, Bytes, Vec[Bytes], Vec[Ctor]);
+type TraitDecl = TrD(Vis, Bytes, Vec[Bytes], Vec[FnSig]);
+type ImplDecl = ImD(Bytes, Vec[TypeRef], TypeRef, Vec[FnDecl]);
+type ViaDecl = VD(Binary{32}, Bytes, Vec[TypeRef]);
+type ObjectDecl = OD(Vis, Bytes, Vec[Bytes], Ctor, Vec[ViaDecl], Vec[ImplDecl], Vec[FnDecl]);
+type InherentImplDecl = IID(Vec[Bytes], TypeRef, Vec[FnDecl]);  // DN-103: impl-level type-param slot first
+type LowerRhs = LRExpr(Expr) | LRImpl(ImplDecl);
+type LowerDecl = LD(Bytes, Vec[Bytes], LowerRhs);
+type DeriveDecl = DD(Bytes, TypeRef);
+type Item =
+    Use(UsePath)
+  | Default(Paradigm)
+  | Type(TypeDecl)
+  | Trait(TraitDecl)
+  | Impl(ImplDecl)
+  | Fn(FnDecl)
+  | Object(ObjectDecl)
+  | Lower(LowerDecl)
+  | Derive(DeriveDecl)
+  | InherentImpl(InherentImplDecl);
+type Nodule = Nd(Path, Bool, Vec[Item]);
+type Phylum = Phy(Option[Path], Vec[Nodule]);
+type Literal =
+    Bin(Bytes)
+  | Trit(Bytes)
+  | Int(Binary{64})
+  | AmbientInt(Paradigm, Binary{64})
+  | List(Vec[Expr])
+  | LBytes(Bytes)
+  | Str(Bytes)
+  | LFloat(Bytes);
+type Pattern =
+    PWildcard
+  | PLit(Literal)
+  | PCtor(Bytes, Vec[Pattern])
+  | PIdent(Bytes)
+  | PTuple(Vec[Pattern])
+  | POr(Vec[Pattern]);
+type Arm = Ar(Pattern, Expr);
+type Hypha = Hy(Option[Expr], Expr);
+type Expr =
+    Let(Bytes, Option[TypeRef], Expr, Expr)
+  | If(Expr, Expr, Expr)
+  | Match(Expr, Vec[Arm])
+  | For(Bytes, Expr, Bytes, Expr, Expr)
+  | Swap(Expr, TypeRef, Path)
+  | WithParadigm(Paradigm, Expr)
+  | Wild(Expr)
+  | Spore(Expr)
+  | Wrapping(Expr)
+  | Consume(Expr)
+  // DN-102 (M-1025 ENB-2): the `?` try-operator node. REPRESENTED + traversed here (like
+  // `Wrapping`/`Consume`), but the self-hosted lexer/parser does NOT yet PRODUCE it — the Rust
+  // reference frontend does (ast.rs::Expr::Try), and `myc check` (Rust-backed) handles `?` in a
+  // `.myc` file. Represented-not-produced (never-silent, G2; FLAG-try-3).
+  | Try(Expr)
+  | Colony(Vec[Hypha])
+  | Lambda(Vec[Param], Expr)
+  | App(Expr, Vec[Expr])
+  | Fuse(Expr, Expr)
+  | Reclaim(Expr, Expr)
+  | Path(Path)
+  | Lit(Literal)
+  | Ascribe(Expr, TypeRef)
+  | TupleLit(Vec[Expr]);
+
+// ── numeric constants + decimal-formatting helpers ────────────────────────────────────────────────
+// No int-to-decimal-string primitive exists in this surface (confirmed against `compiler.ast`'s own
+// FLAG-ast-7: `WidthRef`'s Display was left unported for exactly this reason). `expand_to_source`
+// genuinely needs one (widths/dims/sparsity-k/depth-limit/`Literal::Int` all render as decimal text),
+// so it is built here from `div_u`/`rem_u`/`bytes_slice` (all confirmed-available prims) over a
+// literal `"0123456789"` digit table — sliced 1 byte at a time (never *synthesizing* a Bytes value
+// from a bare Binary{8}, which this surface cannot do; only ever slicing an EXISTING Bytes buffer).
+fn zero32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_0000;
+fn one32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_0001;
+fn three32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_0011;
+fn ten32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+fn zero64() => Binary{64} = 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000;
+fn ten64() => Binary{64} = 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_1010;
+
+fn empty_bytes() => Bytes = "";
+
+fn digit_table() => Bytes = "0123456789";
+
+fn digit_bytes(d: Binary{32}) => Bytes =
+  bytes_slice(digit_table(), d, add_u(d, one32()));
+
+fn join_bytes(xs: Vec[Bytes]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => bytes_concat(h, join_bytes(rest)) };
+
+fn u32_to_dec_acc(n: Binary{32}, acc: Vec[Bytes]) => Vec[Bytes] =
+  match eq(n, zero32()) {
+    0b1 => acc,
+    _ => u32_to_dec_acc(div_u(n, ten32()), Cons(digit_bytes(rem_u(n, ten32())), acc))
+  };
+
+// u32_to_dec: decimal-render a Binary{32} (widths/dims/sparsity-k/the depth limit). Grounded
+// (`Empirical`): the digit order falls out of prepending each new (more-significant) digit to the
+// front of the accumulator as the value shrinks — no explicit reversal step is needed (verified
+// during authoring against `u32_to_dec(0b...1111011)` (123) => "123").
+fn u32_to_dec(n: Binary{32}) => Bytes =
+  match eq(n, zero32()) { 0b1 => "0", _ => join_bytes(u32_to_dec_acc(n, Nil)) };
+
+fn u64_to_dec_acc(n: Binary{64}, acc: Vec[Bytes]) => Vec[Bytes] =
+  match eq(n, zero64()) {
+    0b1 => acc,
+    _ => u64_to_dec_acc(div_u(n, ten64()), Cons(digit_bytes(width_cast(rem_u(n, ten64()), zero32())), acc))
+  };
+
+// u64_to_dec: decimal-render a Binary{64} (`Literal::Int`/`AmbientInt` payloads).
+fn u64_to_dec(n: Binary{64}) => Bytes =
+  match eq(n, zero64()) { 0b1 => "0", _ => join_bytes(u64_to_dec_acc(n, Nil)) };
+
+// ── byte constants + string re-escaping (mirrors `escape_string_literal`; M-910/M-911 discipline) ──
+fn backslash_b() => Binary{8} = 0b0101_1100;
+fn quote_b() => Binary{8} = 0b0010_0010;
+fn nl_b() => Binary{8} = 0b0000_1010;
+fn tab_b() => Binary{8} = 0b0000_1001;
+fn cr_b() => Binary{8} = 0b0000_1101;
+fn nul_b() => Binary{8} = 0b0000_0000;
+
+// escape_string_literal_acc: walks `s` BYTE-by-byte (never char-by-char — this surface has no
+// codepoint-aware iteration), re-escaping the same minimal set `Lexer::lex_string` decodes. Every
+// OTHER byte (including every byte of a multi-byte UTF-8 sequence, which is never equal to any of
+// the ASCII control bytes checked below) is passed through via a 1-byte SLICE of `s` itself — this
+// surface has no "synthesize a Bytes from an arbitrary Binary{8}" primitive, so passthrough must
+// slice the byte from an EXISTING buffer rather than reconstruct it (the same reasoning
+// `digit_bytes` above relies on for the KNOWN 0-9 range).
+fn escape_string_literal_acc(s: Bytes, i: Binary{32}, len: Binary{32}, acc: Bytes) => Bytes =
+  match lt(i, len) {
+    0b1 =>
+      let b = bytes_get(s, i) in
+      match eq(b, backslash_b()) {
+        0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\\\")),
+        _ => match eq(b, quote_b()) {
+          0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\\"")),
+          _ => match eq(b, nl_b()) {
+            0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\n")),
+            _ => match eq(b, tab_b()) {
+              0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\t")),
+              _ => match eq(b, cr_b()) {
+                0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\r")),
+                _ => match eq(b, nul_b()) {
+                  0b1 => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, "\\0")),
+                  _ => escape_string_literal_acc(s, add_u(i, one32()), len, bytes_concat(acc, bytes_slice(s, i, add_u(i, one32()))))
+                }
+              }
+            }
+          }
+        }
+      },
+    _ => acc
+  };
+
+fn escape_string_literal(s: Bytes) => Bytes =
+  escape_string_literal_acc(s, zero32(), bytes_len(s), empty_bytes());
+
+// ── line-splitting + re-indentation (mirrors `print_object_decl`'s per-member `.lines()` re-indent) ─
+fn split_lines_acc(s: Bytes, i: Binary{32}, start: Binary{32}, len: Binary{32}, acc: Vec[Bytes]) => Vec[Bytes] =
+  match lt(i, len) {
+    0b1 => match eq(bytes_get(s, i), nl_b()) {
+      0b1 => split_lines_acc(s, add_u(i, one32()), add_u(i, one32()), len, Cons(bytes_slice(s, start, i), acc)),
+      _ => split_lines_acc(s, add_u(i, one32()), start, len, acc)
+    },
+    _ => match eq(start, len) {
+      // Ended exactly at a newline: no trailing partial line (mirrors Rust `str::lines`).
+      0b1 => rev_acc(acc, Nil : Vec[Bytes]),
+      _ => rev_acc(Cons(bytes_slice(s, start, len), acc), Nil : Vec[Bytes])
+    }
+  };
+
+fn split_lines(s: Bytes) => Vec[Bytes] =
+  split_lines_acc(s, zero32(), zero32(), bytes_len(s), Nil);
+
+fn indent_lines_acc(prefix: Bytes, lines: Vec[Bytes], acc: Bytes) => Bytes =
+  match lines {
+    Nil => acc,
+    Cons(h, rest) => indent_lines_acc(prefix, rest, bytes_concat(acc, bytes_concat(prefix, bytes_concat(h, "\n"))))
+  };
+
+// indent_lines: re-indent every line of `text` by `prefix`, one trailing "\n" each (matches Rust's
+// `for line in text.lines() { s.push_str(&format!("{prefix}{line}\n")); }`).
+fn indent_lines(prefix: Bytes, text: Bytes) => Bytes =
+  indent_lines_acc(prefix, split_lines(text), empty_bytes());
+
+fn ends_with_nl(s: Bytes) => Bool =
+  match eq(bytes_len(s), zero32()) {
+    0b1 => False,
+    _ => match eq(bytes_get(s, sub_u(bytes_len(s), one32())), nl_b()) { 0b1 => True, _ => False }
+  };
+
+fn strip_suffix_nl(s: Bytes) => Bytes =
+  bytes_slice(s, zero32(), sub_u(bytes_len(s), one32()));
+
+// trim_end_nl: mirrors `str::trim_end` as used on `print_impl_decl`'s output inside `print_lower_decl`
+// — that output always ends in exactly one "\n" (never other trailing whitespace), so stripping just
+// that one trailing byte is the faithful equivalent here.
+fn trim_end_nl(s: Bytes) => Bytes =
+  match ends_with_nl(s) { True => strip_suffix_nl(s), False => s };
+
+// join_bytes_list: comma/sep-join a Vec[Bytes] (type-param name lists, `object`/`type` params).
+fn join_bytes_list(sep: Bytes, xs: Vec[Bytes]) => Bytes =
+  match xs {
+    Nil => empty_bytes(),
+    Cons(h, rest) => match rest {
+      Nil => h,
+      Cons(_, _) => bytes_concat(h, bytes_concat(sep, join_bytes_list(sep, rest)))
+    }
+  };
+
+// ── AmbientError / ResolutionNote / Resolved (mirrors ambient.rs's public surface types) ─────────
+type AmbientError =
+    MultipleDefaults(Paradigm, Paradigm)
+  | UnresolvedAmbient(Bytes)
+  | ParadigmShapeMismatch(Bytes, Paradigm, Bytes)
+  | BareDecimalNoEncoding(Bytes, Paradigm)
+  | DepthExceeded(Bytes, Binary{32});
+
+// ambient_error_kind: a 5-way classification code (FLAG-ambient-3 — message TEXT is not ported).
+fn ambient_error_kind(e: AmbientError) => Binary{32} =
+  match e {
+    MultipleDefaults(_, _) => 0b0000_0000_0000_0000_0000_0000_0000_0001,
+    UnresolvedAmbient(_) => 0b0000_0000_0000_0000_0000_0000_0000_0010,
+    ParadigmShapeMismatch(_, _, _) => 0b0000_0000_0000_0000_0000_0000_0000_0011,
+    BareDecimalNoEncoding(_, _) => 0b0000_0000_0000_0000_0000_0000_0000_0100,
+    DepthExceeded(_, _) => 0b0000_0000_0000_0000_0000_0000_0000_0101
+  };
+
+// ResolutionNote / Resolved: kept as real types (a caller can hold/inspect a `Resolved` value); the
+// FLAG-ambient-2 narrowing is that `resolve_report` always returns `notes = Nil` (never populated).
+type ResolutionNote = RNote(Bytes, Paradigm, Bytes);
+type Resolved = Rsv(Nodule, Vec[ResolutionNote]);
+
+// ── depth budget (mirrors `MAX_AMBIENT_DEPTH` / `Resolver::enter_depth`, banked guard 4/A4-02) ────
+fn max_ambient_depth() => Binary{32} = 0b0000_0000_0000_0000_0001_0000_0000_0000; // 4096
+
+fn enter_depth(site: Bytes, depth: Binary{32}) => Result[Binary{32}, AmbientError] =
+  let d2 = add_u(depth, one32()) in
+  match lt(max_ambient_depth(), d2) {
+    0b1 => Err(DepthExceeded(site, max_ambient_depth())),
+    _ => Ok(d2)
+  };
+
+// ── fill_repr (mirrors `fill_repr`: fill a paradigm-less `{params}` or refuse a shape mismatch) ───
+fn mismatch_detail_size() => Bytes = "this paradigm takes a single size `{N}`";
+fn mismatch_detail_dense() => Bytes = "`Dense` takes `{dim, scalar}`";
+fn mismatch_detail_vsa() => Bytes = "`VSA` takes `{model, dim, sparsity}`";
+
+fn fill_repr(site: Bytes, p: Paradigm, params: AmbientParams) => Result[BaseType, AmbientError] =
+  match p {
+    PBinary => match params {
+      APSize(n) => Ok(KwBinary(WLit(n))),
+      _ => Err(ParadigmShapeMismatch(site, p, mismatch_detail_size()))
+    },
+    PTernary => match params {
+      APSize(n) => Ok(KwTernary(WLit(n))),
+      _ => Err(ParadigmShapeMismatch(site, p, mismatch_detail_size()))
+    },
+    PDense => match params {
+      APDense(d, s) => Ok(KwDense(d, s)),
+      _ => Err(ParadigmShapeMismatch(site, p, mismatch_detail_dense()))
+    },
+    PVsa => match params {
+      APVsa(model, dim, sparsity) => Ok(Vsa(model, dim, sparsity)),
+      _ => Err(ParadigmShapeMismatch(site, p, mismatch_detail_vsa()))
+    }
+  };
+
+// ── resolver core: TypeRef / BaseType (mirrors `Resolver::type_ref`) ───────────────────────────────
+fn resolve_type_ref(amb: Option[Paradigm], site: Bytes, t: TypeRef, depth: Binary{32}) => Result[TypeRef, AmbientError] =
+  match enter_depth(site, depth) {
+    Err(e) => Err(e),
+    Ok(d2) => match t {
+      TR(base, guarantee) => match resolve_base_type(amb, site, base, d2) {
+        Err(e) => Err(e),
+        Ok(base2) => Ok(TR(base2, guarantee))
+      }
+    }
+  };
+
+fn resolve_base_type(amb: Option[Paradigm], site: Bytes, b: BaseType, depth: Binary{32}) => Result[BaseType, AmbientError] =
+  match b {
+    Ambient(params) => match amb {
+      None => Err(UnresolvedAmbient(site)),
+      Some(p) => fill_repr(site, p, params)
+    },
+    Named(name, args) => match resolve_typeref_list(amb, site, args, depth) {
+      Err(e) => Err(e),
+      Ok(args2) => Ok(Named(name, args2))
+    },
+    FnArrow(arg, ret) => match resolve_type_ref(amb, site, arg, depth) {
+      Err(e) => Err(e),
+      Ok(arg2) => match resolve_type_ref(amb, site, ret, depth) {
+        Err(e) => Err(e),
+        Ok(ret2) => Ok(FnArrow(arg2, ret2))
+      }
+    },
+    _ => Ok(b)
+  };
+
+fn resolve_typeref_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[TypeRef], depth: Binary{32}, acc: Vec[TypeRef]) => Result[Vec[TypeRef], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[TypeRef])),
+    Cons(h, rest) => match resolve_type_ref(amb, site, h, depth) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_typeref_list_acc(amb, site, rest, depth, Cons(h2, acc))
+    }
+  };
+
+fn resolve_typeref_list(amb: Option[Paradigm], site: Bytes, xs: Vec[TypeRef], depth: Binary{32}) => Result[Vec[TypeRef], AmbientError] =
+  resolve_typeref_list_acc(amb, site, xs, depth, Nil);
+
+fn resolve_typeref_opt(amb: Option[Paradigm], site: Bytes, t: Option[TypeRef], depth: Binary{32}) => Result[Option[TypeRef], AmbientError] =
+  match t {
+    None => Ok(None),
+    Some(x) => match resolve_type_ref(amb, site, x, depth) { Err(e) => Err(e), Ok(x2) => Ok(Some(x2)) }
+  };
+
+// ── resolver core: Literal / Pattern (mirrors `Resolver::literal` / `Resolver::pattern`) ──────────
+fn resolve_literal(amb: Option[Paradigm], site: Bytes, l: Literal, depth: Binary{32}) => Result[Literal, AmbientError] =
+  match l {
+    Int(v) => match amb {
+      None => Ok(Int(v)),
+      Some(p) => match p {
+        PBinary => Ok(AmbientInt(PBinary, v)),
+        PTernary => Ok(AmbientInt(PTernary, v)),
+        PDense => Err(BareDecimalNoEncoding(site, PDense)),
+        PVsa => Err(BareDecimalNoEncoding(site, PVsa))
+      }
+    },
+    List(elems) => match resolve_expr_list(amb, site, elems, depth) {
+      Err(e) => Err(e),
+      Ok(elems2) => Ok(List(elems2))
+    },
+    _ => Ok(l)
+  };
+
+fn resolve_pattern(amb: Option[Paradigm], site: Bytes, p: Pattern, depth: Binary{32}) => Result[Pattern, AmbientError] =
+  match enter_depth(site, depth) {
+    Err(e) => Err(e),
+    Ok(d2) => match p {
+      PWildcard => Ok(p),
+      PLit(l) => match resolve_literal(amb, site, l, d2) { Err(e) => Err(e), Ok(l2) => Ok(PLit(l2)) },
+      PCtor(name, subs) => match resolve_pattern_list(amb, site, subs, d2) { Err(e) => Err(e), Ok(subs2) => Ok(PCtor(name, subs2)) },
+      PIdent(name) => Ok(p),
+      PTuple(subs) => match resolve_pattern_list(amb, site, subs, d2) { Err(e) => Err(e), Ok(subs2) => Ok(PTuple(subs2)) },
+      POr(alts) => match resolve_pattern_list(amb, site, alts, d2) { Err(e) => Err(e), Ok(alts2) => Ok(POr(alts2)) }
+    }
+  };
+
+fn resolve_pattern_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Pattern], depth: Binary{32}, acc: Vec[Pattern]) => Result[Vec[Pattern], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Pattern])),
+    Cons(h, rest) => match resolve_pattern(amb, site, h, depth) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_pattern_list_acc(amb, site, rest, depth, Cons(h2, acc))
+    }
+  };
+
+fn resolve_pattern_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Pattern], depth: Binary{32}) => Result[Vec[Pattern], AmbientError] =
+  resolve_pattern_list_acc(amb, site, xs, depth, Nil);
+
+// ── resolver core: Expr (mirrors `Resolver::expr`) ─────────────────────────────────────────────────
+fn resolve_expr(amb: Option[Paradigm], site: Bytes, e: Expr, depth: Binary{32}) => Result[Expr, AmbientError] =
+  match enter_depth(site, depth) {
+    Err(er) => Err(er),
+    Ok(d2) => match e {
+      WithParadigm(par, body) => resolve_expr(Some(par), site, body, d2),
+      Lit(l) => match resolve_literal(amb, site, l, d2) { Err(er) => Err(er), Ok(l2) => Ok(Lit(l2)) },
+      Path(p) => Ok(Path(p)),
+      Let(name, ty, bound, body) => match resolve_typeref_opt(amb, site, ty, d2) {
+        Err(er) => Err(er),
+        Ok(ty2) => match resolve_expr(amb, site, bound, d2) {
+          Err(er) => Err(er),
+          Ok(bound2) => match resolve_expr(amb, site, body, d2) {
+            Err(er) => Err(er),
+            Ok(body2) => Ok(Let(name, ty2, bound2, body2))
+          }
+        }
+      },
+      If(cond, conseq, alt) => match resolve_expr(amb, site, cond, d2) {
+        Err(er) => Err(er),
+        Ok(cond2) => match resolve_expr(amb, site, conseq, d2) {
+          Err(er) => Err(er),
+          Ok(conseq2) => match resolve_expr(amb, site, alt, d2) {
+            Err(er) => Err(er),
+            Ok(alt2) => Ok(If(cond2, conseq2, alt2))
+          }
+        }
+      },
+      Match(scrutinee, arms) => match resolve_expr(amb, site, scrutinee, d2) {
+        Err(er) => Err(er),
+        Ok(scrutinee2) => match resolve_arm_list(amb, site, arms, d2) {
+          Err(er) => Err(er),
+          Ok(arms2) => Ok(Match(scrutinee2, arms2))
+        }
+      },
+      For(x, xs, acc, init, body) => match resolve_expr(amb, site, xs, d2) {
+        Err(er) => Err(er),
+        Ok(xs2) => match resolve_expr(amb, site, init, d2) {
+          Err(er) => Err(er),
+          Ok(init2) => match resolve_expr(amb, site, body, d2) {
+            Err(er) => Err(er),
+            Ok(body2) => Ok(For(x, xs2, acc, init2, body2))
+          }
+        }
+      },
+      Swap(value, target, pol) => match resolve_expr(amb, site, value, d2) {
+        Err(er) => Err(er),
+        Ok(value2) => match resolve_type_ref(amb, site, target, d2) {
+          Err(er) => Err(er),
+          Ok(target2) => Ok(Swap(value2, target2, pol))
+        }
+      },
+      // `wild` is the audited/opaque FFI escape (M-661): NOT descended into (mirrors ambient.rs's
+      // own comment: descending would rewrite/refuse inside a body that should stay opaque/trusted).
+      Wild(b) => Ok(Wild(b)),
+      Spore(b) => match resolve_expr(amb, site, b, d2) { Err(er) => Err(er), Ok(b2) => Ok(Spore(b2)) },
+      Wrapping(b) => match resolve_expr(amb, site, b, d2) { Err(er) => Err(er), Ok(b2) => Ok(Wrapping(b2)) },
+      Consume(b) => match resolve_expr(amb, site, b, d2) { Err(er) => Err(er), Ok(b2) => Ok(Consume(b2)) },
+      Try(b) => match resolve_expr(amb, site, b, d2) { Err(er) => Err(er), Ok(b2) => Ok(Try(b2)) },
+      Lambda(params, body) => match resolve_expr(amb, site, body, d2) { Err(er) => Err(er), Ok(body2) => Ok(Lambda(params, body2)) },
+      Colony(hyphae) => match resolve_hypha_list(amb, site, hyphae, d2) { Err(er) => Err(er), Ok(hyphae2) => Ok(Colony(hyphae2)) },
+      App(head, args) => match resolve_expr(amb, site, head, d2) {
+        Err(er) => Err(er),
+        Ok(head2) => match resolve_expr_list(amb, site, args, d2) {
+          Err(er) => Err(er),
+          Ok(args2) => Ok(App(head2, args2))
+        }
+      },
+      Ascribe(inner, t) => match resolve_expr(amb, site, inner, d2) {
+        Err(er) => Err(er),
+        Ok(inner2) => match resolve_type_ref(amb, site, t, d2) {
+          Err(er) => Err(er),
+          Ok(t2) => Ok(Ascribe(inner2, t2))
+        }
+      },
+      Fuse(left, right) => match resolve_expr(amb, site, left, d2) {
+        Err(er) => Err(er),
+        Ok(left2) => match resolve_expr(amb, site, right, d2) {
+          Err(er) => Err(er),
+          Ok(right2) => Ok(Fuse(left2, right2))
+        }
+      },
+      Reclaim(pol, body) => match resolve_expr(amb, site, pol, d2) {
+        Err(er) => Err(er),
+        Ok(pol2) => match resolve_expr(amb, site, body, d2) {
+          Err(er) => Err(er),
+          Ok(body2) => Ok(Reclaim(pol2, body2))
+        }
+      },
+      TupleLit(elems) => match resolve_expr_list(amb, site, elems, d2) { Err(er) => Err(er), Ok(elems2) => Ok(TupleLit(elems2)) }
+    }
+  };
+
+fn resolve_expr_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Expr], depth: Binary{32}, acc: Vec[Expr]) => Result[Vec[Expr], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Expr])),
+    Cons(h, rest) => match resolve_expr(amb, site, h, depth) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_expr_list_acc(amb, site, rest, depth, Cons(h2, acc))
+    }
+  };
+
+fn resolve_expr_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Expr], depth: Binary{32}) => Result[Vec[Expr], AmbientError] =
+  resolve_expr_list_acc(amb, site, xs, depth, Nil);
+
+fn resolve_expr_opt(amb: Option[Paradigm], site: Bytes, e: Option[Expr], depth: Binary{32}) => Result[Option[Expr], AmbientError] =
+  match e {
+    None => Ok(None),
+    Some(x) => match resolve_expr(amb, site, x, depth) { Err(er) => Err(er), Ok(x2) => Ok(Some(x2)) }
+  };
+
+fn resolve_arm(amb: Option[Paradigm], site: Bytes, a: Arm, depth: Binary{32}) => Result[Arm, AmbientError] =
+  match a {
+    Ar(pattern, body) => match resolve_pattern(amb, site, pattern, depth) {
+      Err(e) => Err(e),
+      Ok(pattern2) => match resolve_expr(amb, site, body, depth) {
+        Err(e) => Err(e),
+        Ok(body2) => Ok(Ar(pattern2, body2))
+      }
+    }
+  };
+
+fn resolve_arm_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Arm], depth: Binary{32}, acc: Vec[Arm]) => Result[Vec[Arm], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Arm])),
+    Cons(h, rest) => match resolve_arm(amb, site, h, depth) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_arm_list_acc(amb, site, rest, depth, Cons(h2, acc))
+    }
+  };
+
+fn resolve_arm_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Arm], depth: Binary{32}) => Result[Vec[Arm], AmbientError] =
+  resolve_arm_list_acc(amb, site, xs, depth, Nil);
+
+// resolve_hypha: M-906 (DN-70 D1) — a hypha's optional `@forage(policy)` resolves under the same
+// ambient as its body (no new ambient frame).
+fn resolve_hypha(amb: Option[Paradigm], site: Bytes, h: Hypha, depth: Binary{32}) => Result[Hypha, AmbientError] =
+  match h {
+    Hy(frg, body) => match resolve_expr_opt(amb, site, frg, depth) {
+      Err(e) => Err(e),
+      Ok(frg2) => match resolve_expr(amb, site, body, depth) {
+        Err(e) => Err(e),
+        Ok(body2) => Ok(Hy(frg2, body2))
+      }
+    }
+  };
+
+fn resolve_hypha_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Hypha], depth: Binary{32}, acc: Vec[Hypha]) => Result[Vec[Hypha], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Hypha])),
+    Cons(h, rest) => match resolve_hypha(amb, site, h, depth) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_hypha_list_acc(amb, site, rest, depth, Cons(h2, acc))
+    }
+  };
+
+fn resolve_hypha_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Hypha], depth: Binary{32}) => Result[Vec[Hypha], AmbientError] =
+  resolve_hypha_list_acc(amb, site, xs, depth, Nil);
+
+// ── resolver core: FnSig / Param (mirrors `Resolver::fn_sig`) ──────────────────────────────────────
+fn resolve_param(amb: Option[Paradigm], site: Bytes, p: Param) => Result[Param, AmbientError] =
+  match p {
+    Prm(name, ty) => match resolve_type_ref(amb, site, ty, zero32()) {
+      Err(e) => Err(e),
+      Ok(ty2) => Ok(Prm(name, ty2))
+    }
+  };
+
+fn resolve_param_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Param], acc: Vec[Param]) => Result[Vec[Param], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Param])),
+    Cons(h, rest) => match resolve_param(amb, site, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_param_list_acc(amb, site, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_param_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Param]) => Result[Vec[Param], AmbientError] =
+  resolve_param_list_acc(amb, site, xs, Nil);
+
+fn resolve_fn_sig(amb: Option[Paradigm], s: FnSig) => Result[FnSig, AmbientError] =
+  match s {
+    FS(name, params, value_params, ret, effects, budgets) => match resolve_param_list(amb, name, value_params) {
+      Err(e) => Err(e),
+      Ok(vparams2) => match resolve_type_ref(amb, name, ret, zero32()) {
+        Err(e) => Err(e),
+        Ok(ret2) => Ok(FS(name, params, vparams2, ret2, effects, budgets))
+      }
+    }
+  };
+
+fn resolve_fnsig_list_acc(amb: Option[Paradigm], xs: Vec[FnSig], acc: Vec[FnSig]) => Result[Vec[FnSig], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[FnSig])),
+    Cons(h, rest) => match resolve_fn_sig(amb, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_fnsig_list_acc(amb, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_fnsig_list(amb: Option[Paradigm], xs: Vec[FnSig]) => Result[Vec[FnSig], AmbientError] =
+  resolve_fnsig_list_acc(amb, xs, Nil);
+
+// ── resolver core: Ctor / TypeDecl / TraitDecl ─────────────────────────────────────────────────────
+fn resolve_ctor(amb: Option[Paradigm], site: Bytes, c: Ctor) => Result[Ctor, AmbientError] =
+  match c {
+    Ctr(name, fields, sealed) => match resolve_typeref_list(amb, site, fields, zero32()) {
+      Err(e) => Err(e),
+      // M-1027 / DN-104: the `priv` seal is surface metadata, untouched by ambient resolution.
+      Ok(fields2) => Ok(Ctr(name, fields2, sealed))
+    }
+  };
+
+fn resolve_ctor_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[Ctor], acc: Vec[Ctor]) => Result[Vec[Ctor], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Ctor])),
+    Cons(h, rest) => match resolve_ctor(amb, site, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_ctor_list_acc(amb, site, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_ctor_list(amb: Option[Paradigm], site: Bytes, xs: Vec[Ctor]) => Result[Vec[Ctor], AmbientError] =
+  resolve_ctor_list_acc(amb, site, xs, Nil);
+
+fn resolve_type_decl(amb: Option[Paradigm], td: TypeDecl) => Result[TypeDecl, AmbientError] =
+  match td {
+    TD(vis, name, params, ctors) => match resolve_ctor_list(amb, name, ctors) {
+      Err(e) => Err(e),
+      Ok(ctors2) => Ok(TD(vis, name, params, ctors2))
+    }
+  };
+
+fn resolve_trait_decl(amb: Option[Paradigm], td: TraitDecl) => Result[TraitDecl, AmbientError] =
+  match td {
+    TrD(vis, name, params, sigs) => match resolve_fnsig_list(amb, sigs) {
+      Err(e) => Err(e),
+      Ok(sigs2) => Ok(TrD(vis, name, params, sigs2))
+    }
+  };
+
+// ── resolver core: FnDecl / ImplDecl / InherentImplDecl / ViaDecl / ObjectDecl ─────────────────────
+fn resolve_fndecl(amb: Option[Paradigm], f: FnDecl) => Result[FnDecl, AmbientError] =
+  match f {
+    FD(vis, thw, tr_opt, sig, body) => match resolve_fn_sig(amb, sig) {
+      Err(e) => Err(e),
+      Ok(sig2) => match sig2 {
+        FS(name, _, _, _, _, _) => match resolve_expr(amb, name, body, zero32()) {
+          Err(e) => Err(e),
+          Ok(body2) => Ok(FD(vis, thw, tr_opt, sig2, body2))
+        }
+      }
+    }
+  };
+
+fn resolve_fndecl_list_acc(amb: Option[Paradigm], xs: Vec[FnDecl], acc: Vec[FnDecl]) => Result[Vec[FnDecl], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[FnDecl])),
+    Cons(h, rest) => match resolve_fndecl(amb, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_fndecl_list_acc(amb, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_fndecl_list(amb: Option[Paradigm], xs: Vec[FnDecl]) => Result[Vec[FnDecl], AmbientError] =
+  resolve_fndecl_list_acc(amb, xs, Nil);
+
+fn resolve_impl_decl(amb: Option[Paradigm], id: ImplDecl) => Result[ImplDecl, AmbientError] =
+  match id {
+    ImD(trait_name, trait_args, for_ty, methods) => match resolve_typeref_list(amb, trait_name, trait_args, zero32()) {
+      Err(e) => Err(e),
+      Ok(trait_args2) => match resolve_type_ref(amb, trait_name, for_ty, zero32()) {
+        Err(e) => Err(e),
+        Ok(for_ty2) => match resolve_fndecl_list(amb, methods) {
+          Err(e) => Err(e),
+          Ok(methods2) => Ok(ImD(trait_name, trait_args2, for_ty2, methods2))
+        }
+      }
+    }
+  };
+
+fn resolve_impldecl_list_acc(amb: Option[Paradigm], xs: Vec[ImplDecl], acc: Vec[ImplDecl]) => Result[Vec[ImplDecl], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[ImplDecl])),
+    Cons(h, rest) => match resolve_impl_decl(amb, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_impldecl_list_acc(amb, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_impldecl_list(amb: Option[Paradigm], xs: Vec[ImplDecl]) => Result[Vec[ImplDecl], AmbientError] =
+  resolve_impldecl_list_acc(amb, xs, Nil);
+
+fn resolve_inherent_impl_decl(amb: Option[Paradigm], i: InherentImplDecl) => Result[InherentImplDecl, AmbientError] =
+  match i {
+    IID(params, for_ty, methods) => match resolve_type_ref(amb, "impl", for_ty, zero32()) {
+      Err(e) => Err(e),
+      Ok(for_ty2) => match resolve_fndecl_list(amb, methods) {
+        Err(e) => Err(e),
+        Ok(methods2) => Ok(IID(params, for_ty2, methods2))  // DN-103: params are inert here, carried through
+      }
+    }
+  };
+
+fn resolve_viadecl(amb: Option[Paradigm], site: Bytes, v: ViaDecl) => Result[ViaDecl, AmbientError] =
+  match v {
+    VD(idx, name, args) => match resolve_typeref_list(amb, site, args, zero32()) {
+      Err(e) => Err(e),
+      Ok(args2) => Ok(VD(idx, name, args2))
+    }
+  };
+
+fn resolve_viadecl_list_acc(amb: Option[Paradigm], site: Bytes, xs: Vec[ViaDecl], acc: Vec[ViaDecl]) => Result[Vec[ViaDecl], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[ViaDecl])),
+    Cons(h, rest) => match resolve_viadecl(amb, site, h) {
+      Err(e) => Err(e),
+      Ok(h2) => resolve_viadecl_list_acc(amb, site, rest, Cons(h2, acc))
+    }
+  };
+
+fn resolve_viadecl_list(amb: Option[Paradigm], site: Bytes, xs: Vec[ViaDecl]) => Result[Vec[ViaDecl], AmbientError] =
+  resolve_viadecl_list_acc(amb, site, xs, Nil);
+
+fn resolve_object_decl(amb: Option[Paradigm], od: ObjectDecl) => Result[ObjectDecl, AmbientError] =
+  match od {
+    OD(vis, name, params, ctor, via_decls, impls, fns) => match resolve_ctor(amb, name, ctor) {
+      Err(e) => Err(e),
+      Ok(ctor2) => match resolve_viadecl_list(amb, name, via_decls) {
+        Err(e) => Err(e),
+        Ok(via2) => match resolve_impldecl_list(amb, impls) {
+          Err(e) => Err(e),
+          Ok(impls2) => match resolve_fndecl_list(amb, fns) {
+            Err(e) => Err(e),
+            Ok(fns2) => Ok(OD(vis, name, params, ctor2, via2, impls2, fns2))
+          }
+        }
+      }
+    }
+  };
+
+// ── resolver top level: Item / Nodule (mirrors `resolve_report_inner`) ─────────────────────────────
+fn resolve_item(default_p: Option[Paradigm], i: Item) => Result[Option[Item], AmbientError] =
+  match i {
+    // The default declaration is consumed (metadata for resolution, not a runtime item).
+    Default(_) => Ok(None),
+    Use(u) => Ok(Some(Use(u))),
+    Type(td) => match resolve_type_decl(default_p, td) { Err(e) => Err(e), Ok(td2) => Ok(Some(Type(td2))) },
+    Trait(td) => match resolve_trait_decl(default_p, td) { Err(e) => Err(e), Ok(td2) => Ok(Some(Trait(td2))) },
+    Impl(id) => match resolve_impl_decl(default_p, id) { Err(e) => Err(e), Ok(id2) => Ok(Some(Impl(id2))) },
+    Fn(fd) => match resolve_fndecl(default_p, fd) { Err(e) => Err(e), Ok(fd2) => Ok(Some(Fn(fd2))) },
+    Object(od) => match resolve_object_decl(default_p, od) { Err(e) => Err(e), Ok(od2) => Ok(Some(Object(od2))) },
+    // `lower`/`derive` carry no ambient-paradigm parameters (DN-54/M-812) — pass through unchanged.
+    Lower(ld) => Ok(Some(Lower(ld))),
+    Derive(dd) => Ok(Some(Derive(dd))),
+    InherentImpl(iid) => match resolve_inherent_impl_decl(default_p, iid) { Err(e) => Err(e), Ok(iid2) => Ok(Some(InherentImpl(iid2))) }
+  };
+
+fn resolve_item_list_acc(default_p: Option[Paradigm], xs: Vec[Item], acc: Vec[Item]) => Result[Vec[Item], AmbientError] =
+  match xs {
+    Nil => Ok(rev_acc(acc, Nil : Vec[Item])),
+    Cons(h, rest) => match resolve_item(default_p, h) {
+      Err(e) => Err(e),
+      Ok(mi) => match mi {
+        None => resolve_item_list_acc(default_p, rest, acc),
+        Some(h2) => resolve_item_list_acc(default_p, rest, Cons(h2, acc))
+      }
+    }
+  };
+
+fn resolve_item_list(default_p: Option[Paradigm], xs: Vec[Item]) => Result[Vec[Item], AmbientError] =
+  resolve_item_list_acc(default_p, xs, Nil);
+
+// scan_default: the nodule-scope ambient scan — at most one `default paradigm`, else MultipleDefaults.
+fn scan_default_acc(xs: Vec[Item], found: Option[Paradigm]) => Result[Option[Paradigm], AmbientError] =
+  match xs {
+    Nil => Ok(found),
+    Cons(h, rest) => match h {
+      Default(p) => match found {
+        None => scan_default_acc(rest, Some(p)),
+        Some(first) => Err(MultipleDefaults(first, p))
+      },
+      _ => scan_default_acc(rest, found)
+    }
+  };
+
+fn scan_default(xs: Vec[Item]) => Result[Option[Paradigm], AmbientError] =
+  scan_default_acc(xs, None);
+
+// resolve_report: like `resolve`, but also returns the (FLAG-ambient-2: always-empty) notes trace.
+fn resolve_report(n: Nodule) => Result[Resolved, AmbientError] =
+  match n {
+    Nd(path, std_sys, items) => match scan_default(items) {
+      Err(e) => Err(e),
+      Ok(default_p) => match resolve_item_list(default_p, items) {
+        Err(e) => Err(e),
+        // The `@std-sys` FFI-floor marker (M-661) is carried through resolution unchanged.
+        Ok(items2) => Ok(Rsv(Nd(path, std_sys, items2), Nil))
+      }
+    }
+  };
+
+// resolve: rewrite a parsed Nodule to its longhand twin (RFC-0012 §4.3/§4.4). Identity on a program
+// that uses no ambient.
+fn resolve(n: Nodule) => Result[Nodule, AmbientError] =
+  match resolve_report(n) {
+    Err(e) => Err(e),
+    Ok(r) => match r { Rsv(nodule2, _) => Ok(nodule2) }
+  };
+
+// ── surface pretty-printer ("expand ambient" projection; mirrors the `print_*`/`DisplayBase` group) ─
+fn path_str(p: Path) => Bytes =
+  match p { Pth(segs) => join_bytes_list(".", segs) };
+
+fn pub_str(v: Vis) => Bytes =
+  match v { Private => "", Pub => "pub " };
+
+fn thaw_str(t: Bool) => Bytes =
+  match t { True => "thaw ", False => "" };
+
+fn scalar_str(s: Scalar) => Bytes =
+  match s { SF16 => "F16", SBf16 => "BF16", SF32 => "F32", SF64 => "F64" };
+
+fn paradigm_str(p: Paradigm) => Bytes =
+  match p { PBinary => "Binary", PTernary => "Ternary", PDense => "Dense", PVsa => "VSA" };
+
+fn strength_dbg(g: Strength) => Bytes =
+  match g { GExact => "Exact", GProven => "Proven", GEmpirical => "Empirical", GDeclared => "Declared" };
+
+fn sparsity_str(s: Sparsity) => Bytes =
+  match s { SpDense => "Dense", SpSparse(k) => bytes_concat("Sparse{", bytes_concat(u32_to_dec(k), "}")) };
+
+fn ambient_params_str(p: AmbientParams) => Bytes =
+  match p {
+    APSize(n) => u32_to_dec(n),
+    APDense(d, s) => bytes_concat(u32_to_dec(d), bytes_concat(", ", scalar_str(s))),
+    APVsa(model, dim, sp) => bytes_concat(model, bytes_concat(", ", bytes_concat(u32_to_dec(dim), bytes_concat(", ", sparsity_str(sp)))))
+  };
+
+fn print_widthref(w: WidthRef) => Bytes =
+  match w { WLit(n) => u32_to_dec(n), WName(v) => v };
+
+fn print_type_ref_list(xs: Vec[TypeRef]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_type_ref(h), Cons(_, _) => bytes_concat(print_type_ref(h), bytes_concat(", ", print_type_ref_list(rest))) } };
+
+fn print_base_type(b: BaseType) => Bytes =
+  match b {
+    KwBinary(w) => bytes_concat("Binary{", bytes_concat(print_widthref(w), "}")),
+    KwTernary(w) => bytes_concat("Ternary{", bytes_concat(print_widthref(w), "}")),
+    KwDense(d, s) => bytes_concat("Dense{", bytes_concat(u32_to_dec(d), bytes_concat(", ", bytes_concat(scalar_str(s), "}")))),
+    Vsa(model, dim, sp) => bytes_concat("VSA{", bytes_concat(model, bytes_concat(", ", bytes_concat(u32_to_dec(dim), bytes_concat(", ", bytes_concat(sparsity_str(sp), "}")))))),
+    KwSubstrate(t) => bytes_concat("Substrate{", bytes_concat(t, "}")),
+    KwSeq(elem, len) => bytes_concat("Seq{", bytes_concat(print_type_ref(elem), bytes_concat(", ", bytes_concat(u32_to_dec(len), "}")))),
+    KwBytes => "Bytes",
+    KwFloat => "Float",
+    Named(n, args) => match args { Nil => n, Cons(_, _) => bytes_concat(n, bytes_concat("[", bytes_concat(print_type_ref_list(args), "]"))) },
+    Ambient(params) => bytes_concat("{", bytes_concat(ambient_params_str(params), "}")),
+    // Parenthesize a function-typed LHS so `(A => B) => C` round-trips unambiguously.
+    FnArrow(arg, ret) => match arg {
+      TR(base, _) => match base {
+        FnArrow(_, _) => bytes_concat("(", bytes_concat(print_type_ref(arg), bytes_concat(") => ", print_type_ref(ret)))),
+        _ => bytes_concat(print_type_ref(arg), bytes_concat(" => ", print_type_ref(ret)))
+      }
+    },
+    Tuple(elems) => bytes_concat("(", bytes_concat(print_type_ref_list(elems), ")"))
+  };
+
+fn print_type_ref(t: TypeRef) => Bytes =
+  match t { TR(base, guarantee) => match guarantee {
+    None => print_base_type(base),
+    Some(g) => bytes_concat(print_base_type(base), bytes_concat(" @ ", strength_dbg(g)))
+  } };
+
+fn print_traitref_list(xs: Vec[TraitRef]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_trait_ref(h), Cons(_, _) => bytes_concat(print_trait_ref(h), bytes_concat(" + ", print_traitref_list(rest))) } };
+
+fn print_trait_ref(t: TraitRef) => Bytes =
+  match t { TRf(name, args) => match args { Nil => name, Cons(_, _) => bytes_concat(name, bytes_concat("[", bytes_concat(print_type_ref_list(args), "]"))) } };
+
+fn print_type_param(t: TypeParam) => Bytes =
+  match t { TP(name, _kind, bounds) => match bounds { Nil => name, Cons(_, _) => bytes_concat(name, bytes_concat(": ", print_traitref_list(bounds))) } };
+
+fn print_type_param_list(xs: Vec[TypeParam]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_type_param(h), Cons(_, _) => bytes_concat(print_type_param(h), bytes_concat(", ", print_type_param_list(rest))) } };
+
+fn filter_type_params_acc(xs: Vec[TypeParam], acc: Vec[TypeParam]) => Vec[TypeParam] =
+  match xs {
+    Nil => rev_acc(acc, Nil : Vec[TypeParam]),
+    Cons(h, rest) => match h { TP(_, kind, _) => match kind {
+      PkType => filter_type_params_acc(rest, Cons(h, acc)),
+      PkWidth => filter_type_params_acc(rest, acc)
+    } }
+  };
+
+fn filter_type_params(xs: Vec[TypeParam]) => Vec[TypeParam] = filter_type_params_acc(xs, Nil);
+
+fn filter_width_params_acc(xs: Vec[TypeParam], acc: Vec[TypeParam]) => Vec[TypeParam] =
+  match xs {
+    Nil => rev_acc(acc, Nil : Vec[TypeParam]),
+    Cons(h, rest) => match h { TP(_, kind, _) => match kind {
+      PkWidth => filter_width_params_acc(rest, Cons(h, acc)),
+      PkType => filter_width_params_acc(rest, acc)
+    } }
+  };
+
+fn filter_width_params(xs: Vec[TypeParam]) => Vec[TypeParam] = filter_width_params_acc(xs, Nil);
+
+fn print_param_list(xs: Vec[Param]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match h { Prm(name, ty) => match rest {
+    Nil => bytes_concat(name, bytes_concat(": ", print_type_ref(ty))),
+    Cons(_, _) => bytes_concat(name, bytes_concat(": ", bytes_concat(print_type_ref(ty), bytes_concat(", ", print_param_list(rest)))))
+  } } };
+
+fn print_sig_tail(s: FnSig) => Bytes =
+  match s { FS(name, params, value_params, ret, _effects, _budgets) =>
+    let tps = filter_type_params(params) in
+    let wps = filter_width_params(params) in
+    let tp = match tps { Nil => empty_bytes(), Cons(_, _) => bytes_concat("[", bytes_concat(print_type_param_list(tps), "]")) } in
+    let wp = match wps { Nil => empty_bytes(), Cons(_, _) => bytes_concat("{", bytes_concat(print_type_param_list(wps), "}")) } in
+    bytes_concat(name, bytes_concat(tp, bytes_concat(wp, bytes_concat("(", bytes_concat(print_param_list(value_params), bytes_concat(") => ", print_type_ref(ret)))))))
+  };
+
+fn print_params_brackets(xs: Vec[Bytes]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(_, _) => bytes_concat("[", bytes_concat(join_bytes_list(", ", xs), "]")) };
+
+// ── printer: Expr / Pattern / Literal ──────────────────────────────────────────────────────────────
+fn print_typeref_ann(ty: Option[TypeRef]) => Bytes =
+  match ty { None => empty_bytes(), Some(t) => bytes_concat(": ", print_type_ref(t)) };
+
+fn print_param_names(xs: Vec[Param]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match h { Prm(name, _) => match rest {
+    Nil => name,
+    Cons(_, _) => bytes_concat(name, bytes_concat(", ", print_param_names(rest)))
+  } } };
+
+fn print_expr_list(xs: Vec[Expr]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_expr(h), Cons(_, _) => bytes_concat(print_expr(h), bytes_concat(", ", print_expr_list(rest))) } };
+
+fn print_one_arm(a: Arm) => Bytes =
+  match a { Ar(pattern, body) => bytes_concat(print_pattern(pattern), bytes_concat(" => ", print_expr(body))) };
+
+fn print_arm_list(xs: Vec[Arm]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_one_arm(h), Cons(_, _) => bytes_concat(print_one_arm(h), bytes_concat(", ", print_arm_list(rest))) } };
+
+// print_one_hypha: the ORACLE's own print form drops the `@forage(policy)` annotation from the
+// rendered text (mirrored here verbatim, not a narrowing this port introduces).
+fn print_one_hypha(h: Hypha) => Bytes =
+  match h { Hy(_forage, body) => bytes_concat("hypha ", print_expr(body)) };
+
+fn print_hypha_list(xs: Vec[Hypha]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_one_hypha(h), Cons(_, _) => bytes_concat(print_one_hypha(h), bytes_concat(", ", print_hypha_list(rest))) } };
+
+fn print_expr(e: Expr) => Bytes =
+  match e {
+    Lit(l) => print_literal(l),
+    Path(p) => path_str(p),
+    Let(name, ty, bound, body) => bytes_concat("let ", bytes_concat(name, bytes_concat(print_typeref_ann(ty), bytes_concat(" = ", bytes_concat(print_expr(bound), bytes_concat(" in ", print_expr(body))))))),
+    If(cond, conseq, alt) => bytes_concat("if ", bytes_concat(print_expr(cond), bytes_concat(" then ", bytes_concat(print_expr(conseq), bytes_concat(" else ", print_expr(alt)))))),
+    Match(scrutinee, arms) => bytes_concat("match ", bytes_concat(print_expr(scrutinee), bytes_concat(" { ", bytes_concat(print_arm_list(arms), " }")))),
+    For(x, xs, acc, init, body) => bytes_concat("for ", bytes_concat(x, bytes_concat(" in ", bytes_concat(print_expr(xs), bytes_concat(", ", bytes_concat(acc, bytes_concat(" = ", bytes_concat(print_expr(init), bytes_concat(" => ", print_expr(body)))))))))),
+    Swap(value, target, pol) => bytes_concat("swap(", bytes_concat(print_expr(value), bytes_concat(", to: ", bytes_concat(print_type_ref(target), bytes_concat(", policy: ", bytes_concat(path_str(pol), ")")))))),
+    WithParadigm(par, body) => bytes_concat("with paradigm ", bytes_concat(paradigm_str(par), bytes_concat(" { ", bytes_concat(print_expr(body), " }")))),
+    Wild(b) => bytes_concat("wild { ", bytes_concat(print_expr(b), " }")),
+    Spore(b) => bytes_concat("spore(", bytes_concat(print_expr(b), ")")),
+    Wrapping(b) => bytes_concat("wrapping { ", bytes_concat(print_expr(b), " }")),
+    Consume(b) => bytes_concat("consume ", print_expr(b)),
+    Try(b) => bytes_concat(print_expr(b), "?"),
+    Lambda(params, body) => bytes_concat("lambda(", bytes_concat(print_param_names(params), bytes_concat(") => ", print_expr(body)))),
+    Colony(hyphae) => bytes_concat("colony { ", bytes_concat(print_hypha_list(hyphae), " }")),
+    App(head, args) => bytes_concat(print_expr(head), bytes_concat("(", bytes_concat(print_expr_list(args), ")"))),
+    Fuse(left, right) => bytes_concat("fuse(", bytes_concat(print_expr(left), bytes_concat(", ", bytes_concat(print_expr(right), ")")))),
+    Reclaim(pol, body) => bytes_concat("reclaim(", bytes_concat(print_expr(pol), bytes_concat(") { ", bytes_concat(print_expr(body), " }")))),
+    Ascribe(inner, t) => bytes_concat(print_expr(inner), bytes_concat(" : ", print_type_ref(t))),
+    TupleLit(elems) => bytes_concat("(", bytes_concat(print_expr_list(elems), ")"))
+  };
+
+fn print_pattern_list(xs: Vec[Pattern]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_pattern(h), Cons(_, _) => bytes_concat(print_pattern(h), bytes_concat(", ", print_pattern_list(rest))) } };
+
+fn print_pattern_or_list(xs: Vec[Pattern]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_pattern(h), Cons(_, _) => bytes_concat(print_pattern(h), bytes_concat(" | ", print_pattern_or_list(rest))) } };
+
+fn print_pattern(p: Pattern) => Bytes =
+  match p {
+    PWildcard => "_",
+    PLit(l) => print_literal(l),
+    PCtor(n, subs) => bytes_concat(n, bytes_concat("(", bytes_concat(print_pattern_list(subs), ")"))),
+    PIdent(n) => n,
+    PTuple(subs) => bytes_concat("(", bytes_concat(print_pattern_list(subs), ")")),
+    POr(alts) => print_pattern_or_list(alts)
+  };
+
+fn print_literal(l: Literal) => Bytes =
+  match l {
+    Bin(s) => bytes_concat("0b", s),
+    Trit(s) => bytes_concat("0t", s),
+    LBytes(s) => bytes_concat("0x", s),
+    Str(s) => bytes_concat("\"", bytes_concat(escape_string_literal(s), "\"")),
+    Int(i) => u64_to_dec(i),
+    LFloat(s) => s,
+    AmbientInt(p, i) => bytes_concat(u64_to_dec(i), bytes_concat(" /* ", bytes_concat(paradigm_str(p), " (width from context) */"))),
+    List(es) => bytes_concat("[", bytes_concat(print_expr_list(es), "]"))
+  };
+
+// ── printer: Item-level declarations ───────────────────────────────────────────────────────────────
+fn print_ctor(c: Ctor) => Bytes =
+  match c { Ctr(name, fields, sealed) =>
+    bytes_concat(
+      // M-1027 / DN-104 §2: a `priv`-sealed constructor renders with its leading `priv ` marker so the
+      // seal round-trips through `expand_to_source` (mirrors ambient.rs::print_type_decl).
+      match sealed { True => "priv ", False => "" },
+      match fields { Nil => name, Cons(_, _) => bytes_concat(name, bytes_concat("(", bytes_concat(print_type_ref_list(fields), ")"))) }
+    ) };
+
+fn print_ctor_list(xs: Vec[Ctor]) => Bytes =
+  match xs { Nil => empty_bytes(), Cons(h, rest) => match rest { Nil => print_ctor(h), Cons(_, _) => bytes_concat(print_ctor(h), bytes_concat(" | ", print_ctor_list(rest))) } };
+
+fn print_type_decl(td: TypeDecl) => Bytes =
+  match td { TD(vis, name, params, ctors) =>
+    bytes_concat(pub_str(vis), bytes_concat("type ", bytes_concat(name, bytes_concat(print_params_brackets(params), bytes_concat(" = ", bytes_concat(print_ctor_list(ctors), "\n"))))))
+  };
+
+fn print_fn_sig_list_lines_acc(xs: Vec[FnSig], acc: Bytes) => Bytes =
+  match xs {
+    Nil => acc,
+    Cons(h, rest) => print_fn_sig_list_lines_acc(rest, bytes_concat(acc, bytes_concat("  fn ", bytes_concat(print_sig_tail(h), ";\n"))))
+  };
+
+fn print_trait_decl(td: TraitDecl) => Bytes =
+  match td { TrD(vis, name, params, sigs) =>
+    bytes_concat(pub_str(vis), bytes_concat("trait ", bytes_concat(name, bytes_concat(print_params_brackets(params), bytes_concat(" {\n", bytes_concat(print_fn_sig_list_lines_acc(sigs, empty_bytes()), "}\n"))))))
+  };
+
+fn print_fn_decl(f: FnDecl) => Bytes =
+  match f { FD(vis, thw, _tr_opt, sig, body) =>
+    bytes_concat(pub_str(vis), bytes_concat(thaw_str(thw), bytes_concat("fn ", bytes_concat(print_sig_tail(sig), bytes_concat(" =\n  ", bytes_concat(print_expr(body), "\n"))))))
+  };
+
+// terminate_item: append the mandatory `;` component terminator (DN-57 §3, M-818) — replace a single
+// trailing "\n" with ";\n", else append a bare ";".
+fn terminate_item(item_text: Bytes) => Bytes =
+  match ends_with_nl(item_text) {
+    True => bytes_concat(strip_suffix_nl(item_text), ";\n"),
+    False => bytes_concat(item_text, ";")
+  };
+
+fn print_impldecl_methods_acc(xs: Vec[FnDecl], acc: Bytes) => Bytes =
+  match xs { Nil => acc, Cons(h, rest) => print_impldecl_methods_acc(rest, bytes_concat(acc, bytes_concat("  ", terminate_item(print_fn_decl(h))))) };
+
+fn print_impl_decl(id: ImplDecl) => Bytes =
+  match id { ImD(trait_name, trait_args, for_ty, methods) =>
+    let args = match trait_args { Nil => empty_bytes(), Cons(_, _) => bytes_concat("[", bytes_concat(print_type_ref_list(trait_args), "]")) } in
+    bytes_concat("impl ", bytes_concat(trait_name, bytes_concat(args, bytes_concat(" for ", bytes_concat(print_type_ref(for_ty), bytes_concat(" {\n", bytes_concat(print_impldecl_methods_acc(methods, empty_bytes()), "}\n")))))))
+  };
+
+fn print_inherent_impl_decl(i: InherentImplDecl) => Bytes =
+  match i { IID(params, for_ty, methods) =>
+    // DN-103: render the impl-level type-parameter slot `impl[T, …]` when present (empty ⇒ `impl `).
+    bytes_concat("impl", bytes_concat(print_params_brackets(params), bytes_concat(" ", bytes_concat(print_type_ref(for_ty), bytes_concat(" {\n", bytes_concat(print_impldecl_methods_acc(methods, empty_bytes()), "}\n"))))))
+  };
+
+fn print_via_decl(v: ViaDecl) => Bytes =
+  match v { VD(idx, name, args) =>
+    let a = match args { Nil => empty_bytes(), Cons(_, _) => bytes_concat("[", bytes_concat(print_type_ref_list(args), "]")) } in
+    bytes_concat("  via ", bytes_concat(u32_to_dec(idx), bytes_concat(" : ", bytes_concat(name, bytes_concat(a, ";\n")))))
+  };
+
+fn print_via_decl_list_acc(xs: Vec[ViaDecl], acc: Bytes) => Bytes =
+  match xs { Nil => acc, Cons(h, rest) => print_via_decl_list_acc(rest, bytes_concat(acc, print_via_decl(h))) };
+
+fn print_impl_decl_list_indented_acc(xs: Vec[ImplDecl], acc: Bytes) => Bytes =
+  match xs { Nil => acc, Cons(h, rest) => print_impl_decl_list_indented_acc(rest, bytes_concat(acc, indent_lines("  ", terminate_item(print_impl_decl(h))))) };
+
+fn print_fn_decl_list_indented_acc(xs: Vec[FnDecl], acc: Bytes) => Bytes =
+  match xs { Nil => acc, Cons(h, rest) => print_fn_decl_list_indented_acc(rest, bytes_concat(acc, indent_lines("  ", terminate_item(print_fn_decl(h))))) };
+
+fn print_object_decl(od: ObjectDecl) => Bytes =
+  match od { OD(vis, name, params, ctor, via_decls, impls, fns) =>
+    let ctor_str = match ctor { Ctr(cname, fields, _) => match fields {
+      Nil => cname,
+      Cons(_, _) => bytes_concat(cname, bytes_concat("(", bytes_concat(print_type_ref_list(fields), ")")))
+    } } in
+    let head = bytes_concat(pub_str(vis), bytes_concat("object ", bytes_concat(name, bytes_concat(print_params_brackets(params), bytes_concat(" {\n  ", bytes_concat(ctor_str, ";\n")))))) in
+    let with_via = bytes_concat(head, print_via_decl_list_acc(via_decls, empty_bytes())) in
+    let with_impls = bytes_concat(with_via, print_impl_decl_list_indented_acc(impls, empty_bytes())) in
+    let with_fns = bytes_concat(with_impls, print_fn_decl_list_indented_acc(fns, empty_bytes())) in
+    bytes_concat(with_fns, "}\n")
+  };
+
+fn print_use(u: UsePath) => Bytes =
+  match u { UP(p, glob) => match glob {
+    True => bytes_concat("use ", bytes_concat(path_str(p), ".*\n")),
+    False => bytes_concat("use ", bytes_concat(path_str(p), "\n"))
+  } };
+
+fn print_lower_decl(l: LowerDecl) => Bytes =
+  match l { LD(name, params, rhs) =>
+    let rhs_str = match rhs { LRExpr(e) => print_expr(e), LRImpl(id) => trim_end_nl(print_impl_decl(id)) } in
+    bytes_concat("lower ", bytes_concat(name, bytes_concat(print_params_brackets(params), bytes_concat(" = ", bytes_concat(rhs_str, "\n")))))
+  };
+
+fn print_derive_decl(d: DeriveDecl) => Bytes =
+  match d { DD(name, for_ty) => bytes_concat("derive ", bytes_concat(name, bytes_concat(" for ", bytes_concat(print_type_ref(for_ty), "\n")))) };
+
+// ── printer top level: Item / Nodule / Phylum (mirrors `expand_to_source`/`expand_phylum_to_source`) ─
+fn print_item(i: Item) => Bytes =
+  match i {
+    Use(u) => print_use(u),
+    Default(p) => bytes_concat("default paradigm ", bytes_concat(paradigm_str(p), "\n")),
+    Type(td) => print_type_decl(td),
+    Trait(td) => print_trait_decl(td),
+    Impl(id) => print_impl_decl(id),
+    Fn(fd) => print_fn_decl(fd),
+    Object(od) => print_object_decl(od),
+    Lower(ld) => print_lower_decl(ld),
+    Derive(dd) => print_derive_decl(dd),
+    InherentImpl(iid) => print_inherent_impl_decl(iid)
+  };
+
+fn print_item_list_acc(xs: Vec[Item], acc: Bytes) => Bytes =
+  match xs {
+    Nil => acc,
+    Cons(h, rest) => print_item_list_acc(rest, bytes_concat(acc, bytes_concat("\n", terminate_item(print_item(h)))))
+  };
+
+fn expand_to_source(n: Nodule) => Bytes =
+  match n { Nd(path, std_sys, items) =>
+    let header = match std_sys {
+      True => bytes_concat("nodule ", bytes_concat(path_str(path), " @std-sys;\n")),
+      False => bytes_concat("nodule ", bytes_concat(path_str(path), ";\n"))
+    } in
+    print_item_list_acc(items, header)
+  };
+
+fn print_nodule_list_acc(xs: Vec[Nodule], acc: Bytes) => Bytes =
+  match xs {
+    Nil => acc,
+    Cons(h, rest) => match eq(bytes_len(acc), zero32()) {
+      0b1 => print_nodule_list_acc(rest, expand_to_source(h)),
+      _ => print_nodule_list_acc(rest, bytes_concat(acc, bytes_concat("\n", expand_to_source(h))))
+    }
+  };
+
+fn expand_phylum_to_source(ph: Phylum) => Bytes =
+  match ph { Phy(path, nodules) =>
+    let header = match path { None => empty_bytes(), Some(p) => bytes_concat("phylum ", bytes_concat(path_str(p), "\n")) } in
+    print_nodule_list_acc(nodules, header)
+  };
+
+// ── AST structural fingerprint (verbatim-mirrors `compiler.parse`'s `Fp`/`fp_tag`/`walk_*` family;
+// same tag numbering, since this is the SAME AST shape — kept in lock-step with the oracle-side `fp`
+// module in `tests/compiler_stage4_ambient.rs`, itself copied from `compiler_stage3.rs`'s `mod fp`). ─
+type Fp = FP(Binary{32}, Binary{32});
+
+fn fp_hash(fp: Fp) => Binary{32} = match fp { FP(h, _) => h };
+fn fp_count(fp: Fp) => Binary{32} = match fp { FP(_, c) => c };
+
+fn rotl7(x: Binary{32}) => Binary{32} =
+  or(shl_u(x, 0b0000_0000_0000_0000_0000_0000_0000_0111), shr_u(x, 0b0000_0000_0000_0000_0000_0000_0001_1001));
+
+fn fp_tag(fp: Fp, tag: Binary{32}) => Fp =
+  match fp { FP(h, c) => FP(xor(rotl7(h), tag), add_u(c, 0b0000_0000_0000_0000_0000_0000_0000_0001)) };
+
+fn fp_bytes(fp: Fp, b: Bytes) => Fp =
+  fp_tag(fp, bytes_len(b));
+
+fn fp_u32(fp: Fp, n: Binary{32}) => Fp =
+  fp_tag(fp, n);
+
+fn walk_vis(fp: Fp, v: Vis) => Fp =
+  match v { Private => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0001), Pub => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0010) };
+
+fn walk_paradigm(fp: Fp, p: Paradigm) => Fp =
+  match p {
+    PBinary => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0011),
+    PTernary => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0100),
+    PDense => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0101),
+    PVsa => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0110)
+  };
+
+fn walk_scalar(fp: Fp, s: Scalar) => Fp =
+  match s {
+    SF16 => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_0111),
+    SBf16 => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1000),
+    SF32 => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1001),
+    SF64 => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1010)
+  };
+
+fn walk_strength(fp: Fp, s: Strength) => Fp =
+  match s {
+    GExact => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1011),
+    GProven => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1100),
+    GEmpirical => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1101),
+    GDeclared => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1110)
+  };
+
+fn walk_sparsity(fp: Fp, s: Sparsity) => Fp =
+  match s {
+    SpDense => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0000_1111),
+    SpSparse(k) => fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0000), k)
+  };
+
+fn walk_paramkind(fp: Fp, k: ParamKind) => Fp =
+  match k { PkType => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0001), PkWidth => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0010) };
+
+fn walk_execmode(fp: Fp, e: ExecutionMode) => Fp =
+  match e { Interpreted => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0011), Compiled => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0100) };
+
+fn walk_widthref(fp: Fp, w: WidthRef) => Fp =
+  match w {
+    WLit(n) => fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0101), n),
+    WName(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0110), s)
+  };
+
+fn walk_path(fp: Fp, p: Path) => Fp =
+  match p { Pth(segs) => walk_bytes_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_0111), segs) };
+
+fn walk_bytes_list(fp: Fp, xs: Vec[Bytes]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_bytes_list(fp_bytes(fp, h), rest) };
+
+fn walk_usepath(fp: Fp, u: UsePath) => Fp =
+  match u { UP(p, glob) => walk_bool(walk_path(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1000), p), glob) };
+
+fn walk_bool(fp: Fp, b: Bool) => Fp =
+  match b { True => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1001), False => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1010) };
+
+fn walk_ambientparams(fp: Fp, a: AmbientParams) => Fp =
+  match a {
+    APSize(n) => fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1011), n),
+    APDense(n, sc) => walk_scalar(fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1100), n), sc),
+    APVsa(model, dim, sp) => walk_sparsity(fp_u32(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1101), model), dim), sp)
+  };
+
+fn walk_typeref(fp: Fp, t: TypeRef) => Fp =
+  match t { TR(b, g) => walk_guarantee_opt(walk_basetype(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1110), b), g) };
+
+fn walk_guarantee_opt(fp: Fp, g: Option[Strength]) => Fp =
+  match g { None => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0001_1111), Some(s) => walk_strength(fp, s) };
+
+fn walk_typeref_list(fp: Fp, xs: Vec[TypeRef]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_typeref_list(walk_typeref(fp, h), rest) };
+
+fn walk_basetype(fp: Fp, b: BaseType) => Fp =
+  match b {
+    KwBinary(w) => walk_widthref(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0000), w),
+    KwTernary(w) => walk_widthref(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0001), w),
+    KwDense(n, sc) => walk_scalar(fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0010), n), sc),
+    Vsa(model, dim, sp) => walk_sparsity(fp_u32(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0011), model), dim), sp),
+    KwSubstrate(name) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0100), name),
+    KwSeq(elem, len) => fp_u32(walk_typeref(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0101), elem), len),
+    KwBytes => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0110),
+    KwFloat => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_0111),
+    Named(name, args) => walk_typeref_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1000), name), args),
+    Ambient(ap) => walk_ambientparams(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1001), ap),
+    FnArrow(a, r) => walk_typeref(walk_typeref(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1010), a), r),
+    Tuple(elems) => walk_typeref_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1011), elems)
+  };
+
+fn walk_traitref(fp: Fp, t: TraitRef) => Fp =
+  match t { TRf(name, args) => walk_typeref_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1100), name), args) };
+
+fn walk_traitref_list(fp: Fp, xs: Vec[TraitRef]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_traitref_list(walk_traitref(fp, h), rest) };
+
+fn walk_typeparam(fp: Fp, t: TypeParam) => Fp =
+  match t { TP(name, k, bounds) => walk_traitref_list(walk_paramkind(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1101), name), k), bounds) };
+
+fn walk_typeparam_list(fp: Fp, xs: Vec[TypeParam]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_typeparam_list(walk_typeparam(fp, h), rest) };
+
+fn walk_param(fp: Fp, p: Param) => Fp =
+  match p { Prm(name, ty) => walk_typeref(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1110), name), ty) };
+
+fn walk_param_list(fp: Fp, xs: Vec[Param]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_param_list(walk_param(fp, h), rest) };
+
+fn walk_bytes_list2(fp: Fp, xs: Vec[Bytes]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_bytes_list2(fp_bytes(fp, h), rest) };
+
+fn walk_effectbudget_list(fp: Fp, xs: Vec[EffectBudget]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => match h { EB(name, _bound) => walk_effectbudget_list(fp_bytes(fp, name), rest) } };
+
+fn walk_fnsig(fp: Fp, s: FnSig) => Fp =
+  match s { FS(name, params, vparams, ret, effects, budgets) =>
+    walk_effectbudget_list(
+      walk_bytes_list2(
+        walk_typeref(
+          walk_param_list(
+            walk_typeparam_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0010_1111), name), params),
+            vparams),
+          ret),
+        effects),
+      budgets)
+  };
+
+// M-1027 / DN-104: the `sealed` (`priv`) flag joins the structural fingerprint via tag 110, folded
+// ONLY when sealed — so an unsealed ctor's fingerprint stays byte-identical (lock-step with parse.myc).
+fn walk_ctor_seal(fp: Fp, s: Bool) => Fp =
+  match s { False => fp, True => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1110) };
+
+fn walk_ctor(fp: Fp, c: Ctor) => Fp =
+  match c { Ctr(name, fields, sealed) => walk_ctor_seal(walk_typeref_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0000), name), fields), sealed) };
+
+fn walk_ctor_list(fp: Fp, xs: Vec[Ctor]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_ctor_list(walk_ctor(fp, h), rest) };
+
+fn walk_typedecl(fp: Fp, t: TypeDecl) => Fp =
+  match t { TD(vis, name, params, ctors) => walk_ctor_list(walk_bytes_list2(walk_vis(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0001), name), vis), params), ctors) };
+
+fn walk_fnsig_list(fp: Fp, xs: Vec[FnSig]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_fnsig_list(walk_fnsig(fp, h), rest) };
+
+fn walk_traitdecl(fp: Fp, t: TraitDecl) => Fp =
+  match t { TrD(vis, name, params, sigs) => walk_fnsig_list(walk_bytes_list2(walk_vis(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0010), name), vis), params), sigs) };
+
+fn walk_fndecl(fp: Fp, f: FnDecl) => Fp =
+  match f { FD(vis, thw, tr_opt, sig, body) =>
+    walk_expr(walk_fnsig(walk_tier_opt(walk_bool(walk_vis(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0011), vis), thw), tr_opt), sig), body)
+  };
+
+fn walk_tier_opt(fp: Fp, t: Option[ExecutionMode]) => Fp =
+  match t { None => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0100), Some(m) => walk_execmode(fp, m) };
+
+fn walk_fndecl_list(fp: Fp, xs: Vec[FnDecl]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_fndecl_list(walk_fndecl(fp, h), rest) };
+
+fn walk_impldecl(fp: Fp, i: ImplDecl) => Fp =
+  match i { ImD(name, args, for_ty, methods) =>
+    walk_fndecl_list(walk_typeref(walk_typeref_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0101), name), args), for_ty), methods)
+  };
+
+fn walk_viadecl(fp: Fp, v: ViaDecl) => Fp =
+  match v { VD(idx, name, args) => walk_typeref_list(fp_bytes(fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0110), idx), name), args) };
+
+fn walk_viadecl_list(fp: Fp, xs: Vec[ViaDecl]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_viadecl_list(walk_viadecl(fp, h), rest) };
+
+fn walk_impldecl_list(fp: Fp, xs: Vec[ImplDecl]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_impldecl_list(walk_impldecl(fp, h), rest) };
+
+fn walk_objectdecl(fp: Fp, o: ObjectDecl) => Fp =
+  match o { OD(vis, name, params, ctor, vias, impls, fns) =>
+    walk_fndecl_list(
+      walk_impldecl_list(
+        walk_viadecl_list(
+          walk_ctor(walk_bytes_list2(walk_vis(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_0111), name), vis), params), ctor),
+          vias),
+        impls),
+      fns)
+  };
+
+// DN-103 / M-1026: fold the impl-level type-parameter slot (unbounded names) first — matching how
+// TypeDecl/TraitDecl/LowerDecl fold their `params` — so the fingerprint distinguishes `impl[T] Foo[T]`
+// from `impl Foo[T]` (lock-step with the oracle `fp::inherentimpldecl`, no new tag-table entry).
+fn walk_inherentimpldecl(fp: Fp, i: InherentImplDecl) => Fp =
+  match i { IID(params, for_ty, methods) => walk_fndecl_list(walk_typeref(fp_tag(walk_bytes_list2(fp, params), 0b0000_0000_0000_0000_0000_0000_0011_1000), for_ty), methods) };
+
+fn walk_lowerrhs(fp: Fp, r: LowerRhs) => Fp =
+  match r {
+    LRExpr(e) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1001), e),
+    LRImpl(i) => walk_impldecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1010), i)
+  };
+
+fn walk_lowerdecl(fp: Fp, l: LowerDecl) => Fp =
+  match l { LD(name, params, rhs) => walk_lowerrhs(walk_bytes_list2(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1011), name), params), rhs) };
+
+fn walk_derivedecl(fp: Fp, d: DeriveDecl) => Fp =
+  match d { DD(name, for_ty) => walk_typeref(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1100), name), for_ty) };
+
+fn walk_expr_list(fp: Fp, xs: Vec[Expr]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_expr_list(walk_expr(fp, h), rest) };
+
+fn walk_literal(fp: Fp, l: Literal) => Fp =
+  match l {
+    Bin(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1101), s),
+    Trit(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1110), s),
+    Int(n) => fp_u32(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0011_1111), width_cast(n, zero32())),
+    AmbientInt(par, n) => fp_u32(walk_paradigm(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0000), par), width_cast(n, zero32())),
+    List(elems) => walk_expr_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0001), elems),
+    LBytes(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0010), s),
+    Str(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0011), s),
+    LFloat(s) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0100), s)
+  };
+
+fn walk_pattern(fp: Fp, p: Pattern) => Fp =
+  match p {
+    PWildcard => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0101),
+    PLit(l) => walk_literal(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0110), l),
+    PCtor(name, subs) => walk_pattern_list(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_0111), name), subs),
+    PIdent(name) => fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1000), name),
+    PTuple(subs) => walk_pattern_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1001), subs),
+    POr(alts) => walk_pattern_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1010), alts)
+  };
+
+fn walk_pattern_list(fp: Fp, xs: Vec[Pattern]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_pattern_list(walk_pattern(fp, h), rest) };
+
+fn walk_arm(fp: Fp, a: Arm) => Fp =
+  match a { Ar(pat, body) => walk_expr(walk_pattern(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1011), pat), body) };
+
+fn walk_arm_list(fp: Fp, xs: Vec[Arm]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_arm_list(walk_arm(fp, h), rest) };
+
+fn walk_expr_opt(fp: Fp, e: Option[Expr]) => Fp =
+  match e { None => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1100), Some(x) => walk_expr(fp, x) };
+
+fn walk_hypha(fp: Fp, h: Hypha) => Fp =
+  match h { Hy(frg, body) => walk_expr(walk_expr_opt(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1101), frg), body) };
+
+fn walk_hypha_list(fp: Fp, xs: Vec[Hypha]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_hypha_list(walk_hypha(fp, h), rest) };
+
+fn walk_typeref_opt(fp: Fp, t: Option[TypeRef]) => Fp =
+  match t { None => fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1110), Some(x) => walk_typeref(fp, x) };
+
+fn walk_expr(fp: Fp, e: Expr) => Fp =
+  match e {
+    Let(name, ty, bound, body) => walk_expr(walk_expr(walk_typeref_opt(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0100_1111), name), ty), bound), body),
+    If(cond, conseq, alt) => walk_expr(walk_expr(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0000), cond), conseq), alt),
+    Match(scrutinee, arms) => walk_arm_list(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0001), scrutinee), arms),
+    For(x, xs, acc, init, body) => walk_expr(walk_expr(walk_expr(fp_bytes(fp_bytes(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0010), x), acc), xs), init), body),
+    Swap(value, target, pol) => walk_path(walk_typeref(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0011), value), target), pol),
+    WithParadigm(par, body) => walk_expr(walk_paradigm(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0100), par), body),
+    Wild(body) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0101), body),
+    Spore(value) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0110), value),
+    Wrapping(value) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1110), value),
+    Try(value) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1111), value),
+    Consume(value) => walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_0111), value),
+    Colony(hyphae) => walk_hypha_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1000), hyphae),
+    Lambda(params, body) => walk_expr(walk_param_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1001), params), body),
+    App(head, args) => walk_expr_list(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1010), head), args),
+    Fuse(left, right) => walk_expr(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1011), left), right),
+    Reclaim(pol, body) => walk_expr(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1100), pol), body),
+    Path(p) => walk_path(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1101), p),
+    Lit(l) => walk_literal(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1110), l),
+    Ascribe(inner, ty) => walk_typeref(walk_expr(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0101_1111), inner), ty),
+    TupleLit(elems) => walk_expr_list(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0000), elems)
+  };
+
+fn walk_item(fp: Fp, i: Item) => Fp =
+  match i {
+    Use(u) => walk_usepath(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0001), u),
+    Default(par) => walk_paradigm(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0010), par),
+    Type(t) => walk_typedecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0011), t),
+    Trait(t) => walk_traitdecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0100), t),
+    Impl(i2) => walk_impldecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0101), i2),
+    Fn(f) => walk_fndecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0110), f),
+    Object(o) => walk_objectdecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_0111), o),
+    Lower(l) => walk_lowerdecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1000), l),
+    Derive(d) => walk_derivedecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1001), d),
+    InherentImpl(i3) => walk_inherentimpldecl(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1010), i3)
+  };
+
+fn walk_item_list(fp: Fp, xs: Vec[Item]) => Fp =
+  match xs { Nil => fp, Cons(h, rest) => walk_item_list(walk_item(fp, h), rest) };
+
+fn walk_nodule(fp: Fp, n: Nodule) => Fp =
+  match n { Nd(path, std_sys, items) => walk_item_list(walk_bool(walk_path(fp_tag(fp, 0b0000_0000_0000_0000_0000_0000_0110_1011), path), std_sys), items) };
+
+fn fingerprint_nodule(n: Nodule) => Fp =
+  walk_nodule(FP(0b0000_0000_0000_0000_0000_0000_0000_0000, 0b0000_0000_0000_0000_0000_0000_0000_0000), n);
+
+// ── differential support (mirrors compiler.parse's stage3_verdict shape) ──────────────────────────
+fn stage4_verdict_fp(fp: Fp, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match eq(fp_hash(fp), want_hash) {
+    0b1 => match eq(fp_count(fp), want_count) { 0b1 => one32(), _ => three32() },
+    _ => 0b0000_0000_0000_0000_0000_0000_0000_0010
+  };
+
+// resolve_err_kind: Ok => 0; Err(e) => the 5-way classification code (ambient_error_kind).
+fn resolve_err_kind(n: Nodule) => Binary{32} =
+  match resolve(n) { Ok(_) => zero32(), Err(e) => ambient_error_kind(e) };
+
+// ── synthetic differential fixtures (FLAG-ambient-6: hand-built, not real corpus files) ───────────
+// Each `test_input_N` is hand-transcribed identically (as a Rust `ast::Nodule` struct literal, and
+// as this `.myc` literal) in `tests/compiler_stage4_ambient.rs`.
+
+// TC1: pure passthrough — no ambient anywhere; `resolve` must be the identity.
+fn test_input_1() => Nodule =
+  Nd(Pth(Cons("t1", Nil)), False,
+    Cons(Fn(FD(Private, False, None,
+        FS("f", Nil, Cons(Prm("x", TR(Named("Widget", Nil), None)), Nil), TR(Named("Widget", Nil), None), Nil, Nil),
+        Path(Pth(Cons("x", Nil))))),
+      Nil));
+
+// TC2: `default paradigm Binary` + a paradigm-less `{8}` return type resolves to `Binary{8}`.
+fn test_input_2() => Nodule =
+  Nd(Pth(Cons("t2", Nil)), False,
+    Cons(Default(PBinary),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Ambient(APSize(0b0000_0000_0000_0000_0000_0000_0000_1000)), None), Nil, Nil),
+          Lit(Int(0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0010_1010)))),
+        Nil)));
+
+// TC3: `default paradigm Ternary`, same shape as TC2 but Ternary.
+fn test_input_3() => Nodule =
+  Nd(Pth(Cons("t3", Nil)), False,
+    Cons(Default(PTernary),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Ambient(APSize(0b0000_0000_0000_0000_0000_0000_0000_0101)), None), Nil, Nil),
+          Lit(Int(zero64())))),
+        Nil)));
+
+// TC4: `default paradigm Dense` + `{4, F32}` resolves to `Dense{4, F32}`.
+fn test_input_4() => Nodule =
+  Nd(Pth(Cons("t4", Nil)), False,
+    Cons(Default(PDense),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Ambient(APDense(0b0000_0000_0000_0000_0000_0000_0000_0100, SF32)), None), Nil, Nil),
+          Lit(LFloat("0.0")))),
+        Nil)));
+
+// TC5: `default paradigm VSA` + `{"hrr", 128, Dense}` resolves to `VSA{"hrr", 128, Dense}`.
+fn test_input_5() => Nodule =
+  Nd(Pth(Cons("t5", Nil)), False,
+    Cons(Default(PVsa),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Ambient(APVsa("hrr", 0b0000_0000_0000_0000_0000_0000_1000_0000, SpDense)), None), Nil, Nil),
+          Lit(LFloat("0.0")))),
+        Nil)));
+
+// TC6: nested `with paradigm Ternary { … }` locally overrides a `Binary` nodule default.
+fn test_input_6() => Nodule =
+  Nd(Pth(Cons("t6", Nil)), False,
+    Cons(Default(PBinary),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Named("Unit", Nil), None), Nil, Nil),
+          WithParadigm(PTernary, Lit(Int(one32_as_64()))))),
+        Nil)));
+
+fn one32_as_64() => Binary{64} = 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001;
+
+// TC7: an `object` declaration with a paradigm-less ctor field, resolved under a Binary default.
+fn test_input_7() => Nodule =
+  Nd(Pth(Cons("t7", Nil)), False,
+    Cons(Default(PBinary),
+      Cons(Object(OD(Private, "Cell", Nil,
+          Ctr("Cell", Cons(TR(Ambient(APSize(0b0000_0000_0000_0000_0000_0000_0001_0000)), None), Nil), False),
+          Nil, Nil, Nil)),
+        Nil)));
+
+// TC8: a mixed-expr body (let/if/match/app/tuple) under a Binary ambient — several bare decimals
+// each resolve to `AmbientInt(Binary, _)`.
+fn test_input_8() => Nodule =
+  Nd(Pth(Cons("t8", Nil)), False,
+    Cons(Default(PBinary),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Named("Unit", Nil), None), Nil, Nil),
+          Let("x", None, Lit(Int(one32_as_64())),
+            If(Path(Pth(Cons("x", Nil))),
+              Match(Path(Pth(Cons("x", Nil))), Cons(Ar(PWildcard, TupleLit(Cons(Lit(Int(zero64())), Cons(Lit(Int(one32_as_64())), Nil)))), Nil)),
+              App(Path(Pth(Cons("id", Nil))), Cons(Lit(Int(zero64())), Nil)))))),
+        Nil)));
+
+// ERR1: two `default paradigm` declarations -> MultipleDefaults.
+fn test_input_err1() => Nodule =
+  Nd(Pth(Cons("e1", Nil)), False, Cons(Default(PBinary), Cons(Default(PTernary), Nil)));
+
+// ERR2: a paradigm-less `{8}` with no enclosing ambient anywhere -> UnresolvedAmbient.
+fn test_input_err2() => Nodule =
+  Nd(Pth(Cons("e2", Nil)), False,
+    Cons(Fn(FD(Private, False, None,
+        FS("f", Nil, Nil, TR(Ambient(APSize(0b0000_0000_0000_0000_0000_0000_0000_1000)), None), Nil, Nil),
+        Lit(LFloat("0.0")))),
+      Nil));
+
+// ERR3: a Binary ambient but a Dense-shaped `{4, F32}` param -> ParadigmShapeMismatch.
+fn test_input_err3() => Nodule =
+  Nd(Pth(Cons("e3", Nil)), False,
+    Cons(Default(PBinary),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Ambient(APDense(0b0000_0000_0000_0000_0000_0000_0000_0100, SF32)), None), Nil, Nil),
+          Lit(LFloat("0.0")))),
+        Nil)));
+
+// ERR4: a bare decimal under a Dense ambient -> BareDecimalNoEncoding.
+fn test_input_err4() => Nodule =
+  Nd(Pth(Cons("e4", Nil)), False,
+    Cons(Default(PDense),
+      Cons(Fn(FD(Private, False, None,
+          FS("f", Nil, Nil, TR(Named("Unit", Nil), None), Nil, Nil),
+          Lit(Int(one32_as_64())))),
+        Nil)));
+
+// ── per-fixture verdict drivers (mirrors `stage3_verdict`'s one-eval-per-file shape) ──────────────
+fn stage4_verdict_1(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_1()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_2(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_2()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_3(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_3()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_4(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_4()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_5(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_5()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_6(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_6()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_7(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_7()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+fn stage4_verdict_8(want_ok: Binary{32}, want_hash: Binary{32}, want_count: Binary{32}) => Binary{32} =
+  match resolve(test_input_8()) {
+    Err(_) => match eq(want_ok, zero32()) { 0b1 => one32(), _ => zero32() },
+    Ok(n) => match eq(want_ok, one32()) { 0b1 => stage4_verdict_fp(fingerprint_nodule(n), want_hash, want_count), _ => zero32() }
+  };
+
+// ── expand_to_source verdict drivers: exact byte-for-byte comparison against the oracle's rendered
+// text (passed in as a Bytes argument — no hashing needed, the same "pass a Bytes value in" idiom
+// `compiler_stage3.rs`'s `bytes_value(source)` already establishes for corpus source text). ────────
+fn stage4_expand_verdict_1(want_expand: Bytes) => Binary{32} =
+  match bytes_eq(expand_to_source(test_input_1()), want_expand) { 0b1 => one32(), _ => zero32() };
+
+fn stage4_expand_verdict_2(want_expand: Bytes) => Binary{32} =
+  match bytes_eq(expand_to_source(test_input_2()), want_expand) { 0b1 => one32(), _ => zero32() };
+
+fn stage4_expand_verdict_resolved_2(want_expand: Bytes) => Binary{32} =
+  match resolve(test_input_2()) {
+    Err(_) => zero32(),
+    Ok(n) => match bytes_eq(expand_to_source(n), want_expand) { 0b1 => one32(), _ => zero32() }
+  };
+
+fn stage4_expand_verdict_7(want_expand: Bytes) => Binary{32} =
+  match bytes_eq(expand_to_source(test_input_7()), want_expand) { 0b1 => one32(), _ => zero32() };
+
+fn stage4_expand_verdict_resolved_7(want_expand: Bytes) => Binary{32} =
+  match resolve(test_input_7()) {
+    Err(_) => zero32(),
+    Ok(n) => match bytes_eq(expand_to_source(n), want_expand) { 0b1 => one32(), _ => zero32() }
+  };
+
+// ── error-classification verdict drivers (the four never-silent refusals; FLAG-ambient-3 scope) ──
+fn stage4_err_kind_1() => Binary{32} = resolve_err_kind(test_input_err1());
+fn stage4_err_kind_2() => Binary{32} = resolve_err_kind(test_input_err2());
+fn stage4_err_kind_3() => Binary{32} = resolve_err_kind(test_input_err3());
+fn stage4_err_kind_4() => Binary{32} = resolve_err_kind(test_input_err4());

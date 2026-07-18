@@ -1,0 +1,9 @@
+// exercises: bounded iteration (`for` fold over a linearly recursive data value; RFC-0007 §4.8)
+// (the recursive ADT is named `ByteList`, not `Bytes`: `Bytes` is now a reserved repr keyword —
+// RFC-0032 D4 / M-750 — so it can never be a user type name.)
+nodule folds;
+
+type ByteList = End | More(Binary{8}, ByteList);
+
+fn checksum(bs: ByteList) => Binary{8} =
+    for b in bs, acc = 0b0000_0000 => xor(acc, b);

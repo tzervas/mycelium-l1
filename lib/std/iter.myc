@@ -1,0 +1,121 @@
+// nodule: std.iter
+// @version: 0.2.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-26
+// @updated: 2026-06-27
+// @summary: Self-hosted first-order iterator surface over the cons-list shape (List<A> = Nil |
+nodule std.iter;
+
+// Cons(A, List<A>)). M-715 (E13-1, RFC-0031 §5 D4 Tier-0). Provides: is_empty_l, length, and the
+// recursive HOF combinators map, filter, foldl, any, all, find — ALL now execute three-way
+// (L1-eval ≡ L0-interp ≡ AOT). The recursive-HOF re-pass gap is CLOSED (M-715, rsm S3): a HOF
+// parameter re-passed at a recursive call site (e.g. `map(rest, f)`) is threaded through as the
+// SAME static specialization by mono::resolve_fn_args (RFC-0024 §4 defunctionalization, extended).
+// Guarantee (per-op, audit-precise): List constructors and is_empty_l are Exact (total); length is
+// Declared (O(n) walk) with Empirical add_u overflow; the HOF combinators carry Declared type-level
+// contracts with Empirical three-way agreement (std_iter.rs). Never-silent (G2): find-miss → None;
+// length overflow → refusal on all paths. Honesty boundary: HOF arguments use RFC-0024 static
+// defunctionalization — a single NAMED top-level function arg; closures, multi-arg arrows, and partial
+// application remain deferred (M-704). Option re-declaration: self-contained — Option/Bool in scope
+// without import. The Option type parameter is named Opt (not A) to avoid substitution-key collisions
+// when Option nests inside List<A> (RFC-0007 §11.3 + M-716).
+type Option[Opt] = Some(Opt) | None;
+
+// ── List — a recursive cons-list ─────────────────────────────────────────────────────────────────
+//
+// Rep: type List<A> = Nil | Cons(A, List<A>)
+// Mirrors the Vec cons-list shape in std.collections. All ops are O(n) in the spine (Declared).
+// Constructors are Exact (total). The name `List` is chosen to distinguish from `Vec` (which lives
+// in std.collections) while sharing the same underlying cons-cell structure.
+type List[A] = Nil | Cons(A, List[A]);
+
+// is_empty_l: True iff the List is Nil. Total (Exact).
+fn is_empty_l[A](xs: List[A]) => Bool =
+  match xs { Nil => True, Cons(_, _) => False };
+
+// ── map ──────────────────────────────────────────────────────────────────────────────────────────
+//
+// map: apply `f` to every element; structure is preserved. O(n) spine-walk (Declared). The
+// function `f` is a single-arg named function (RFC-0024 defunctionalization). Never-silent (G2):
+// Nil passes through. Declared; three-way agreement Empirical (std_iter.rs). `f` is a single named
+// top-level fn (RFC-0024 §4); the recursive call `map(rest, f)` re-passes `f`, now threaded through as
+// the SAME static specialization (M-715 / mono::resolve_fn_args). Closures / multi-arg arrows: M-704.
+fn map[A, B](xs: List[A], f: A => B) => List[B] =
+  match xs { Nil => Nil, Cons(h, rest) => Cons(f(h), map(rest, f)) };
+
+// ── filter ────────────────────────────────────────────────────────────────────────────────────────
+//
+// filter: keep only elements satisfying `pred`; elements that fail are dropped. O(n) spine-walk
+// (Declared). Never-silent (G2): dropped elements are explicit absences, not silent coercions.
+// Declared; three-way agreement Empirical (M-715: the recursive re-pass of `pred` is threaded as the
+// same static specialization).
+fn filter[A](xs: List[A], pred: A => Bool) => List[A] =
+  match xs {
+    Nil => Nil,
+    Cons(h, rest) =>
+      match pred(h) {
+        True => Cons(h, filter(rest, pred)),
+        False => filter(rest, pred)
+      }
+  };
+
+// ── foldl ─────────────────────────────────────────────────────────────────────────────────────────
+//
+// foldl: left-associative fold — reduce the list to a single B via `f` at each element. O(n)
+// spine-walk (Declared). Nil returns the initial `acc` (never-silent, G2). `f: A -> B` is the
+// single-arg HOF (RFC-0024 §3); the prior acc is replaced by `f(h)` at each step — not a true
+// binary (A -> B -> B) fold (which requires multi-arg HOF, deferred RFC-0024 §5). Declared.
+// Note: because each step discards the prior `acc` (it is `f(h)`, ignoring the accumulator), the
+// effective result for a non-empty list is `f(last element)`; the initial `acc` is only ever
+// returned on `Nil`. (A true binary fold — needing multi-arg HOF — is the deferred form below.)
+// Three-way agreement Empirical (M-715: the recursive re-pass of `f` is threaded as the same static
+// specialization). FLAG (still open): a TRUE two-arg fold (f: A -> B -> B, combining the accumulator)
+// requires multi-arg HOF — deferred (M-704); this `f: A -> B` form discards the prior acc, as noted.
+fn foldl[A, B](xs: List[A], f: A => B, acc: B) => B =
+  match xs { Nil => acc, Cons(h, rest) => foldl(rest, f, f(h)) };
+
+// ── length ────────────────────────────────────────────────────────────────────────────────────────
+//
+// length: the number of elements. O(n) recursive spine-walk. Uses add_u at Binary{8}: a list
+// longer than 255 elements causes add_u to refuse on ALL paths — never a silent wrap (G2).
+// This is an explicit never-silent contract; the "fits Binary{8}" bound is Empirical (add_u's
+// runtime refusal is the evidence, not a type-level proof). Declared (type-level contract for the
+// O(n) walk).
+fn length[A](xs: List[A]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, length(rest)) };
+
+// ── any / all ─────────────────────────────────────────────────────────────────────────────────────
+//
+// any: True iff any element satisfies `pred`. Short-circuits at the first True (O(n) worst-case,
+// Declared). Never-silent (G2): empty → False (no fabricated True). Declared.
+// Three-way agreement Empirical (M-715: the recursive re-pass of `pred` is threaded as the same
+// static specialization). `pred` is a single named top-level fn (RFC-0024 §4; closures deferred, M-704).
+fn any[A](xs: List[A], pred: A => Bool) => Bool =
+  match xs {
+    Nil => False,
+    Cons(h, rest) => match pred(h) { True => True, False => any(rest, pred) }
+  };
+
+// all: True iff every element satisfies `pred`. Short-circuits at the first False (O(n) worst-case,
+// Declared). Never-silent (G2): empty → True (vacuous universal quantification — standard convention,
+// not a fabricated result; documented to avoid confusion). Declared.
+// Three-way agreement Empirical (M-715: the recursive re-pass of `pred` is threaded as the same
+// static specialization). `pred` is a single named top-level fn (RFC-0024 §4; closures deferred, M-704).
+fn all[A](xs: List[A], pred: A => Bool) => Bool =
+  match xs {
+    Nil => True,
+    Cons(h, rest) => match pred(h) { True => all(rest, pred), False => False }
+  };
+
+// ── find ──────────────────────────────────────────────────────────────────────────────────────────
+//
+// find: the first element satisfying `pred`, or None if no element qualifies. O(n) spine-walk
+// (Declared). Never-silent (G2): a miss yields None — never a fabricated element, never a sentinel.
+// Declared; three-way agreement Empirical (M-715: the recursive re-pass of `pred` is threaded as the
+// same static specialization).
+fn find[A](xs: List[A], pred: A => Bool) => Option[A] =
+  match xs {
+    Nil => None,
+    Cons(h, rest) => match pred(h) { True => Some(h), False => find(rest, pred) }
+  };

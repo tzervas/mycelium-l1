@@ -1,0 +1,2 @@
+// rejected: a program must open with a nodule header; a bare item is not a program
+use core.binary

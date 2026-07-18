@@ -1,0 +1,308 @@
+// nodule: std.swaps
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted surface of `std.swap` — the never-silent representation-change library
+nodule std.swaps;
+
+//   (M-929, E29-1, kickoff `opp`, RFC-0031 D5): the RFC-0016 §4.5 guarantee matrix as CHECKED
+//   DATA, the never-silent check-error model, and the bijective binary<->ternary swap class
+//   expressed through the language's own `swap(…, to: …, policy: …)` construct at fixed legal
+//   pairs. The kernel certificate machinery stays Rust (RFC-0031 D1) — FLAGged below, never forced.
+//
+// NAMING (FLAG-swap-0, keyword renames — the reserved words `swap`/`to`/`policy`/`Bytes` and the
+// strength words `Exact`/`Proven`/`Empirical`/`Declared` lex as keywords, never identifiers):
+//   - The nodule path is `std.swaps` (a bare `swap` segment cannot be an identifier; the FILE keeps
+//     the ratified name `lib/std/swap.myc`).
+//   - Guarantee constructors are G-prefixed (`GExact`/…) — the std.diag precedent for the reserved
+//     strength words. Multi-word identifiers like `bin_to_tern` are single tokens and stay faithful.
+//   - The swap-op instances are width-suffixed (`bin8_to_tern6`, …) because the `.myc` surface
+//     carries the width in the type, where the Rust ops take it as a runtime parameter.
+//
+// Surface-check (D5 row 1, Empirical, 2026-07-02) — `crates/mycelium-std-swap/src/lib.rs`:
+//   (a) KERNEL RE-EXPORTS (RFC-0031 D1 — the kernel stays Rust; FLAGged, NOT ported): `check`,
+//       `CheckVerdict`, `Evidence`, `Fallback`, `NotValidatedReason`, `RefinementRelation`,
+//       `SwapCertificate`, `SwapError` and the constants `BF16_MIN_NORMAL`/`BF16_REL_EPS`/
+//       `DENSE_VSA_EMP_DELTA`/`DENSE_VSA_MODEL` (mycelium-cert); `Bound`/`BoundBasis`/`BoundKind`/
+//       `ContentHash`/`GuaranteeStrength`/`NormKind`/`Repr`/`Value` (mycelium-core); the helpers
+//       `legal_pair`/`roundtrip_lemma_ref`. No FFI/kernel-type construction mechanism is exposed to
+//       `.myc` today; these stay behind the kernel boundary.
+//   (b) OWN TYPES (4): `MatrixRow` + `GUARANTEE_MATRIX` + `assert_matrix_invariants` — pure
+//       algebraic data + structural checks: FULLY PORTED below. `CheckError` — the never-silent
+//       check-error model: PORTED STRUCTURALLY (the kernel-typed `NotValidatedReason` payload is
+//       carried as its human-readable detail, Bytes — see FLAG-swap-2). `Swapped` — a pair of
+//       kernel `Value` + `SwapCertificate`: NOT PORTED as a type (FLAG-swap-1); at the `.myc`
+//       surface the native `swap` expression subsumes it — the result value carries its kernel
+//       `Meta` (policy_used, provenance, strength), so a converted value without its audit trail is
+//       structurally impossible, which is the property `Swapped` exists to enforce. `ExplainRecord`
+//       — kernel-typed fields (`Repr`/`ContentHash`/`Bound`): NOT PORTED (FLAG-swap-1); its two
+//       portable classifications (`cert_kind`, `strength`) are the `CertKind`/`Guarantee` ADTs below.
+//   (c) OWN OPS (7): `bin_to_tern`/`tern_to_bin` — the bijective class IS expressible today via the
+//       native `swap(…, to: …, policy: …)` construct (S1/WF2: target and policy are mandatory
+//       syntax; a silent swap is a parse error): ported as fixed legal-pair instances below
+//       (RFC-0002 §5 legal pairs (8,6) and (4,3)). `f32_to_bf16`/`dense_to_vsa`/`vsa_to_dense` —
+//       kernel-engine dispatch outside the reference interpreter's binary<->ternary engine:
+//       FLAGged, NOT ported (FLAG-swap-3). `check_swap` — delegates to the single M-210 kernel
+//       checker (KC-3): FLAGged, NOT ported (FLAG-swap-3). `explain` — a total projection of the
+//       kernel `SwapCertificate`: FLAGged, NOT ported (FLAG-swap-3; the ported matrix row records
+//       its contract).
+//
+// Pre-port polish (D5 row 2): RECORDED CLEAN — no Rust-side change. The crate is the DN-66 frozen
+// baseline (2026-07-01) and its source is already unambiguous; polishing a frozen oracle would be
+// churn, not clarity (G2: stated, not skipped silently).
+//
+// Transpiler assist (D5 row 5, Empirical, measured 2026-07-02): `mycelium-transpile` reports
+// 2/22 non-test items emitted (9.1% expressible); both emitted items are single-path `use`
+// re-exports of kernel symbols that this port FLAGs rather than keeps, so the net assist to this
+// shipped nodule is 0% — hand-written. Recorded for the M-935 ledger close-out (FLAGged up; the
+// ledger is orchestrator-owned).
+//
+// Honesty tags (VR-5 — carried at the SAME strength as the Rust source, never upgraded):
+//   - The matrix rows' `guarantee` fields mirror `GUARANTEE_MATRIX` exactly: `GExact` for the
+//     bijective class and the verdict/projection ops, `GProven` for f32->bf16 (ProvenThm basis,
+//     side-conditions checked kernel-side), `GEmpirical` for the Dense<->VSA class (probabilistic
+//     capacity bound).
+//   - The 7-row transcription itself is `Declared` (asserted data, structurally checked — the same
+//     strength as the Rust source's own `assert_matrix_invariants` tests).
+//   - Three-way differential agreement (L1-eval ≡ L0-interp ≡ AOT) and the live Rust-oracle
+//     differential live in `crates/mycelium-l1/tests/std_swap.rs` and are `Empirical` (trials).
+//   - The swap instances below inherit the KERNEL's per-swap tag at runtime (`Exact` within range,
+//     derived by the engine, never asserted here): the L1 evaluator, the L0 interpreter, and the
+//     AOT path all dispatch to the same `mycelium-cert` engine the Rust oracle wraps (RFC-0031 D1),
+//     so this port validates the TRANSLATION SURFACE, not an independent second implementation —
+//     stated plainly (VR-5).
+// ── Guarantee ────────────────────────────────────────────────────────────────────────────────────
+// The lattice tag Exact ⊐ Proven ⊐ Empirical ⊐ Declared (VR-5), as VALUE-level data. G-prefixed
+// because the bare strength words are reserved (`T @ Exact` type-annotation surface) — FLAG-swap-0;
+// same rename as std.diag.
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// ── CertKind ─────────────────────────────────────────────────────────────────────────────────────
+// Mirrors `MatrixRow::cert_kind: Option<&'static str>` — but TYPED: `KBijective`/`KBounded` are the
+// only certificate classes and `KNone` is the explicit absence. The Rust invariant "cert_kind must
+// be 'Bijective' or 'Bounded'" is discharged here BY CONSTRUCTION (an invalid kind is
+// unrepresentable) — a structural strengthening of the same contract, not a tag upgrade.
+type CertKind = KBijective | KBounded | KNone;
+
+// ── Fallback / CheckError — the never-silent check-error model (RFC-0002 §2) ─────────────────────
+// Mirrors `mycelium_std_swap::CheckError`. `Refuted` carries a concrete-counterexample detail;
+// `NotValidated` is the TV-incompleteness arm — NEVER a silent pass: it always carries the explicit
+// fallback path the caller must take (`UseReference`, the only fallback in v1 — the single-variant
+// type IS the "always Fallback::UseReference" contract, structurally).
+// FLAG-swap-2: the Rust `NotValidated.reason` is the kernel enum `NotValidatedReason` (D1); this
+// port carries it as its human-readable detail (Bytes — the same information the Rust `Display`
+// impl surfaces), not as a kernel-typed payload.
+type Fallback = UseReference;
+
+type CheckError = Refuted(Bytes) | NotValidated(Bytes, Fallback);
+
+// refuted: build the concrete-counterexample arm (the swap is WRONG). Total (Exact).
+fn refuted(detail: Bytes) => CheckError =
+  Refuted(detail);
+
+// not_validated: build the TV-incompleteness arm. The constructor PINS the explicit fallback
+// (UseReference) — a NotValidated without a fallback path is unrepresentable through it. Total (Exact).
+fn not_validated(reason: Bytes) => CheckError =
+  NotValidated(reason, UseReference);
+
+// is_refuted / is_not_validated: which arm — pure ADT dispatch. Total (Exact).
+fn is_refuted(e: CheckError) => Bool =
+  match e { Refuted(_) => True, NotValidated(_, _) => False };
+
+fn is_not_validated(e: CheckError) => Bool =
+  match e { Refuted(_) => False, NotValidated(_, _) => True };
+
+// has_explicit_fallback: True iff the error carries a fallback route (the NotValidated arm — the
+// "caller MUST take the enclosed Fallback" half of RFC-0002 §2). Total (Exact).
+fn has_explicit_fallback(e: CheckError) => Bool =
+  match e { Refuted(_) => False, NotValidated(_, _) => True };
+
+// fallback_is_use_reference: every representable fallback is UseReference (vacuously True on
+// Refuted, which carries none) — the structural port of "always Fallback::UseReference". Total (Exact).
+fn fallback_is_use_reference(e: CheckError) => Bool =
+  match e { Refuted(_) => True, NotValidated(_, f) => match f { UseReference => True } };
+
+// ── MatrixRow ────────────────────────────────────────────────────────────────────────────────────
+// Mirrors `mycelium_std_swap::MatrixRow` field-for-field, in the same order:
+//   Row(op, guarantee, fallible, cert_carrying, cert_kind)
+// `op` is prose (Bytes); the rest are typed ADTs / Bool (never stringly).
+type MatrixRow = Row(Bytes, Guarantee, Bool, Bool, CertKind);
+
+// ── Field accessors ──────────────────────────────────────────────────────────────────────────────
+fn row_op(r: MatrixRow) => Bytes =
+  match r { Row(op, _, _, _, _) => op };
+
+fn row_guarantee(r: MatrixRow) => Guarantee =
+  match r { Row(_, g, _, _, _) => g };
+
+fn row_fallible(r: MatrixRow) => Bool =
+  match r { Row(_, _, f, _, _) => f };
+
+fn row_cert_carrying(r: MatrixRow) => Bool =
+  match r { Row(_, _, _, c, _) => c };
+
+fn row_cert_kind(r: MatrixRow) => CertKind =
+  match r { Row(_, _, _, _, k) => k };
+
+// ── Structural predicates (ADT equality — no bytes_eq needed) ────────────────────────────────────
+fn is_exact(g: Guarantee) => Bool =
+  match g { GExact => True, GProven => False, GEmpirical => False, GDeclared => False };
+
+fn is_bijective(k: CertKind) => Bool =
+  match k { KBijective => True, KBounded => False, KNone => False };
+
+fn is_bounded(k: CertKind) => Bool =
+  match k { KBijective => False, KBounded => True, KNone => False };
+
+fn is_kind_none(k: CertKind) => Bool =
+  match k { KBijective => False, KBounded => False, KNone => True };
+
+// bool_and: local total conjunction (no cross-leaf import; the std.diag/std.cmp self-containedness
+// convention). Total over Bool x Bool (Exact).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+// bool_not: local total negation. Total (Exact).
+fn bool_not(a: Bool) => Bool =
+  match a { True => False, False => True };
+
+// nonempty: True iff `b` has at least one byte. Delegates to the Exact `bytes_len` prim; the
+// zero-comparison is the Exact `eq` prim at Binary{32} (the width `bytes_len` returns). Total (Exact).
+fn nonempty(b: Bytes) => Bool =
+  match eq(bytes_len(b), 0b0000_0000_0000_0000_0000_0000_0000_0000) { 0b1 => False, _ => True };
+
+// ── The 7 rows (hand-transcribed verbatim from lib.rs::GUARANTEE_MATRIX, RFC-0016 §4.5) ──────────
+// Tags at the SAME strength as the Rust rows (VR-5): the bounded ops' tag is the DEFAULT strength;
+// the kernel cert may reach Proven when the cited theorem's side-conditions check at cert-build
+// time — derived kernel-side, never upgraded here.
+fn row_bin_to_tern() => MatrixRow =
+  Row("bin_to_tern", GExact, True, True, KBijective);
+
+fn row_tern_to_bin() => MatrixRow =
+  Row("tern_to_bin", GExact, True, True, KBijective);
+
+fn row_f32_to_bf16() => MatrixRow =
+  Row("f32_to_bf16", GProven, True, True, KBounded);
+
+fn row_dense_to_vsa() => MatrixRow =
+  Row("dense_to_vsa", GEmpirical, True, True, KBounded);
+
+fn row_vsa_to_dense() => MatrixRow =
+  Row("vsa_to_dense", GEmpirical, True, True, KBounded);
+
+fn row_check_swap() => MatrixRow =
+  Row("check_swap", GExact, True, False, KNone);
+
+fn row_explain() => MatrixRow =
+  Row("explain", GExact, False, True, KNone);
+
+// ── Vec (local, self-contained; mirrors std.diag's cons-list convention — no cross-leaf import) ──
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// matrix: the full 7-row table, in the same order as lib.rs::GUARANTEE_MATRIX.
+fn matrix() => Vec[MatrixRow] =
+  [
+    row_bin_to_tern(),
+    row_tern_to_bin(),
+    row_f32_to_bf16(),
+    row_dense_to_vsa(),
+    row_vsa_to_dense(),
+    row_check_swap(),
+    row_explain()
+  ];
+
+// ── Structural checks over the matrix (the .myc port of lib.rs::assert_matrix_invariants) ────────
+// The Rust source PANICS on violation (a test-time assert); this port returns an explicit Bool —
+// the same never-silent discipline in the value domain (a False is a loud check failure in
+// std_swap.rs, driven against the live Rust oracle). Every check below is Empirical (trials,
+// std_swap.rs three-way differential) over Declared data.
+// matrix_len: the row count, as Binary{8}. O(n) spine-walk (Declared, mirrors std.diag::matrix_len).
+fn matrix_len(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// all_ops_nonempty: no matrix row has an empty op name (lib.rs: "matrix row has empty op name").
+fn all_ops_nonempty(xs: Vec[MatrixRow]) => Bool =
+  match xs { Nil => True, Cons(r, rest) => bool_and(nonempty(row_op(r)), all_ops_nonempty(rest)) };
+
+// bijective_implies_exact: a Bijective cert implies an Exact guarantee — the only genuinely
+// bijective/exact swap class (RFC-0002 §4; lib.rs: "Bijective cert implies Exact guarantee").
+fn bijective_implies_exact(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      bool_and(
+        match is_bijective(row_cert_kind(r)) { True => is_exact(row_guarantee(r)), False => True },
+        bijective_implies_exact(rest)
+      )
+  };
+
+// bounded_never_exact: a Bounded cert is never Exact — Exact means no bound (M-I1; RFC-0001 §4.3;
+// lib.rs: "Bounded cert cannot be Exact").
+fn bounded_never_exact(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      bool_and(
+        match is_bounded(row_cert_kind(r)) {
+          True => bool_not(is_exact(row_guarantee(r))),
+          False => True
+        },
+        bounded_never_exact(rest)
+      )
+  };
+
+// nonfallible_no_cert_kind: a non-fallible op emits no swap cert kind (lib.rs: "non-fallible op
+// should not emit a swap cert_kind" — `explain` is cert_carrying but PROJECTS rather than emits,
+// so its kind is KNone).
+fn nonfallible_no_cert_kind(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) =>
+      bool_and(
+        match row_fallible(r) { True => True, False => is_kind_none(row_cert_kind(r)) },
+        nonfallible_no_cert_kind(rest)
+      )
+  };
+
+// matrix_invariants_hold: the conjunction — the whole assert_matrix_invariants contract as one
+// checkable value. (The Rust "cert_kind must be 'Bijective' or 'Bounded'" arm is discharged by the
+// CertKind type — unrepresentable, see the CertKind doc.)
+fn matrix_invariants_hold() => Bool =
+  bool_and(all_ops_nonempty(matrix()),
+  bool_and(bijective_implies_exact(matrix()),
+  bool_and(bounded_never_exact(matrix()),
+  nonfallible_no_cert_kind(matrix()))));
+
+// ── The bijective swap class, through the language's own construct (S1/WF2) ──────────────────────
+// The `.myc` form of lib.rs::bin_to_tern/tern_to_bin at the RFC-0002 §5 legal pairs (8,6) and
+// (4,3): the native `swap(…, to: …, policy: …)` expression, where the target AND the policy are
+// mandatory SYNTAX — a silent swap does not parse (S1/WF2; the reject-case conformance in
+// std_swap.rs). Width lives in the type here, so each legal pair is its own typed instance where
+// the Rust op takes the width as a runtime parameter (FLAG-swap-0 naming note).
+//
+// Guarantee (VR-5, same strength as the Rust ops): Exact WITHIN RANGE — the kernel engine derives
+// the tag per swap; out-of-range / illegal-pair inputs are explicit runtime REFUSALS (never a
+// clamp, never a sentinel — C1), surfaced identically by the L1 evaluator, the L0 interpreter, and
+// the AOT path (asserted in std_swap.rs). `rt` is the v0 policy name every execution path hashes
+// through the same `policy-name.v0:` reference (NFR-7), the L1-corpus convention.
+fn bin8_to_tern6(x: Binary{8}) => Ternary{6} =
+  swap(x, to: Ternary{6}, policy: rt);
+
+fn tern6_to_bin8(x: Ternary{6}) => Binary{8} =
+  swap(x, to: Binary{8}, policy: rt);
+
+fn bin4_to_tern3(x: Binary{4}) => Ternary{3} =
+  swap(x, to: Ternary{3}, policy: rt);
+
+fn tern3_to_bin4(x: Ternary{3}) => Binary{4} =
+  swap(x, to: Binary{4}, policy: rt);
+
+// roundtrip8 / roundtrip4: dec(enc(x)) — the LosslessWithinRange property (RFC-0002 §4) as a
+// composable value; identity on the full corpus is asserted differentially in std_swap.rs.
+fn roundtrip8(x: Binary{8}) => Binary{8} =
+  tern6_to_bin8(bin8_to_tern6(x));
+
+fn roundtrip4(x: Binary{4}) => Binary{4} =
+  tern3_to_bin4(bin4_to_tern3(x));

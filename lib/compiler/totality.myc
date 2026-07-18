@@ -1,0 +1,947 @@
+// nodule: compiler.totality
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-06
+// @updated: 2026-07-06
+// @summary: Self-hosted structural totality checker (M-740 Stage 4; DN-26 §7.3 row 4). A faithful
+//   port of crates/mycelium-l1/src/totality.rs's `classify_all` (RFC-0007 §4.5 — Foetus-style
+//   structural descent, self- and mutual-recursion) over a SELF-CONTAINED copy of the `ast.myc`
+//   type vocabulary it traverses (`Expr`/`Pattern`/`Arm`/`FnDecl` and their transitive closure).
+nodule compiler.totality;
+
+// M-740 (E18-1, DN-26 §7.3 Stage 4). `crates/mycelium-l1/src/totality.rs` stays the trusted
+// differential oracle (DN-26 §7.4); this file is checked against it by
+// `crates/mycelium-l1/tests/compiler_stage4_totality.rs` (a unit differential over small synthetic
+// `FnDecl` tables — not a corpus sweep, since the input here is a checker-INTERNAL data structure,
+// not source text; DN-26 §7.4/task-brief scope).
+//
+// The checker's contract (mirrors totality.rs::classify_all exactly): every function classifies
+// `Total` (no recursion, or a checked structural descent — self- or mutual-) or `Partial` (anything
+// this structural criterion cannot witness — sound, not complete: never a false `Total`, RFC-0007
+// §4.5's own guarantee). `WalkDepthExceeded` is a never-silent refusal of the PASS's own AST
+// traversal recursion (distinct from the `Totality` verdict itself — an operational resource limit,
+// not a claim about the checked program), mirroring `MAX_WALK_DEPTH` (4096).
+//
+// Representation choices/deviations (each deliberate, honest, DOCUMENTED — VR-5/G2 — never a
+// silent divergence):
+//
+// FLAG-totality-1 (`BTreeMap`/`BTreeSet` -> sorted `Vec[Pair[Bytes, V]]` assoc-lists / `Vec[Bytes]`
+// key lists — the ast.myc FLAG-ast-6 / parse.myc `contains_bytes` convention, at a larger scale).
+// `.myc` has no map/set primitive (M-982); every Rust `BTreeMap<&str,_>`/`BTreeSet<String>` site
+// (the call graph, the SCC `assigned` set, `reaches`'s `seen` set, the mutual-descent `pos`
+// position map, the `smaller`-variable set, the final classification map) becomes a `Vec[Pair[Bytes,
+// V]]` (assoc list, linear-scan `bytes_eq` lookup) or a plain `Vec[Bytes]` (linear-scan membership).
+// **`classify_all`'s own `fns` parameter carries a NARROWED precondition the type itself cannot
+// enforce: it must already be sorted ascending by name (byte-wise)** — mirroring the ordering a
+// `BTreeMap<String, FnDecl>` gives its Rust counterpart for free. Every caller in this port (the
+// Stage-4 differential) constructs its synthetic tables already sorted, so the precondition always
+// holds here; it is a real, honest narrowing (not checked by this file) that a hostile/careless
+// caller could violate — flagged, never silently assumed. Everywhere else order is either
+// (a) provably irrelevant to the final `Total`/`Partial` verdict (SCC member order, `pos`-assignment
+// discovery order — both explored exhaustively regardless of order) or (b) a pure membership/lookup
+// structure (the call graph, `smaller`, `seen`) where duplicate entries are harmless (never
+// deduplicated on insert, unlike a real `BTreeSet` — a query only ever asks "is X present", never
+// "how many", so this costs nothing but a few redundant list cells).
+//
+// FLAG-totality-2 (`walk_expr(e, f: &mut impl FnMut(&Expr))` HOF -> per-use SPECIALIZED
+// traversals). `.myc` has no closure-passing HOF surface a checker pass can rely on (RFC-0037 D5
+// lambdas are staged, M-704); the shared Rust `walk_expr` this file's oracle reuses for BOTH
+// `collect_calls` (the call-graph builder) and `descend_walk` (the mutual-descent search, which
+// ALSO threads the `smaller`/`ok`/`pos` scoped state `walk_expr`'s stateless `FnMut` cannot carry —
+// see totality.rs's own doc comment on why `descend_walk` is deliberately NOT expressed over
+// `walk_expr`) is therefore ported as two INDEPENDENT, fully-specialized preorder traversals:
+// `collect_calls_expr` (this file) and `descend_walk` (this file) — each writes its own complete
+// `Expr` recursion rather than sharing one generic walker. More code, zero HOF surface required —
+// the honest trade this self-hosted stage makes everywhere a Rust closure argument does not survive
+// the port (mirrors parse.myc's own "no generic parser combinator" FLAG-parse-5).
+//
+// FLAG-totality-3 (no `mycelium_stack::with_deep_stack` analogue — rely on the threaded depth
+// budget alone). The oracle wraps `classify_all_inner` in a 256 MiB deep worker stack so
+// `MAX_WALK_DEPTH` (4096) is the thing that refuses a pathological input, never a host-stack
+// overflow, REGARDLESS of the caller's own thread stack size. `.myc` has no host-stack-sizing
+// primitive to port; this file relies ENTIRELY on the explicit `depth: Binary{32}` parameter
+// threaded through every one of its own traversals (`collect_calls_expr`/`descend_walk`/
+// `pattern_binders`), charged once per recursive descent and refused past `max_walk_depth()`
+// (4096 — the same numeric ceiling as the oracle) with an explicit `Err(WDE(...))`. Since the L1
+// evaluator (`crates/mycelium-l1/src/eval.rs`) that ultimately RUNS this file already carries its
+// own `DepthExceeded` guard on the HOST recursion of evaluating `.myc` calls (the FLAG-parse-11
+// "match-arm/let-body tail calls are not elided" gap this differential's own runtime rides), a
+// pathologically-nested synthetic `Expr` fed to this checker refuses via ONE of the two guards
+// (this file's own `MAX_WALK_DEPTH`, or the evaluator's call-depth guard, whichever is shallower for
+// the concrete shape) — never silently, either way (G2).
+//
+// FLAG-totality-4 (`Pattern::Or` reaching `pattern_binders` — a Rust `panic!` invariant violation
+// this file cannot express). The oracle panics if an or-pattern (`p1 | p2 | …`) survives to
+// `pattern_binders` — the checker desugars every `Or` into multiple arms before totality ever runs,
+// so reaching it here is an internal invariant violation, not a real input. `.myc` has no panic
+// primitive; this port's `POr(_)` arm returns `Ok(acc)` (no binders contributed) as a documented,
+// PROVABLY-DEAD fallback — it is never exercised by any input this checker (or its differential)
+// constructs, and it is NOT a claim that or-patterns are handled correctly (if this arm is ever
+// actually reached on a real input, it silently under-collects binders — which is exactly why it is
+// flagged here rather than ported as if it were ordinary business logic, VR-5/G2).
+//
+// FLAG-totality-5 (SCC member order not preserved; `combos` computed with an early-exit product
+// rather than "compute in full, then compare"). `strongly_connected`'s Rust `group.push(other)`
+// (append) becomes a `Cons(other, group)` (prepend) here — cheaper, and PROVABLY order-irrelevant to
+// the final verdict: `group_descends`/`assignment_descends` explore every member regardless of list
+// order, and the singleton-vs-multi-member "is this SCC recursive" check only inspects `scc[0]`
+// specifically when the SCC is a SINGLETON (in which case there is only one possible element, so
+// order cannot matter) — never when `scc.len() > 1` (where the check is unconditionally `True`
+// regardless of which member sits at index 0). Separately, `arity_product_capped` multiplies
+// arities into the running product ONE AT A TIME and refuses (`None`) the moment the running
+// product exceeds `max_assignments()`, rather than computing the FULL product first (as the oracle
+// does) and comparing after — an equivalent, strictly cheaper reformulation (every arity is >= 1 by
+// the point this runs — the nullary-member case already returned `False` earlier — so the running
+// product only ever grows, meaning an early "already over the cap" verdict can never be
+// contradicted by continuing the multiplication).
+
+// ── Option / Vec / Result / Pair (local; self-contained — no cross-nodule `use`, M-982) ───────────
+type Option[A] = Some(A) | None;
+type Vec[A] = Nil | Cons(A, Vec[A]);
+type Result[A, E] = Ok(A) | Err(E);
+type Pair[A, B] = Pr(A, B);
+
+fn pair_key[A, B](p: Pair[A, B]) => A =
+  match p { Pr(k, _) => k };
+
+fn pair_val[A, B](p: Pair[A, B]) => B =
+  match p { Pr(_, v) => v };
+
+// ── zero32 / one32 (the parse.myc convention, redeclared per self-containment) ──────────────────
+fn zero32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_0000;
+fn one32() => Binary{32} = 0b0000_0000_0000_0000_0000_0000_0000_0001;
+
+// ── ast.myc type-vocabulary subset (verbatim constructor spellings — copied in per self-
+// containment, M-982; only the closure `FnDecl`/`Expr`/`Pattern`/`Arm` actually needs; the
+// Item/TraitDecl/ImplDecl/ObjectDecl/ViaDecl/InherentImplDecl/LowerDecl/LowerRhs/DeriveDecl/Nodule/
+// Phylum/UsePath top-level-item universe is NOT part of that closure and is not copied here) ──────
+
+// ── Vis (mirrors ast.myc::Vis) ───────────────────────────────────────────────────────────────────
+type Vis = Private | Pub;
+
+// ── Path (mirrors ast.myc::Path) ─────────────────────────────────────────────────────────────────
+type Path = Pth(Vec[Bytes]);
+
+fn path_segs(p: Path) => Vec[Bytes] =
+  match p { Pth(segs) => segs };
+
+// ── Paradigm (mirrors ast.myc::Paradigm) ─────────────────────────────────────────────────────────
+type Paradigm = PBinary | PTernary | PDense | PVsa;
+
+// ── Scalar (mirrors ast.myc::Scalar) ─────────────────────────────────────────────────────────────
+type Scalar = SF16 | SBf16 | SF32 | SF64;
+
+// ── Sparsity (mirrors ast.myc::Sparsity) ─────────────────────────────────────────────────────────
+type Sparsity = SpDense | SpSparse(Binary{32});
+
+// ── AmbientParams (mirrors ast.myc::AmbientParams) ──────────────────────────────────────────────
+type AmbientParams =
+    APSize(Binary{32})
+  | APDense(Binary{32}, Scalar)
+  | APVsa(Bytes, Binary{32}, Sparsity);
+
+// ── Strength (mirrors ast.myc::Strength) ────────────────────────────────────────────────────────
+type Strength = GExact | GProven | GEmpirical | GDeclared;
+
+// ── WidthRef (mirrors ast.myc::WidthRef) ────────────────────────────────────────────────────────
+type WidthRef = WLit(Binary{32}) | WName(Bytes);
+
+// ── ParamKind (mirrors ast.myc::ParamKind) ──────────────────────────────────────────────────────
+type ParamKind = PkType | PkWidth;
+
+// ── TraitRef (mirrors ast.myc::TraitRef) ────────────────────────────────────────────────────────
+type TraitRef = TRf(Bytes, Vec[TypeRef]);
+
+// ── TypeParam (mirrors ast.myc::TypeParam) ──────────────────────────────────────────────────────
+type TypeParam = TP(Bytes, ParamKind, Vec[TraitRef]);
+
+// ── EffectBudget (mirrors ast.myc::EffectBudget) ────────────────────────────────────────────────
+type EffectBudget = EB(Bytes, Binary{64});
+
+// ── FnSig (mirrors ast.myc::FnSig) ──────────────────────────────────────────────────────────────
+type FnSig = FS(Bytes, Vec[TypeParam], Vec[Param], TypeRef, Vec[Bytes], Vec[EffectBudget]);
+
+fn fnsig_name(s: FnSig) => Bytes =
+  match s { FS(n, _, _, _, _, _) => n };
+
+fn fnsig_value_params(s: FnSig) => Vec[Param] =
+  match s { FS(_, _, vp, _, _, _) => vp };
+
+// ── Param (mirrors ast.myc::Param) ──────────────────────────────────────────────────────────────
+type Param = Prm(Bytes, TypeRef);
+
+fn param_name(p: Param) => Bytes =
+  match p { Prm(n, _) => n };
+
+// ── TypeRef / BaseType (mirror ast.myc::TypeRef / ast.myc::BaseType — mutually recursive; the
+// checker's shell-then-resolve type registration handles this regardless of declaration order,
+// same reasoning as ast.myc's own header note) ─────────────────────────────────────────────────
+type TypeRef = TR(BaseType, Option[Strength]);
+
+type BaseType =
+    KwBinary(WidthRef)
+  | KwTernary(WidthRef)
+  | KwDense(Binary{32}, Scalar)
+  | Vsa(Bytes, Binary{32}, Sparsity)
+  | KwSubstrate(Bytes)
+  | KwSeq(TypeRef, Binary{32})
+  | KwBytes
+  | KwFloat
+  | Named(Bytes, Vec[TypeRef])
+  | Ambient(AmbientParams)
+  | FnArrow(TypeRef, TypeRef)
+  | Tuple(Vec[TypeRef]);
+
+// ── ExecutionMode (mirrors ast.myc::ExecutionMode) ──────────────────────────────────────────────
+type ExecutionMode = Interpreted | Compiled;
+
+// ── FnDecl (mirrors ast.myc::FnDecl) ────────────────────────────────────────────────────────────
+type FnDecl = FD(Vis, Bool, Option[ExecutionMode], FnSig, Expr);
+
+fn fndecl_sig(f: FnDecl) => FnSig =
+  match f { FD(_, _, _, s, _) => s };
+
+fn fndecl_body(f: FnDecl) => Expr =
+  match f { FD(_, _, _, _, b) => b };
+
+// ── Literal (mirrors ast.myc::Literal — declared for Pattern::PLit's closure; never constructed
+// by this file's own logic, which treats every Lit/PLit node as an opaque leaf) ────────────────
+type Literal =
+    Bin(Bytes)
+  | Trit(Bytes)
+  | Int(Binary{64})
+  | AmbientInt(Paradigm, Binary{64})
+  | List(Vec[Expr])
+  | LBytes(Bytes)
+  | Str(Bytes)
+  | LFloat(Bytes);
+
+// ── Pattern (mirrors ast.myc::Pattern) ──────────────────────────────────────────────────────────
+type Pattern =
+    PWildcard
+  | PLit(Literal)
+  | PCtor(Bytes, Vec[Pattern])
+  | PIdent(Bytes)
+  | PTuple(Vec[Pattern])
+  | POr(Vec[Pattern]);
+
+// ── Arm (mirrors ast.myc::Arm) ──────────────────────────────────────────────────────────────────
+type Arm = Ar(Pattern, Expr);
+
+fn arm_pattern(a: Arm) => Pattern =
+  match a { Ar(p, _) => p };
+
+fn arm_body(a: Arm) => Expr =
+  match a { Ar(_, b) => b };
+
+// ── Hypha (mirrors ast.myc::Hypha) ──────────────────────────────────────────────────────────────
+type Hypha = Hy(Option[Expr], Expr);
+
+fn hypha_body(h: Hypha) => Expr =
+  match h { Hy(_, b) => b };
+
+// ── Expr (mirrors ast.myc::Expr) ────────────────────────────────────────────────────────────────
+type Expr =
+    Let(Bytes, Option[TypeRef], Expr, Expr)
+  | If(Expr, Expr, Expr)
+  | Match(Expr, Vec[Arm])
+  | For(Bytes, Expr, Bytes, Expr, Expr)
+  | Swap(Expr, TypeRef, Path)
+  | WithParadigm(Paradigm, Expr)
+  | Wild(Expr)
+  | Spore(Expr)
+  | Wrapping(Expr)
+  | Consume(Expr)
+  // DN-102 (M-1025 ENB-2): the `?` try-operator node. REPRESENTED + traversed here (like
+  // `Wrapping`/`Consume`), but the self-hosted lexer/parser does NOT yet PRODUCE it — the Rust
+  // reference frontend does (ast.rs::Expr::Try), and `myc check` (Rust-backed) handles `?` in a
+  // `.myc` file. Represented-not-produced (never-silent, G2; FLAG-try-3).
+  | Try(Expr)
+  | Colony(Vec[Hypha])
+  | Lambda(Vec[Param], Expr)
+  | App(Expr, Vec[Expr])
+  | Fuse(Expr, Expr)
+  | Reclaim(Expr, Expr)
+  | Path(Path)
+  | Lit(Literal)
+  | Ascribe(Expr, TypeRef)
+  | TupleLit(Vec[Expr]);
+
+// ── Totality (mirrors totality.rs::Totality — the divergence bit, RFC-0007 §4.5) ───────────────
+type Totality = Total | Partial;
+
+// ── WalkDepthExceeded (mirrors totality.rs::WalkDepthExceeded — carries the exceeded budget) ────
+type WalkDepthExceeded = WDE(Binary{32});
+
+// max_walk_depth: mirrors totality.rs::MAX_WALK_DEPTH (4096) exactly — the same numeric ceiling
+// parse.myc's own `max_expr_depth` uses (FLAG-parse-7's sibling budget, a DIFFERENT traversal).
+fn max_walk_depth() => Binary{32} = 0b0000_0000_0000_0000_0001_0000_0000_0000;
+
+// max_assignments: mirrors totality.rs::MAX_ASSIGNMENTS (4096) — a DIFFERENT budget (a bound on
+// the mutual-descent position-assignment SEARCH SPACE, not on AST nesting) that happens to share
+// the same numeric value; kept as its own named constant for honesty (never conflated in-file).
+fn max_assignments() => Binary{32} = 0b0000_0000_0000_0000_0001_0000_0000_0000;
+
+// charge_depth: mirrors the `let depth = depth + 1; if depth > MAX_WALK_DEPTH { return Err(...) }`
+// prologue shared by totality.rs's `walk_expr_at`/`descend_walk`/`pattern_binders` (M-674's
+// FLAG-totality-3 threaded-budget discipline).
+fn charge_depth(depth: Binary{32}) => Result[Binary{32}, WalkDepthExceeded] =
+  let d2 = add_u(depth, one32()) in
+  match lt(max_walk_depth(), d2) {
+    0b1 => Err(WDE(max_walk_depth())),
+    _ => Ok(d2)
+  };
+
+// ── Bytes assoc-list / set helpers (FLAG-totality-1) ────────────────────────────────────────────
+
+// alist_get: linear-scan lookup by Bytes key (the BTreeMap::get / BTreeMap::contains_key mirror).
+fn alist_get[V](xs: Vec[Pair[Bytes, V]], k: Bytes) => Option[V] =
+  match xs {
+    Nil => None,
+    Cons(p, rest) => match bytes_eq(pair_key(p), k) {
+      0b1 => Some(pair_val(p)),
+      _ => alist_get(rest, k)
+    }
+  };
+
+// contains_bytes / add_bytes_if_absent: the parse.myc convention (redeclared, self-contained) —
+// the BTreeSet<String>::contains / ::insert mirror over a plain Vec[Bytes].
+fn contains_bytes(xs: Vec[Bytes], x: Bytes) => Bool =
+  match xs {
+    Nil => False,
+    Cons(h, rest) => match bytes_eq(h, x) {
+      0b1 => True,
+      _ => contains_bytes(rest, x)
+    }
+  };
+
+fn add_bytes_if_absent(xs: Vec[Bytes], x: Bytes) => Vec[Bytes] =
+  match contains_bytes(xs, x) {
+    True => xs,
+    False => Cons(x, xs)
+  };
+
+// remove_bytes: drop every occurrence of `x` from `xs` (the BTreeSet::remove mirror; direct-tail
+// accumulator + rev_acc, bounded by list LENGTH — idiom #2).
+fn remove_bytes_acc(xs: Vec[Bytes], x: Bytes, acc: Vec[Bytes]) => Vec[Bytes] =
+  match xs {
+    Nil => rev_acc(acc, Nil : Vec[Bytes]),
+    Cons(h, rest) => match bytes_eq(h, x) {
+      0b1 => remove_bytes_acc(rest, x, acc),
+      _ => remove_bytes_acc(rest, x, Cons(h, acc))
+    }
+  };
+
+fn remove_bytes(xs: Vec[Bytes], x: Bytes) => Vec[Bytes] =
+  remove_bytes_acc(xs, x, Nil : Vec[Bytes]);
+
+fn remove_all_bytes(xs: Vec[Bytes], names: Vec[Bytes]) => Vec[Bytes] =
+  match names {
+    Nil => xs,
+    Cons(n, rest) => remove_all_bytes(remove_bytes(xs, n), rest)
+  };
+
+fn add_all_bytes(xs: Vec[Bytes], names: Vec[Bytes]) => Vec[Bytes] =
+  match names {
+    Nil => xs,
+    Cons(n, rest) => add_all_bytes(add_bytes_if_absent(xs, n), rest)
+  };
+
+// append_bytes: `xs ++ ys` (order-irrelevant for the reachability worklist it feeds — direct-tail
+// accumulator + rev_acc, bounded by `xs`'s length — idiom #2).
+fn append_bytes_acc(xs: Vec[Bytes], ys: Vec[Bytes], acc: Vec[Bytes]) => Vec[Bytes] =
+  match xs {
+    Nil => rev_acc(acc, ys),
+    Cons(h, rest) => append_bytes_acc(rest, ys, Cons(h, acc))
+  };
+
+fn append_bytes(xs: Vec[Bytes], ys: Vec[Bytes]) => Vec[Bytes] =
+  append_bytes_acc(xs, ys, Nil : Vec[Bytes]);
+
+// rev_acc: the direct-tail list reversal underpinning every accumulator+reverse builder above
+// (the parse.myc M-985 convention, redeclared per self-containment).
+fn rev_acc[A](xs: Vec[A], acc: Vec[A]) => Vec[A] =
+  match xs { Nil => acc, Cons(h, rest) => rev_acc(rest, Cons(h, acc)) };
+
+// ── small Vec indexing / length helpers (mirror the Rust `.len()`/`.get(i)` call sites) ────────
+
+fn vec_param_len(ps: Vec[Param]) => Binary{32} =
+  match ps { Nil => zero32(), Cons(_, rest) => add_u(one32(), vec_param_len(rest)) };
+
+fn vec_param_get(xs: Vec[Param], i: Binary{32}) => Option[Param] =
+  match xs {
+    Nil => None,
+    Cons(x, rest) => match eq(i, zero32()) {
+      0b1 => Some(x),
+      _ => vec_param_get(rest, sub_u(i, one32()))
+    }
+  };
+
+fn vec_expr_get(xs: Vec[Expr], i: Binary{32}) => Option[Expr] =
+  match xs {
+    Nil => None,
+    Cons(x, rest) => match eq(i, zero32()) {
+      0b1 => Some(x),
+      _ => vec_expr_get(rest, sub_u(i, one32()))
+    }
+  };
+
+// ── app_call_name / expr_is_smaller (single-level-deep helpers shared by both traversals below —
+// M-980 split-match idiom: each `match` here inspects exactly ONE value one level deep) ─────────
+
+// app_call_name: if `head` is a single-segment `Path`, its name; otherwise `None`. Mirrors the
+// `if let Expr::Path(p) = head.as_ref() { if p.0.len() == 1 { ... } }` guard shared by
+// `collect_calls`'s visitor and `descend_walk`'s `App` case.
+fn app_call_name(head: Expr) => Option[Bytes] =
+  match head {
+    Path(p) => match path_segs(p) {
+      Cons(name, rest) => match rest {
+        Nil => Some(name),
+        Cons(_, _) => None
+      },
+      Nil => None
+    },
+    _ => None
+  };
+
+// expr_is_smaller: mirrors `match scrutinee.as_ref() { Expr::Path(p) if p.0.len()==1 => p.0[0] ==
+// param || smaller.contains(&p.0[0]), _ => false }`.
+fn expr_is_smaller(e: Expr, param: Bytes, smaller: Vec[Bytes]) => Bool =
+  match e {
+    Path(p) => match path_segs(p) {
+      Cons(v, rest) => match rest {
+        Nil => match bytes_eq(v, param) { 0b1 => True, _ => contains_bytes(smaller, v) },
+        Cons(_, _) => False
+      },
+      Nil => False
+    },
+    _ => False
+  };
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// collect_calls_expr — the call-graph builder (FLAG-totality-2's first specialized traversal).
+// Mirrors totality.rs::collect_calls (itself `walk_expr` + a visitor closure): a preorder walk of
+// `e` collecting every name in `fn_names` that `e` calls (directly, as a single-segment `App`
+// head). `acc` is a plain Vec[Bytes] (membership-only; duplicates harmless — FLAG-totality-1).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+fn collect_calls_expr(e: Expr, fn_names: Vec[Bytes], depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match charge_depth(depth) {
+    Err(err) => Err(err),
+    Ok(d) => match e {
+      Let(_, _, bound, body) =>
+        match collect_calls_expr(bound, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => collect_calls_expr(body, fn_names, d, acc2)
+        },
+      If(cond, conseq, alt) =>
+        match collect_calls_expr(cond, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => match collect_calls_expr(conseq, fn_names, d, acc2) {
+            Err(e3) => Err(e3),
+            Ok(acc3) => collect_calls_expr(alt, fn_names, d, acc3)
+          }
+        },
+      Match(scrutinee, arms) =>
+        match collect_calls_expr(scrutinee, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => collect_calls_arm_list(arms, fn_names, d, acc2)
+        },
+      // A `for` is bounded by construction (RFC-0007 §4.8) — no recursion of its own, only the
+      // calls inside its sub-expressions matter (mirrors totality.rs's own `walk_expr_at` note).
+      For(_, xs, _, init, body) =>
+        match collect_calls_expr(xs, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => match collect_calls_expr(init, fn_names, d, acc2) {
+            Err(e3) => Err(e3),
+            Ok(acc3) => collect_calls_expr(body, fn_names, d, acc3)
+          }
+        },
+      Swap(value, _, _) => collect_calls_expr(value, fn_names, d, acc),
+      WithParadigm(_, body) => collect_calls_expr(body, fn_names, d, acc),
+      // `wild` is the audited/opaque FFI escape (M-661) — a LEAF here too, mirroring the oracle:
+      // calls inside a `wild` body never leak into the enclosing fn's call graph.
+      Wild(_) => Ok(acc),
+      Spore(b) => collect_calls_expr(b, fn_names, d, acc),
+      Wrapping(b) => collect_calls_expr(b, fn_names, d, acc),
+      Consume(b) => collect_calls_expr(b, fn_names, d, acc),
+      Try(b) => collect_calls_expr(b, fn_names, d, acc),
+      Colony(hyphae) => collect_calls_hypha_list(hyphae, fn_names, d, acc),
+      Lambda(_, body) => collect_calls_expr(body, fn_names, d, acc),
+      App(head, args) =>
+        let acc1 = match app_call_name(head) {
+          Some(name) => match contains_bytes(fn_names, name) {
+            True => Cons(name, acc),
+            False => acc
+          },
+          None => acc
+        } in
+        match collect_calls_expr(head, fn_names, d, acc1) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => collect_calls_list(args, fn_names, d, acc2)
+        },
+      Fuse(left, right) =>
+        match collect_calls_expr(left, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => collect_calls_expr(right, fn_names, d, acc2)
+        },
+      Reclaim(pol, body) =>
+        match collect_calls_expr(pol, fn_names, d, acc) {
+          Err(e2) => Err(e2),
+          Ok(acc2) => collect_calls_expr(body, fn_names, d, acc2)
+        },
+      Path(_) => Ok(acc),
+      Lit(_) => Ok(acc),
+      Ascribe(b, _) => collect_calls_expr(b, fn_names, d, acc),
+      TupleLit(elems) => collect_calls_list(elems, fn_names, d, acc)
+    }
+  };
+
+fn collect_calls_list(xs: Vec[Expr], fn_names: Vec[Bytes], depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(acc),
+    Cons(h, rest) => match collect_calls_expr(h, fn_names, depth, acc) {
+      Err(e) => Err(e),
+      Ok(acc2) => collect_calls_list(rest, fn_names, depth, acc2)
+    }
+  };
+
+fn collect_calls_arm_list(xs: Vec[Arm], fn_names: Vec[Bytes], depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(acc),
+    Cons(a, rest) => match collect_calls_expr(arm_body(a), fn_names, depth, acc) {
+      Err(e) => Err(e),
+      Ok(acc2) => collect_calls_arm_list(rest, fn_names, depth, acc2)
+    }
+  };
+
+fn collect_calls_hypha_list(xs: Vec[Hypha], fn_names: Vec[Bytes], depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(acc),
+    Cons(h, rest) => match collect_calls_expr(hypha_body(h), fn_names, depth, acc) {
+      Err(e) => Err(e),
+      Ok(acc2) => collect_calls_hypha_list(rest, fn_names, depth, acc2)
+    }
+  };
+
+// ── fn table / call graph ────────────────────────────────────────────────────────────────────────
+
+// fn_table_names: extract just the names, ORDER PRESERVED (the caller's sortedness precondition,
+// FLAG-totality-1, rides through unchanged). Direct-tail accumulator + rev_acc — bounded by the
+// number of functions in the table (idiom #2).
+fn fn_table_names_acc(fns: Vec[Pair[Bytes, FnDecl]], acc: Vec[Bytes]) => Vec[Bytes] =
+  match fns {
+    Nil => rev_acc(acc, Nil : Vec[Bytes]),
+    Cons(p, rest) => fn_table_names_acc(rest, Cons(pair_key(p), acc))
+  };
+
+fn fn_table_names(fns: Vec[Pair[Bytes, FnDecl]]) => Vec[Bytes] =
+  fn_table_names_acc(fns, Nil : Vec[Bytes]);
+
+// build_calls: one collect_calls_expr per function, in table order (order irrelevant to the
+// resulting lookup-only map — FLAG-totality-1). Direct-tail.
+fn build_calls(fns: Vec[Pair[Bytes, FnDecl]], fn_names: Vec[Bytes], acc: Vec[Pair[Bytes, Vec[Bytes]]]) => Result[Vec[Pair[Bytes, Vec[Bytes]]], WalkDepthExceeded] =
+  match fns {
+    Nil => Ok(acc),
+    Cons(p, rest) => match collect_calls_expr(fndecl_body(pair_val(p)), fn_names, zero32(), Nil : Vec[Bytes]) {
+      Err(e) => Err(e),
+      Ok(out) => build_calls(rest, fn_names, Cons(Pr(pair_key(p), out), acc))
+    }
+  };
+
+// ── graph reachability (mirrors totality.rs::reaches — an explicit worklist, no depth budget:
+// the oracle itself carries none here, only walk_expr/descend_walk/pattern_binders do) ──────────
+
+fn reaches_step(target: Bytes, calls: Vec[Pair[Bytes, Vec[Bytes]]], seen: Vec[Bytes], stack: Vec[Bytes]) => Bool =
+  match stack {
+    Nil => False,
+    Cons(f, rest_stack) => match contains_bytes(seen, f) {
+      True => reaches_step(target, calls, seen, rest_stack),
+      False =>
+        let seen2 = Cons(f, seen) in
+        match alist_get(calls, f) {
+          None => reaches_step(target, calls, seen2, rest_stack),
+          Some(cs) => match contains_bytes(cs, target) {
+            True => True,
+            False => reaches_step(target, calls, seen2, append_bytes(cs, rest_stack))
+          }
+        }
+    }
+  };
+
+fn reaches(from: Bytes, target: Bytes, calls: Vec[Pair[Bytes, Vec[Bytes]]]) => Bool =
+  reaches_step(target, calls, Nil : Vec[Bytes], Cons(from, Nil : Vec[Bytes]));
+
+// ── strongly_connected (mirrors totality.rs::strongly_connected — a greedy grouping over the
+// mutual-reachability equivalence; FLAG-totality-5's order note applies to `group`) ────────────
+
+fn scc_inner_scan(others: Vec[Bytes], calls: Vec[Pair[Bytes, Vec[Bytes]]], name: Bytes, assigned: Vec[Bytes], group: Vec[Bytes]) => Pair[Vec[Bytes], Vec[Bytes]] =
+  match others {
+    Nil => Pr(group, assigned),
+    Cons(other, rest) => match contains_bytes(assigned, other) {
+      True => scc_inner_scan(rest, calls, name, assigned, group),
+      False => match reaches(name, other, calls) {
+        False => scc_inner_scan(rest, calls, name, assigned, group),
+        True => match reaches(other, name, calls) {
+          False => scc_inner_scan(rest, calls, name, assigned, group),
+          True => scc_inner_scan(rest, calls, name, Cons(other, assigned), Cons(other, group))
+        }
+      }
+    }
+  };
+
+fn scc_outer(remaining: Vec[Bytes], fn_names: Vec[Bytes], calls: Vec[Pair[Bytes, Vec[Bytes]]], assigned: Vec[Bytes], acc: Vec[Vec[Bytes]]) => Vec[Vec[Bytes]] =
+  match remaining {
+    Nil => rev_acc(acc, Nil : Vec[Vec[Bytes]]),
+    Cons(name, rest) => match contains_bytes(assigned, name) {
+      True => scc_outer(rest, fn_names, calls, assigned, acc),
+      False =>
+        let assigned2 = Cons(name, assigned) in
+        match scc_inner_scan(fn_names, calls, name, assigned2, Cons(name, Nil : Vec[Bytes])) {
+          Pr(group, assigned3) => scc_outer(rest, fn_names, calls, assigned3, Cons(group, acc))
+        }
+    }
+  };
+
+fn strongly_connected(fn_names: Vec[Bytes], calls: Vec[Pair[Bytes, Vec[Bytes]]]) => Vec[Vec[Bytes]] =
+  scc_outer(fn_names, fn_names, calls, Nil : Vec[Bytes], Nil : Vec[Vec[Bytes]]);
+
+// ── arity / assignment-search helpers (mirror totality.rs::group_descends' setup) ──────────────
+
+fn scc_members(scc: Vec[Bytes], fns: Vec[Pair[Bytes, FnDecl]]) => Vec[FnDecl] =
+  match scc {
+    Nil => Nil,
+    Cons(name, rest) => match alist_get(fns, name) {
+      Some(fd) => Cons(fd, scc_members(rest, fns)),
+      // Unreachable by construction: every SCC name originates from `fn_table_names(fns)`, so a
+      // lookup miss here would be an internal invariant violation, never a real input. `.myc` has
+      // no panic primitive (FLAG-totality-4's reasoning applies identically here); this documented,
+      // provably-dead placeholder keeps the match total without fabricating a misleading error.
+      None => Cons(FD(Private, False, None, FS("", Nil : Vec[TypeParam], Nil : Vec[Param], TR(KwBytes, None), Nil : Vec[Bytes], Nil : Vec[EffectBudget]), Path(Pth(Nil : Vec[Bytes]))), scc_members(rest, fns))
+    }
+  };
+
+fn member_arities(members: Vec[FnDecl]) => Vec[Binary{32}] =
+  match members {
+    Nil => Nil,
+    Cons(fd, rest) => Cons(vec_param_len(fnsig_value_params(fndecl_sig(fd))), member_arities(rest))
+  };
+
+fn any_zero(xs: Vec[Binary{32}]) => Bool =
+  match xs {
+    Nil => False,
+    Cons(h, rest) => match eq(h, zero32()) { 0b1 => True, _ => any_zero(rest) }
+  };
+
+// arity_product_capped: FLAG-totality-5's early-exit product (equivalent to, cheaper than, the
+// oracle's "compute in full, compare after").
+fn arity_product_capped_acc(arities: Vec[Binary{32}], running: Binary{32}, cap: Binary{32}) => Option[Binary{32}] =
+  match arities {
+    Nil => Some(running),
+    Cons(a, rest) =>
+      let p = mul_s(running, a) in
+      match lt(cap, p) {
+        0b1 => None,
+        _ => arity_product_capped_acc(rest, p, cap)
+      }
+  };
+
+fn arity_product_capped(arities: Vec[Binary{32}], cap: Binary{32}) => Option[Binary{32}] =
+  arity_product_capped_acc(arities, one32(), cap);
+
+// decode_pos: the mixed-radix digit decomposition of `rem` over `arities`, zipped with `members`'
+// names (mirrors group_descends's `pos.insert(fd.sig.name.as_str(), rem % arity); rem /= arity`).
+// Order among `pos` entries is irrelevant (assoc list, lookup only — FLAG-totality-1).
+fn decode_pos_acc(members: Vec[FnDecl], arities: Vec[Binary{32}], rem: Binary{32}, acc: Vec[Pair[Bytes, Binary{32}]]) => Vec[Pair[Bytes, Binary{32}]] =
+  match members {
+    Nil => acc,
+    Cons(fd, rest_m) => match arities {
+      // Unreachable by construction: `arities` is always `member_arities(members)`, so the two
+      // lists are always the same length.
+      Nil => acc,
+      Cons(arity, rest_a) =>
+        let name = fnsig_name(fndecl_sig(fd)) in
+        let p = rem_u(rem, arity) in
+        let rem2 = div_u(rem, arity) in
+        decode_pos_acc(rest_m, rest_a, rem2, Cons(Pr(name, p), acc))
+    }
+  };
+
+fn decode_pos(members: Vec[FnDecl], arities: Vec[Binary{32}], rem: Binary{32}) => Vec[Pair[Bytes, Binary{32}]] =
+  decode_pos_acc(members, arities, rem, Nil : Vec[Pair[Bytes, Binary{32}]]);
+
+// ── app_call_ok (the App-call structural-descent check shared by descend_walk's App arm) ───────
+
+fn app_call_ok(head: Expr, args: Vec[Expr], pos: Vec[Pair[Bytes, Binary{32}]], smaller: Vec[Bytes], ok: Bool) => Bool =
+  match app_call_name(head) {
+    None => ok,
+    Some(name) => match alist_get(pos, name) {
+      None => ok,
+      Some(tpos) =>
+        let good = match vec_expr_get(args, tpos) {
+          None => False,
+          Some(a) => match a {
+            Path(p) => match path_segs(p) {
+              Cons(v, rest) => match rest {
+                Nil => contains_bytes(smaller, v),
+                Cons(_, _) => False
+              },
+              Nil => False
+            },
+            _ => False
+          }
+        } in
+        match good { True => ok, False => False }
+    }
+  };
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// descend_walk — the mutual-descent search (FLAG-totality-2's second specialized traversal).
+// Mirrors totality.rs::descend_walk exactly: `ok` (running, never reset once False — every
+// subtree is still walked so a later WalkDepthExceeded is never silently skipped) and `smaller`
+// (the scoped smaller-than-`param` variable set) are both threaded functionally rather than via
+// `&mut` (Rust's mutate-then-restore around each Match arm becomes: compute this arm's OWN
+// `smaller` from the untouched `smaller_outer`, recurse, then move to the next arm using
+// `smaller_outer` again — no explicit "restore" bookkeeping needed, since nothing was mutated).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+fn descend_walk(e: Expr, pos: Vec[Pair[Bytes, Binary{32}]], param: Bytes, smaller: Vec[Bytes], ok: Bool, depth: Binary{32}) => Result[Bool, WalkDepthExceeded] =
+  match charge_depth(depth) {
+    Err(err) => Err(err),
+    Ok(d) => match e {
+      App(head, args) =>
+        let ok1 = app_call_ok(head, args, pos, smaller, ok) in
+        match descend_walk(head, pos, param, smaller, ok1, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) => descend_walk_list(args, pos, param, smaller, ok2, d)
+        },
+      Match(scrutinee, arms) =>
+        match descend_walk(scrutinee, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) =>
+            let scrut_small = expr_is_smaller(scrutinee, param, smaller) in
+            descend_walk_arms(arms, pos, param, smaller, ok2, scrut_small, d)
+        },
+      Let(name, _, bound, body) =>
+        match descend_walk(bound, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) =>
+            let smaller2 = remove_bytes(smaller, name) in
+            descend_walk(body, pos, param, smaller2, ok2, d)
+        },
+      If(cond, conseq, alt) =>
+        match descend_walk(cond, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) => match descend_walk(conseq, pos, param, smaller, ok2, d) {
+            Err(e3) => Err(e3),
+            Ok(ok3) => descend_walk(alt, pos, param, smaller, ok3, d)
+          }
+        },
+      For(x, xs, acc_name, init, body) =>
+        match descend_walk(xs, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) => match descend_walk(init, pos, param, smaller, ok2, d) {
+            Err(e3) => Err(e3),
+            Ok(ok3) =>
+              let smaller2 = remove_bytes(remove_bytes(smaller, x), acc_name) in
+              descend_walk(body, pos, param, smaller2, ok3, d)
+          }
+        },
+      Swap(value, _, _) => descend_walk(value, pos, param, smaller, ok, d),
+      WithParadigm(_, body) => descend_walk(body, pos, param, smaller, ok, d),
+      // `wild` is opaque trusted FFI (M-661) — a leaf here too, mirroring `walk_expr`'s own
+      // opacity invariant (a call inside `wild` is not analyzable Mycelium recursion).
+      Wild(_) => Ok(ok),
+      Spore(b) => descend_walk(b, pos, param, smaller, ok, d),
+      Wrapping(b) => descend_walk(b, pos, param, smaller, ok, d),
+      Consume(b) => descend_walk(b, pos, param, smaller, ok, d),
+      Try(b) => descend_walk(b, pos, param, smaller, ok, d),
+      Lambda(_, body) => descend_walk(body, pos, param, smaller, ok, d),
+      Colony(hyphae) => descend_walk_hyphae(hyphae, pos, param, smaller, ok, d),
+      Ascribe(b, _) => descend_walk(b, pos, param, smaller, ok, d),
+      Fuse(left, right) =>
+        match descend_walk(left, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) => descend_walk(right, pos, param, smaller, ok2, d)
+        },
+      Reclaim(pol, body) =>
+        match descend_walk(pol, pos, param, smaller, ok, d) {
+          Err(e2) => Err(e2),
+          Ok(ok2) => descend_walk(body, pos, param, smaller, ok2, d)
+        },
+      TupleLit(elems) => descend_walk_list(elems, pos, param, smaller, ok, d),
+      Path(_) => Ok(ok),
+      Lit(_) => Ok(ok)
+    }
+  };
+
+fn descend_walk_list(xs: Vec[Expr], pos: Vec[Pair[Bytes, Binary{32}]], param: Bytes, smaller: Vec[Bytes], ok: Bool, depth: Binary{32}) => Result[Bool, WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(ok),
+    Cons(h, rest) => match descend_walk(h, pos, param, smaller, ok, depth) {
+      Err(e) => Err(e),
+      Ok(ok2) => descend_walk_list(rest, pos, param, smaller, ok2, depth)
+    }
+  };
+
+fn descend_walk_hyphae(xs: Vec[Hypha], pos: Vec[Pair[Bytes, Binary{32}]], param: Bytes, smaller: Vec[Bytes], ok: Bool, depth: Binary{32}) => Result[Bool, WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(ok),
+    Cons(h, rest) => match descend_walk(hypha_body(h), pos, param, smaller, ok, depth) {
+      Err(e) => Err(e),
+      Ok(ok2) => descend_walk_hyphae(rest, pos, param, smaller, ok2, depth)
+    }
+  };
+
+// descend_walk_arms: mirrors the Match-arm shadow/promote-then-restore dance (see the file-level
+// note above for why no explicit "restore" step is needed in this functional threading).
+fn descend_walk_arms(arms: Vec[Arm], pos: Vec[Pair[Bytes, Binary{32}]], param: Bytes, smaller_outer: Vec[Bytes], ok: Bool, scrut_small: Bool, depth: Binary{32}) => Result[Bool, WalkDepthExceeded] =
+  match arms {
+    Nil => Ok(ok),
+    Cons(a, rest) =>
+      let pattern = arm_pattern(a) in
+      match pattern_binders(pattern, zero32()) {
+        Err(e) => Err(e),
+        Ok(introduced) =>
+          let smaller_shadow_removed = remove_all_bytes(smaller_outer, introduced) in
+          let smaller_for_arm = match scrut_small {
+            False => smaller_shadow_removed,
+            True => match pattern {
+              PCtor(_, _) => add_all_bytes(smaller_shadow_removed, introduced),
+              _ => smaller_shadow_removed
+            }
+          } in
+          match descend_walk(arm_body(a), pos, param, smaller_for_arm, ok, depth) {
+            Err(e) => Err(e),
+            Ok(ok2) => descend_walk_arms(rest, pos, param, smaller_outer, ok2, scrut_small, depth)
+          }
+      }
+  };
+
+// pattern_binders: mirrors totality.rs::pattern_binders (every variable a pattern binds,
+// recursively). FLAG-totality-4 covers the `POr` dead-fallback.
+fn pattern_binders_list(xs: Vec[Pattern], depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match xs {
+    Nil => Ok(acc),
+    Cons(h, rest) => match pattern_binders_acc(h, depth, acc) {
+      Err(e) => Err(e),
+      Ok(acc2) => pattern_binders_list(rest, depth, acc2)
+    }
+  };
+
+fn pattern_binders_acc(p: Pattern, depth: Binary{32}, acc: Vec[Bytes]) => Result[Vec[Bytes], WalkDepthExceeded] =
+  match charge_depth(depth) {
+    Err(err) => Err(err),
+    Ok(d) => match p {
+      PIdent(b) => Ok(Cons(b, acc)),
+      PCtor(_, subs) => pattern_binders_list(subs, d, acc),
+      PTuple(subs) => pattern_binders_list(subs, d, acc),
+      PWildcard => Ok(acc),
+      PLit(_) => Ok(acc),
+      // FLAG-totality-4: documented dead fallback — see the file-level note.
+      POr(_) => Ok(acc)
+    }
+  };
+
+fn pattern_binders(p: Pattern, depth: Binary{32}) => Result[Vec[Bytes], WalkDepthExceeded] =
+  pattern_binders_acc(p, depth, Nil : Vec[Bytes]);
+
+// ── group_descends / assignment_descends (mirror totality.rs exactly) ──────────────────────────
+
+fn assignment_descends_scan(members: Vec[FnDecl], pos: Vec[Pair[Bytes, Binary{32}]]) => Result[Bool, WalkDepthExceeded] =
+  match members {
+    Nil => Ok(True),
+    Cons(fd, rest) =>
+      let sig = fndecl_sig(fd) in
+      let name = fnsig_name(sig) in
+      match alist_get(pos, name) {
+        // Unreachable by construction: every member of `members` has a `pos` entry (decode_pos
+        // assigns one to each member of the SAME list this was built from).
+        None => Ok(False),
+        Some(idx) => match vec_param_get(fnsig_value_params(sig), idx) {
+          // Unreachable by construction: `idx` is always `< ` this member's own arity (it came
+          // from decoding a mixed-radix digit bounded by that arity).
+          None => Ok(False),
+          Some(param) =>
+            match descend_walk(fndecl_body(fd), pos, param_name(param), Nil : Vec[Bytes], True, zero32()) {
+              Err(e) => Err(e),
+              Ok(b) => match b {
+                True => assignment_descends_scan(rest, pos),
+                False => Ok(False)
+              }
+            }
+        }
+      }
+  };
+
+fn assignment_descends(members: Vec[FnDecl], pos: Vec[Pair[Bytes, Binary{32}]]) => Result[Bool, WalkDepthExceeded] =
+  assignment_descends_scan(members, pos);
+
+fn group_descends_search(members: Vec[FnDecl], arities: Vec[Binary{32}], rem: Binary{32}, combos: Binary{32}) => Result[Bool, WalkDepthExceeded] =
+  match lt(rem, combos) {
+    0b1 =>
+      let pos = decode_pos(members, arities, rem) in
+      match assignment_descends(members, pos) {
+        Err(e) => Err(e),
+        Ok(b) => match b {
+          True => Ok(True),
+          False => group_descends_search(members, arities, add_u(rem, one32()), combos)
+        }
+      },
+    _ => Ok(False)
+  };
+
+fn group_descends(scc: Vec[Bytes], fns: Vec[Pair[Bytes, FnDecl]]) => Result[Bool, WalkDepthExceeded] =
+  let members = scc_members(scc, fns) in
+  let arities = member_arities(members) in
+  match any_zero(arities) {
+    True => Ok(False),
+    False => match arity_product_capped(arities, max_assignments()) {
+      None => Ok(False),
+      Some(combos) => group_descends_search(members, arities, zero32(), combos)
+    }
+  };
+
+// ── classify_all (mirrors totality.rs::classify_all_inner — no with_deep_stack wrapper needed
+// here, FLAG-totality-3) ─────────────────────────────────────────────────────────────────────────
+
+fn scc_recursive_flag(scc: Vec[Bytes], calls: Vec[Pair[Bytes, Vec[Bytes]]]) => Bool =
+  match scc {
+    // Unreachable by construction: `scc_outer` always seeds `group` with `Cons(name, Nil)`, so an
+    // SCC is never empty.
+    Nil => False,
+    Cons(h, rest) => match rest {
+      Nil => match alist_get(calls, h) { Some(cs) => contains_bytes(cs, h), None => False },
+      Cons(_, _) => True
+    }
+  };
+
+fn assign_totality_all(scc: Vec[Bytes], t: Totality, acc: Vec[Pair[Bytes, Totality]]) => Vec[Pair[Bytes, Totality]] =
+  match scc {
+    Nil => acc,
+    Cons(h, rest) => assign_totality_all(rest, t, Cons(Pr(h, t), acc))
+  };
+
+fn classify_sccs(sccs: Vec[Vec[Bytes]], fns: Vec[Pair[Bytes, FnDecl]], calls: Vec[Pair[Bytes, Vec[Bytes]]], acc: Vec[Pair[Bytes, Totality]]) => Result[Vec[Pair[Bytes, Totality]], WalkDepthExceeded] =
+  match sccs {
+    Nil => Ok(acc),
+    Cons(scc, rest) => match scc_recursive_flag(scc, calls) {
+      False => classify_sccs(rest, fns, calls, assign_totality_all(scc, Total, acc)),
+      True => match group_descends(scc, fns) {
+        Err(e) => Err(e),
+        Ok(descends) =>
+          let t = match descends { True => Total, False => Partial } in
+          classify_sccs(rest, fns, calls, assign_totality_all(scc, t, acc))
+      }
+    }
+  };
+
+// classify_all: the public entry (mirrors totality.rs::classify_all/classify_all_inner). PRECONDITION
+// (FLAG-totality-1, not enforced by this file): `fns` must already be sorted ascending by name.
+fn classify_all(fns: Vec[Pair[Bytes, FnDecl]]) => Result[Vec[Pair[Bytes, Totality]], WalkDepthExceeded] =
+  let fn_names = fn_table_names(fns) in
+  match build_calls(fns, fn_names, Nil : Vec[Pair[Bytes, Vec[Bytes]]]) {
+    Err(e) => Err(e),
+    Ok(calls) => classify_sccs(strongly_connected(fn_names, calls), fns, calls, Nil : Vec[Pair[Bytes, Totality]])
+  };

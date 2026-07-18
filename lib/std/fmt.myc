@@ -1,0 +1,247 @@
+// nodule: std.fmt
+// @version: 0.2.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-26
+// @updated: 2026-07-12
+// @summary: Self-hosted first-order formatting: hex-digit conversion and two-digit hex encoding,
+nodule std.fmt;
+
+// plus (DN-127/M-1090 WU-1) decimal int-to-Bytes rendering (`digit_byte`/`to_dec`/`to_dec_s`) and
+// `impl Show` for the primitive reprs (`Binary{64}`, `Bytes`, `Bool`) — the value-to-text PROBLEM's
+// native answer (pure `render: T => Bytes`, no new kernel prim, KC-3 held).
+// of a Binary{8} byte. M-717 (E13-1, #462). Self-contained: no import of std.collections
+// or std.text (not available in this worktree; must not be imported per worktree discipline).
+// Guarantee: `hex_digit` is total over its finite nibble domain (Binary{8} inputs 0..15) — the
+// case split is match-defined via `lt` + `add_u` making each in-range arm Exact; nibble >= 16
+// returns '?' (0x3F), never-silent (G2: the fallback is explicit, not a silent wrap).
+// `nibble_lo(x)` is Exact (total bit-mask over Binary{8}). `nibble_hi(x)` is Exact over the
+// 16 possible masked values via a 4-level lt binary-search match tree — implementable without
+// a right-shift prim. `to_hex` is Declared (structural composition of nibble_hi/nibble_lo +
+// hex_digit). Differential agreement (L1-eval ≡ L0-interp ≡ AOT) is Empirical (trials,
+// std_fmt.rs). Honesty boundary: no reflective `display(Value)` — .myc has no Value introspection;
+// fmt is first-order over concrete types only. Grounding: hand-computed values, three-way verified
+// (L1≡L0≡AOT). crates/mycelium-std-fmt exists but exposes a different Ring-2 surface (no
+// hex_digit/to_hex) — it is not the structural oracle.
+// ── HexPair — the two ASCII hex-digit bytes of a byte encoding ────────────────────────────────────
+// HexPair: carries the high-nibble digit and the low-nibble digit as ASCII bytes (Binary{8}).
+// Used as the return type of `to_hex` so the result is a first-class value pair. (A Bytes return
+// would require bytes_concat which is not surface-callable — see FLAG-text-3 in text.myc.)
+type HexPair = HP(Binary{8}, Binary{8});
+
+// ── hex_digit ─────────────────────────────────────────────────────────────────────────────────────
+// hex_digit: map a nibble (0..15) to its ASCII hex character byte ('0'..'9', 'a'..'f').
+// - 0..9  → 0x30 + nibble  (ASCII '0'=0x30 .. '9'=0x39)
+// - 10..15 → 0x57 + nibble  (0x57=87; 87+10=97='a', 87+11=98='b', …, 87+15=102='f')
+// - nibble >= 16 → 0x3F ('?') — never-silent fallback (G2: the out-of-range case is explicit).
+//
+// Guarantee: Exact over the finite in-range domain (0..15) — the `lt`/`add_u` computation is
+// a closed-form arithmetic on the finite range; Declared for the fallback arm (structurally
+// necessary; unreachable for well-formed nibbles, never-silent for malformed ones). The `lt` prim
+// returns Binary{1}; we use a match { 0b1 => …, _ => … } bridge.
+fn hex_digit(nibble: Binary{8}) => Binary{8} =
+  match lt(nibble, 0b0000_1010) {
+    0b1 => add_u(nibble, 0b0011_0000),
+    _ => match lt(nibble, 0b0001_0000) { 0b1 => add_u(nibble, 0b0101_0111), _ => 0b0011_1111 }
+  };
+
+// ── nibble_lo ─────────────────────────────────────────────────────────────────────────────────────
+// nibble_lo: extract the low 4 bits of `x` (bits 0..3) as a Binary{8} value in 0..15.
+// Total (Exact): `and` is total over Binary{8}.
+fn nibble_lo(x: Binary{8}) => Binary{8} =
+  and(x, 0b0000_1111);
+
+// ── nibble_hi ─────────────────────────────────────────────────────────────────────────────────────
+// nibble_hi: extract the high 4 bits of `x` (bits 4..7) as a Binary{8} value in 0..15.
+// Total (Exact): a 4-level lt binary-search match tree over the 16 possible values of
+// `and(x, 0b1111_0000)` ∈ {0x00,0x10,…,0xf0}, returning the corresponding nibble digit 0..15.
+// No right-shift prim is needed — the tree is exhaustive over the finite masked domain.
+//
+// The masked value `m = and(x, 0b1111_0000)` is one of exactly 16 values; every Binary{8}
+// produces exactly one leaf via the 4-branch binary search (Exact). Each leaf returns the nibble
+// value (masked 0x00 → nibble 0, 0x10 → nibble 1, …, 0xf0 → nibble 15) as a Binary{8} constant.
+fn nibble_hi(x: Binary{8}) => Binary{8} =
+  let m = and(x, 0b1111_0000) in
+  match lt(m, 0b1000_0000) {
+    0b1 => match lt(m, 0b0100_0000) {
+      0b1 => match lt(m, 0b0010_0000) {
+        0b1 => match lt(m, 0b0001_0000) { 0b1 => 0b0000_0000, _ => 0b0000_0001 },
+        _ => match lt(m, 0b0011_0000) { 0b1 => 0b0000_0010, _ => 0b0000_0011 }
+      },
+      _ => match lt(m, 0b0110_0000) {
+        0b1 => match lt(m, 0b0101_0000) { 0b1 => 0b0000_0100, _ => 0b0000_0101 },
+        _ => match lt(m, 0b0111_0000) { 0b1 => 0b0000_0110, _ => 0b0000_0111 }
+      }
+    },
+    _ => match lt(m, 0b1100_0000) {
+      0b1 => match lt(m, 0b1010_0000) {
+        0b1 => match lt(m, 0b1001_0000) { 0b1 => 0b0000_1000, _ => 0b0000_1001 },
+        _ => match lt(m, 0b1011_0000) { 0b1 => 0b0000_1010, _ => 0b0000_1011 }
+      },
+      _ => match lt(m, 0b1110_0000) {
+        0b1 => match lt(m, 0b1101_0000) { 0b1 => 0b0000_1100, _ => 0b0000_1101 },
+        _ => match lt(m, 0b1111_0000) { 0b1 => 0b0000_1110, _ => 0b0000_1111 }
+      }
+    }
+  };
+
+// ── to_hex ────────────────────────────────────────────────────────────────────────────────────────
+// to_hex: encode a Binary{8} byte as a HexPair of two ASCII hex-digit bytes (high nibble first,
+// low nibble second). E.g. to_hex(0x4a) = HP(0x34, 0x61) = HP('4', 'a').
+// Guarantee: Declared (structural composition of Exact `nibble_hi`/`nibble_lo`/`hex_digit`);
+// differential agreement Empirical (std_fmt.rs). Total: every Binary{8} input has a defined
+// HexPair output. Grounding: hand-computed, three-way verified; crates/mycelium-std-fmt exists but
+// exposes a different Ring-2 surface (no to_hex) — not the structural oracle.
+fn to_hex(x: Binary{8}) => HexPair =
+  HP(hex_digit(nibble_hi(x)), hex_digit(nibble_lo(x)));
+
+// ── digit_byte (DN-127 §3, H1-corrected sketch / M-1090 WU-1) ──────────────────────────────────────
+// digit_byte: map a single decimal digit value (0..9) to its ASCII digit BYTE STRING directly.
+// Unlike `hex_digit` above (which returns a Binary{8} byte), `digit_byte` returns a one-byte `Bytes`
+// LITERAL, because `bytes_concat` (used by `to_dec` below) requires `Bytes` on BOTH operands
+// (crates/mycelium-interp/src/prims.rs:1723-1735; crates/mycelium-l1/src/checkty.rs:8676-8695) and
+// there is no landed `Binary -> Bytes` construction prim (crates/mycelium-core/src/prim.rs:400-410)
+// — a `Binary{8}`-returning digit table would not type-check as a `bytes_concat` operand (the exact
+// gap DN-127 §3's H1 review fix closes). Total (Exact) over the finite in-range domain 0..9: a literal
+// match over explicit `Binary{8}` literals (mirroring `hex_digit`'s own style above), generalized from
+// a `lt`-bridged nibble table to a direct literal-match `Bytes` digit table.
+//
+// SECOND CORRECTION over DN-127 §3's own sketch (found by `myc check`, not asserted — VR-5): the
+// sketch wrote bare-decimal match patterns (`0 => "0", 1 => "1", …`), expecting RFC-0012 §4.3 ambient
+// resolution to fill their width from the `Binary{8}` scrutinee. Empirically that does NOT happen
+// outside an explicit `with paradigm Binary { … }` block: the ambient-resolution PRE-PASS
+// (`crate::ambient::resolve`) only rewrites a bare `Literal::Int` to a width-resolvable
+// `Literal::AmbientInt` when it is lexically inside such a block (`ambient.rs:761-784`,
+// "with no ambient it stays `Literal::Int`" — the checker's *own* per-callsite anchoring, verified
+// working for `lt(n, 10)`/`div_u(n, 10)`-style call ARGUMENTS above §6553-6588, never fires for a bare
+// literal in this position because it never reaches the checker as `AmbientInt` in the first place).
+// Confirmed by `myc check`: the original bare-decimal-pattern form failed with "a bare integer literal
+// has no representation family (no cross-family defaulting, Q6)". Fixed here with explicit
+// `Binary{8}` literals — no ambient dependency, and the same style every other `.myc` nodule in this
+// tree already uses (`hex_digit` above, `text.myc`, `math.myc`) — never faked, never silently
+// downgraded past what actually checks (VR-5/G2). `_ => "?"` is the never-silent fallback (G2) —
+// unreachable for an in-range digit (`to_dec` below only ever narrows a value already proven `< 10`
+// into this domain), explicit for a malformed one (mirrors `hex_digit`'s own `_ => 0b0011_1111` ('?')).
+fn digit_byte(d: Binary{8}) => Bytes =
+  match d {
+    0b0000_0000 => "0",
+    0b0000_0001 => "1",
+    0b0000_0010 => "2",
+    0b0000_0011 => "3",
+    0b0000_0100 => "4",
+    0b0000_0101 => "5",
+    0b0000_0110 => "6",
+    0b0000_0111 => "7",
+    0b0000_1000 => "8",
+    0b0000_1001 => "9",
+    _ => "?"
+  };
+
+// ── to_dec (DN-127 §3, H1-corrected sketch / M-1090 WU-1) ──────────────────────────────────────────
+// to_dec: most-significant-digit-first UNSIGNED decimal render of a Binary{64} value, as `Bytes`.
+// Derived entirely from LANDED prims — NO new kernel prim (KC-3 held): `div_u`/`rem_u` (surface names
+// for `bin.div`/`bin.rem`, RFC-0033 §4.1.2/M-888), `width_cast` (the checked `Binary{64} -> Binary{8}`
+// narrow, DN-41/M-798 — always in-range here, since `n < ten` in the base case and `rem_u(n, ten) <
+// ten` in the recursive case; a Declared/never-silent runtime contract per `width_cast`'s own
+// contract, not machine-proven), `bytes_concat` (DN-43/M-799), and recursion (three-way executing per
+// M-715).
+//
+// THIRD CORRECTION over DN-127 §3's own sketch (`myc check`-found, VR-5): the sketch used a bare
+// decimal `ten` for the `lt(n, ten)`/`div_u(n, ten)`/`rem_u(n, ten)` operands, assuming call-site
+// ambient anchoring would fill it (as it does for a genuine `Literal::AmbientInt` — `digit_byte`'s
+// comment above traces exactly why a bare decimal never becomes one outside `with paradigm`). Fixed
+// here with an explicit `Binary{64}` literal for ten (`0b0…01010`, 64 bits) at each use site — no
+// local top-level `let`/const binding exists in this surface, so the literal is written inline
+// (KISS; three call sites, one value, self-evidently `10` from the trailing `1010`).
+//
+// Guarantee: Exact over the base case (a single in-range digit — `to_dec(0) = "0"`, the base case
+// fires immediately since `0 < 10`); Declared for the recursive composition (structural, correct by
+// construction for the itoa recurrence — decreasing, since `div_u(n, 10) < n` for `n >= 10` — not a
+// machine-proven termination bound). Three-way differential agreement is Empirical (trials).
+fn to_dec(n: Binary{64}) => Bytes =
+  match lt(n, 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_1010) {
+    0b1 => digit_byte(width_cast(n, 0b0000_0000)),
+    _ =>
+      bytes_concat(
+        to_dec(
+          div_u(
+            n,
+            0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_1010
+          )
+        ),
+        digit_byte(
+          width_cast(
+            rem_u(
+              n,
+              0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_1010
+            ),
+            0b0000_0000
+          )
+        )
+      )
+  };
+
+// ── to_dec_s (DN-127 §7 stress-test point 2 / M-1090 WU-1) ─────────────────────────────────────────
+// to_dec_s: SIGNED (two's-complement) decimal render of a Binary{64} value. DN-127 §7's adversarial
+// pass flagged this explicitly ("must be written, not assumed") and assigned it to WU-1. A sign test
+// via `lt_s` (the signed order, RFC-0033 §4.1.2/ADR-028) against an explicit `Binary{64}` zero
+// prefixes a leading `"-"` in the negative case, then delegates to `to_dec` over the negated
+// magnitude (`neg_s`, M-766) — all landed prims, no new mechanism.
+//
+// Guarantee: Declared (structural composition of Exact/Declared parts). Honest residual (checked, not
+// glossed): `neg_s` on the minimum representable `Binary{64}` value (two's-complement `i64::MIN`) has
+// no positive-magnitude representation and is a never-silent runtime `Overflow` refusal (`neg_s`'s own
+// contract, M-766) — `to_dec_s` inherits that refusal rather than silently wrapping or truncating
+// (G2), for exactly that one boundary value.
+fn to_dec_s(n: Binary{64}) => Bytes =
+  match lt_s(n, 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000) {
+    0b1 => bytes_concat("-", to_dec(neg_s(n))),
+    _ => to_dec(n)
+  };
+
+// ── impl Show — primitive reprs (DN-127 §5/§6 WU-1; M-1090) ────────────────────────────────────────
+// `Show[T] { fn render(x: T) => Bytes; }` is the value-to-text prelude trait, seeded conditionally
+// (DN-129 §5) — present in this nodule's checked `Env` precisely because the `impl`s below are here
+// (`crates/mycelium-l1/src/show.rs`). Orphan rule: `Binary`, `Bytes`, and `Bool` are all
+// primitive-repr / prelude `for`-type heads (RFC-0019 §4.5; checkty.rs:4483-4492), so each `impl`
+// below is legal with no separate trait/type declaration needed.
+//
+// HONEST RESIDUAL (checked directly against the checker, not glossed): the orphan/coherence key is
+// WIDTH-ERASED for `Binary` — `type_head` collapses every `Binary{N}` to the single head `"Binary"`
+// (checkty.rs:311, "stage-1 keys per head"), so at most ONE `impl Show[Binary{N}] for Binary{N}` may
+// exist in this whole phylum; a second one at a different concrete width is a duplicate-instance
+// coherence refusal (verified — see this work-unit's report). `Binary{64}` is chosen (the natural
+// domain of `to_dec` above, and the widest commonly-rendered width); a `Binary{8}`/`Binary{16}`/
+// `Binary{32}` value renders via an explicit `width_cast` to `Binary{64}` first (a zero-extension
+// widen, always exact) — there is no per-width `Show[Binary{N}]` dispatch until a width-generic
+// trait-instance mechanism lands (not yet designed here; flagged, not faked). `Show` renders the
+// UNSIGNED interpretation (`to_dec`) — `Binary{N}` itself carries no signedness (ADR-028: signedness
+// lives in the operation, not the type), so `Show` cannot dispatch signed-vs-unsigned on the type
+// alone; call `to_dec_s` directly for a signed render.
+impl Show[Binary{64}] for Binary{64} {
+  fn render(x: Binary{64}) => Bytes =
+    to_dec(x);
+};
+
+// `Bytes` renders as itself — the identity render (Exact, total, coherence head `"Bytes"`).
+impl Show[Bytes] for Bytes {
+  fn render(x: Bytes) => Bytes =
+    x;
+};
+
+// `Bool` renders as its ASCII word form (Exact, total over the two constructors, coherence head
+// `"Data:Bool"` — distinct from `Binary`/`Bytes`, no collision).
+impl Show[Bool] for Bool {
+  fn render(x: Bool) => Bytes =
+    match x { True => "True", False => "False" };
+};
+
+// HONEST GAP (DN-127 §7 point 3 / OQ-1 — NOT fabricated): no `impl Show[Float] for Float` is provided
+
+// here. Correct float -> shortest-decimal rendering (Ryu/Grisu-class) is genuinely hard and is not
+
+// derivable from the landed prim set (ADR-040 has no decimal-render prim for `Float`); a `{f}`
+
+// interpolation of a `Float` value is left an explicit, never-silent gap until a dedicated
+
+// float-render fn lands (tracked as DN-127's OQ-1) — never a fabricated or truncated render (G2).

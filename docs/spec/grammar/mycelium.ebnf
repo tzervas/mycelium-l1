@@ -1,0 +1,450 @@
+(* Mycelium surface grammar — v0 (L1-facing fragment).
+ *
+ * Notation: W3C EBNF (as used by the XML 1.0 spec), NOT ISO 14977 (RFC-0006 §4.3 / T3.1-B;
+ * Wheeler's critique). Terminals are 'quoted'; A? optional; A* zero-or-more; A+ one-or-more;
+ * A | B alternation; (A B) grouping; /* ... */ comments. This artifact is the NORMATIVE oracle
+ * for the accept/reject conformance corpus under ./conformance/ — every accept/ program parses
+ * by this grammar, every reject/ program does not.
+ *
+ * Vocabulary is the ratified DN-02 set (Resolved 2026-06-10) plus `for` (RFC-0007 §4.8 r2;
+ * recorded in DN-03) and the DN-06 static-organization lexicon (Resolved 2026-06-16): `nodule`
+ * replaces the former static keyword `colony`. Themed keywords: nodule, substrate, spore, matured,
+ * wild. Conventional: use, type, trait, fn, let, in, if, then, else, match, for, swap, thaw
+ * (de-maturation; inverts `matured` = "frozen"; `germinate` is taken by spore-germination, ADR-013).
+ *
+ * `matured` is no longer a fn/definition modifier (RFC-0017, 2026-06-18): maturation is declared at
+ * SCOPE — a `nodule`/`phylum` via its header (`// @matured: true`; Nodule-Header spec §3) or a
+ * program/package via its manifest. `matured` stays a reserved word (the header key; never a silent
+ * identifier) but opens no term production. `thaw` is the in-source DE-maturation marker: it
+ * keeps one definition interpreted inside an otherwise-matured scope (RFC-0017 §4.3).
+ *
+ * SURFACE STATUS (2026-06-18): this grammar is the COMMITTED L3 text surface (DN-09 KC-2 verdict =
+ * proceed; RFC-0006 §10 Q1 resolved). Refinements are append-only recorded decisions, not drift; a
+ * co-equal structured-projection layer (M-380) renders the same content-addressed defs (FR-S5).
+ *
+ * ACTIVE (M-662; RFC-0006, DN-06 §6): `phylum` (the library-scale grouping above nodules) is now an
+ * active surface construct — an optional 'phylum <path>' header groups one-or-more nodules in one
+ * source file (see `program` / `phylum_header` below). It is a metadata grouping (identity stays
+ * per-nodule, ADR-003), paired with `pub` cross-nodule visibility and `use` glob imports (M-662); the
+ * cross-nodule orphan rule (RFC-0019 §4.5) is enforced phylum-wide. (`colony`, once reserved-not-active
+ * here too, ACTIVATED with M-666 as an expression — see `colony_expr` below, RFC-0008 §4.7.)
+ *
+ * ACTIVE (M-666; RFC-0008 §4.7 R1): `colony` and `hypha` are now active surface constructs (the
+ * deterministic structured-concurrency fragment). `colony { hypha e, … }` is an expression (a
+ * `colony_expr`, below) — the dynamic runtime grouping of `hypha` execution units; the reference
+ * semantics is the spawn-order sequentialization (RT2). They are no longer reserved-not-active.
+ *
+ * ACTIVE (M-667; DN-58 §A/§B/§C; RFC-0008 §4.6 R1): `fuse`, `reclaim`, and `@tier` are now
+ * active constructs — they LEFT the reserved-not-active set with M-667 (the r4v wave, 2026-06-28):
+ *   fuse       — lawful binary merge (RFC-0008 RT6): `fuse ( expr , expr )` → `fuse_expr` below
+ *   reclaim    — supervised scope (RFC-0008 RT7): `reclaim ( expr ) block` → `reclaim_expr` below
+ *   tier       — execution-mode hint (RFC-0004 ExecutionMode): `@tier(compiled|interpreted) fn …`
+ *                  → `tier_fn_item` below (non-semantic, NFR-7; never a behavioural switch)
+ *
+ * ACTIVE, D-LITE SUBSET (M-906; DN-70 D1; DN-63 §3.5; RFC-0008 §4.6 R2 usability subset — kickoff
+ * `enb`): `forage` LEFT the reserved-not-active set with M-906 — but only its **D-lite** surface:
+ *   forage     — adaptive placement policy (RFC-0008 RT3): `@forage(policy) hypha …` →
+ *                  the `hypha` production below. `policy` is a **literal binary bitmask** (each
+ *                  set bit names one local worker candidate; the D-lite mechanism is the existing
+ *                  RFC-0005 `SelectionPolicy` — no new mechanism, DN-70). Semantics-free (RT3):
+ *                  placement never changes the observable, only the mandatory EXPLAIN trail. An
+ *                  all-zero mask is the DN-63 FLAG-14 empty-candidate-set case — an explicit
+ *                  `ForageError::NoCandidates` refusal, never a silent hang. **Multi-node**
+ *                  placement (an arbitrary dynamic policy expression, real network nodes) is an
+ *                  explicit residual, tracked on M-828's H2 remainder (DN-70 §5 R-6) — not covered
+ *                  by this grammar entry.
+ *
+ * RESERVED, NOT YET ACTIVE (DN-03 §4; RFC-0008 §4.5): the remaining FIVE runtime-vocabulary names
+ * are reserved keywords — they lex as keywords (never silent identifiers, G2) but no production
+ * consumes them, so they cannot open a program or appear in identifier position at this language
+ * version (see conformance/reject/12). They activate when their runtime-model constructs land
+ * (RFC-0008 §4.6 R2):
+ *   mesh       — decentralized gossip/pub-sub overlay (RFC-0008 RT5)
+ *   graft      — capability contract with infrastructure (RFC-0008 RT4)
+ *   cyst       — durable checkpoint / dormant resumable form (RFC-0008 RT2)
+ *   xloc       — explicit value movement / trans-locate
+ *   backbone   — priority transport path (RFC-0008 RT3)
+ *
+ * This is v0 — it covers the L1-facing core (RFC-0006 §3 L1); abstraction/recursion typing,
+ * the full trait/guild machinery (LR-2), and L2 sugar layer above it.
+ *)
+
+program        ::= phylum_header? nodule_block+
+/* DN-57 §3 (Accepted; mandatory `;` landed M-818, Enacted gated on M-819/M-820): `;` is the
+ * **MANDATORY** component terminator — `;` terminates,
+ * `,` separates siblings, `:` ascribes. Every component ends with exactly one `;`, *uniformly and
+ * regardless of how its body ends*: a `}`-closed block (`trait`/`impl`/`object`) still takes the
+ * trailing `;` (NOT Rust's "`}` ends the block, no `;"). The **nodule header itself** is a
+ * component, so it too ends with `;` — this is what makes fully whitespace-free source legal
+ * (`nodule d; fn a() => … = …;`). A missing terminator is a never-silent parse error (G2) naming
+ * the component. The terminator adds NO AST node (it is purely a boundary token), so a streaming
+ * parser emits a completed component the instant it sees `;` (the streaming guarantee). The earlier
+ * v0 form made `;` OPTIONAL; M-818 makes it mandatory and migrates the whole corpus. */
+nodule_block   ::= nodule_header ';' (item ';')*
+
+/* A phylum (M-662; RFC-0006; DN-06 §6) groups one-or-more nodules in a single source file under an
+ * optional 'phylum <path>' header — a metadata grouping parallel to the `nodule` header (identity
+ * stays per-nodule, ADR-003). A header-less single nodule is a phylum-of-one (backward-compatible:
+ * the former `program ::= nodule_header item*`). Cross-nodule names are exported with `pub` and
+ * imported with `use` (specific `use a.b.X` or glob `use a.b.*`); a `use` of an absent/private name,
+ * a duplicate import, or a referenced glob-vs-glob collision is a never-silent refusal (G2). The
+ * cross-nodule orphan rule (RFC-0019 §4.5) is enforced phylum-wide (pub-blind coherence). */
+phylum_header  ::= 'phylum' path
+
+/* Top-level scoping (RP-6 / DN-13; append-only surface commitment per DN-09 §3.1): the `item*` under
+ * a `nodule` is unordered for name resolution — every top-level `fn` is mutually visible, so a
+ * function may reference any sibling regardless of declaration order. No mutual-recursion keyword is
+ * introduced (Rust/Unison/ML-module semantics): the elaborator builds the call graph over the nodule
+ * and auto-groups each strongly-connected component of ≥2 functions into a `FixGroup` (a self-looping
+ * singleton → `Fix`; a non-recursive function inlines). The grouping is *inferred*, not written, and
+ * is materialized as a `FixGroup` node in the elaborated term (inspectable; no black box).
+ * RFC-0007 §8 R7-Q3; M-343/M-391. */
+
+/* The optional '@std-sys' marker (M-661; RFC-0016 §8-Q6) tags the nodule as the AUDITED FFI FLOOR
+ * context — an explicit header ATTRIBUTE, not a naming convention. It is lexed as ONE atomic token
+ * (the '-' could not lex as '@' + an identifier), and it is the only place a `wild` block (LR-9/S6;
+ * ADR-014) may legally appear: the checker hard-refuses a `wild` in any non-'@std-sys' nodule (never
+ * silent — G2), and inside one a `wild`'s enclosing `fn` must declare the `ffi` effect (`!{ffi}` —
+ * `wild` is the `ffi` source; RFC-0014/M-660). The `wild` body is the trusted/opaque FFI escape
+ * (audited, not verified); execution stays staged in v0. See conformance/accept/18-wild-std-sys. */
+nodule_header  ::= 'nodule' path '@std-sys'?
+
+item           ::= use_item
+                 | default_item
+                 | type_item
+                 | trait_item
+                 | impl_item
+                 | fn_item
+                 | object_item
+                 | lower_item
+                 | derive_item
+
+/* Implementation blocks (RFC-0019 §4.1 / DN-03 §1; M-659/M-664). The TRAIT-instance form
+ * `impl Trait[args]? for T { … }` provides a trait's methods for a type (coherence: global
+ * uniqueness per (trait, type-head) + single-nodule orphan rule). The INHERENT form `impl T { … }`
+ * (no `for`) groups ordinary explicitly-typed functions with a type; it desugars to top-level
+ * `fn`s (the `object` inherent-`fn` model — KC-3, zero kernel growth). The two are disambiguated
+ * after the head by the `for` (trait) vs `{` (inherent) follower; any other follower is a
+ * never-silent parse error (G2). */
+/* DN-57 §3 (M-818): each block member (method) is itself a component, so it carries the mandatory
+ * `;` — `(fn_item ';')*`; and the whole `impl_item` is in turn terminated by a `;` at its use site
+ * in `nodule_block` (the trailing `;` after the closing `}`). */
+impl_item      ::= 'impl' Ident type_args? 'for' type_ref '{' (fn_item ';')* '}'  /* trait instance */
+                 | 'impl' base_type '{' (fn_item ';')* '}'                        /* inherent (M-664) */
+
+/* Import (M-662): a specific `use a.b.X` binds the single name `X`; a glob `use a.b.*` binds every
+ * `pub` name directly under the prefix `a.b`. Precedence (highest first): a local declaration, then
+ * an explicit `use`, then a glob — higher shadows lower deterministically (documented, never silent).
+ * A referenced name imported by two globs is a never-silent ambiguity refusal (G2). */
+use_item       ::= 'use' path ( '.' '*' )?
+
+/* default paradigm: the nodule-scope ambient (RFC-0012 §4.2; enacted M-344). At most one per
+ * nodule — the outermost ambient frame. It supplies an OMITTED paradigm for paradigm-less reprs
+ * and bare decimals; it never inserts a swap (I1) and elaborates to the same L0 as the longhand
+ * twin (I2). `default`/`paradigm`/`with` are reserved (DN-02 surface additions). */
+default_item   ::= 'default' 'paradigm' paradigm
+paradigm       ::= 'Binary' | 'Ternary' | 'Dense' | 'VSA'
+
+/* Algebraic data type (LR-1): a sum of constructors, each with optional positional fields. The
+ * optional `pub` (M-662) exports the type to sibling nodules of the phylum; absent ⇒ private to its
+ * nodule (visible intra-nodule, never cross-nodule without a matching `pub` + `use`). */
+type_item      ::= 'pub'? 'type' Ident type_params? '=' constructor ('|' constructor)*
+/* RFC-0037 D1/D2: type parameters in `[…]` (a fn type-param may carry `: bound`, RFC-0019 §4.1);
+ * const/width parameters in `{…}` (bare names — DN-42/M-753). A fn generic over both is `[T]{N}`. */
+type_params    ::= '[' Ident (',' Ident)* ']'
+const_params   ::= '{' Ident (',' Ident)* '}'
+constructor    ::= Ident ('(' type_ref (',' type_ref)* ')')?
+
+/* Trait = a named set of function signatures (LR-2; conventional term, DN-02). Optional `pub`
+ * (M-662) exports the trait to sibling nodules of the phylum. DN-57 §3 (M-818): each signature is a
+ * component, terminated by `;` — `(fn_sig ';')*`. */
+trait_item     ::= 'pub'? 'trait' Ident type_params? '{' (fn_sig ';')* '}'
+fn_sig         ::= 'fn' Ident type_params? const_params? '(' params? ')' '=>' type_ref effects?
+
+/* Function. Optional 'thaw' DE-matures one definition — keeps it interpreted inside an
+ * otherwise-matured scope (RFC-0017 §4.3; the rare iterate/debug escape hatch). Maturation itself is
+ * NOT a fn modifier — it is declared per `nodule`/`phylum`/program in the header/manifest (RFC-0017
+ * §4.1). A bare `matured fn …` is a parse error with a teaching diagnostic. */
+fn_item        ::= tier_fn_item
+                 | 'pub'? 'thaw'? 'fn' Ident type_params? const_params? '(' params? ')' '=>' type_ref effects? '=' expr
+/* DN-58 §C (M-667): `@tier(compiled|interpreted)` execution-mode hint on a function definition.
+ * Non-semantic (NFR-7: the chosen mode never changes observable semantics). Not a reserved-word
+ * expression — it is an attribute that precedes a `fn` declaration. Teaching diagnostic for bare
+ * `tier` at item position (write `@tier(compiled) fn …` instead). */
+tier_fn_item   ::= 'pub'? '@' 'tier' '(' tier_mode ')' 'thaw'? 'fn' Ident type_params? const_params? '(' params? ')' '=>' type_ref effects? '=' expr
+tier_mode      ::= 'compiled' | 'interpreted'   /* RFC-0004 ExecutionMode surface spelling (DN-58 §C F-C2) */
+params         ::= param (',' param)*
+param          ::= Ident ':' type_ref
+
+/* Object-composition surface (DN-53 / M-811; implemented Rust-first in mycelium-l1, pending
+ * ratification). An `object` groups one constructor with its trait `impl`s, `via` delegation
+ * clauses, and inherent `fn`s. It is PURE FRONTEND SUGAR: the checker desugars it to `type` +
+ * `impl` (+ generated `via`-forwarding impls) + `fn` — zero kernel growth (KC-3), `reveal`-able
+ * (DN-38 §5). The body MUST open with exactly one constructor clause (terminated by `;`); an empty
+ * body is a never-silent parse refusal (G2). `via N : Trait` — `N` is a decimal field index (not an
+ * identifier). `pub` inside the body is refused (the object's own `pub` governs the composed type). */
+/* DN-57 §3 (M-818): the constructor clause AND every subsequent object member are components, each
+ * terminated by a mandatory `;` (the constructor `;` was already required; M-818 makes the member
+ * `;` mandatory too — `(object_member ';')*`). The whole `object_item` is terminated by the trailing
+ * `;` at its `nodule_block` use site (after the closing `}`). */
+object_item    ::= 'pub'? 'object' Ident type_params? '{' constructor ';' (object_member ';')* '}'
+object_member  ::= via_clause | trait_item_impl | fn_item
+via_clause     ::= 'via' Int ':' Ident type_args?                 /* delegate to a held field by index */
+trait_item_impl ::= /* a trait-instance `impl` block, same grammar as a top-level impl */
+                   'impl' Ident type_args? 'for' type_ref '{' (fn_item ';')* '}'
+
+/* User-extensible generative lowering (DN-54 / M-812; implemented Rust-first, SURFACE + STRUCTURAL
+ * checks only — pending ratification). `lower Name[params]? = <rhs>` DEFINES a generative-lowering
+ * rule whose RHS is an explicit typed term; `derive Name for T` APPLIES one at a type. The checker
+ * validates rule-name uniqueness, param-name uniqueness, and `derive` name-resolution — all
+ * never-silent (G2). NOT YET IMPLEMENTED (deferred, M-812-cont): RHS elaboration to L0, the §4.1
+ * IL-grammar RHS type-check, and the §6 KC-3 kernel-growth guard — so `derive` currently emits no L0
+ * (an honest never-silent residual). `grow` is reserved-but-superseded-by-`derive` (DN-38 §8.1). */
+lower_item     ::= 'lower' Ident type_params? '=' expr
+derive_item    ::= 'derive' Ident 'for' type_ref
+
+/* Anonymous function / closure (RFC-0037 D5). Implemented (M-704 / RFC-0024 §4A): the closure
+ * type-checks (Ty::Fn) and lowers + runs via Reynolds defunctionalization in monomorphization (a
+ * tag-sum struct + a generated `apply` dispatcher; no new L0 kernel node — KC-3). `=>` (D4)
+ * separates params from body. A multi-parameter lambda now CURRIES (M-822, RFC-0024 §4A.5/§4A.8):
+ * the checker desugars `lambda(x, y) => e` to nested single-param closures `lambda(x) => lambda(y) =>
+ * e`, so applying fewer arguments yields a partially-applied function value. A zero-parameter lambda
+ * has no v0 form and is a never-silent refusal (G2). */
+lambda_expr    ::= 'lambda' '(' params? ')' '=>' expr
+
+/* Effect annotation (RFC-0014 §3.4/§4.5 I3; M-660). Optional `!{ … }` after the return type
+ * declaring a fn's effect set; ABSENT ⇒ pure (the empty set, RFC-0014 I5), and the explicit `!{}`
+ * is also the empty/pure set. Effect names are plain identifiers — the closed kernel effect kinds
+ * (retry|alloc|io|cascade|time) plus user-declared `Named` effects — NOT reserved words; a duplicate
+ * name in one annotation is a never-silent parse refusal (G2). The coverage rule (a fn's declared
+ * effects ⊇ the effects it performs) is a CHECKER obligation, not a grammar one. */
+effects        ::= '!' '{' (Ident (',' Ident)*)? '}'
+
+/* Types. A guarantee-annotated type carries its honesty tag as a type-level index (LR-6). */
+/* RFC-0024 §3 (M-924 gap-fix): a `type_ref` may itself be a first-class FUNCTION TYPE
+ * `A => B` — right-associative (`A => B => C` parses as `A => (B => C)`, mirroring
+ * `lambda`/`match`-arm currying), matching `parse_type_ref_guarded` in
+ * `crates/mycelium-l1/src/parse.rs`. `@ strength` (below) binds tighter than `=>`: `A @ Exact =>
+ * B` parses as `(A @ Exact) => B`, since the LHS `base_type ('@' strength)?` atom is parsed
+ * before the optional trailing `=> type_ref` is consumed. `->` is RETIRED as the function-type
+ * arrow (RFC-0037 D4) — the parser emits a never-silent teaching-reject diagnostic on `->` here,
+ * it is not silently accepted as an alias. */
+type_ref       ::= base_type ('@' strength)? ('=>' type_ref)?
+/* RFC-0037 D2-b (M-915): `bin`/`tern`/`emb`/`hvec` are short repr-keyword aliases for
+ * `Binary`/`Ternary`/`Dense`/`VSA` — they elaborate identically (the same AST node either way; no
+ * new BaseType variant). `vec` was considered and REJECTED (DN-02) — it collides with
+ * `std.collections.Vec`; it is never a keyword. Both spellings are reserved full keywords
+ * (RFC-0037 §7 FLAG-3 resolved: reserved-keyword class, matching the long forms' existing
+ * posture) — `mycfmt` canonicalizes to the long form on output (Declared; avoids corpus reformat
+ * churn). */
+base_type      ::= 'Binary'  '{' Int '}'
+                 | 'Ternary' '{' Int '}'
+                 | 'Dense'   '{' Int ',' scalar '}'
+                 | 'VSA'     '{' Ident ',' Int ',' sparsity '}'
+                 | 'bin'     '{' Int '}'                      /* D2-b short alias for Binary */
+                 | 'tern'    '{' Int '}'                      /* D2-b short alias for Ternary */
+                 | 'emb'     '{' Int ',' scalar '}'            /* D2-b short alias for Dense */
+                 | 'hvec'    '{' Ident ',' Int ',' sparsity '}' /* D2-b short alias for VSA */
+                 | 'Substrate' '{' Ident '}'                  /* affine external resource (LR-8) */
+                 | 'Seq'     '{' type_ref ',' Int '}'         /* indexed homogeneous sequence (RFC-0032 D3) */
+                 | 'Bytes'                                    /* first-class byte string (RFC-0032 D4) */
+                 | 'Float'                                    /* first-class scalar float, IEEE-754 binary64
+                                                               * only at introduction (ADR-040 FLAG-1; M-897) —
+                                                               * nullary like Bytes; a later width extends the
+                                                               * surface append-only under its own decision */
+                 | '(' type_ref ',' type_ref (',' type_ref)* ')'  /* tuple/product type (M-826, arity >= 2);
+                                                                   * desugars to a synthetic single-ctor data
+                                                                   * type (KC-3 — no new L0 node) */
+                 | Ident type_args?                           /* named type or type variable */
+                 | '{' ambient_params '}'                     /* paradigm-less repr (RFC-0012 §4.2) */
+/* A paradigm-less repr writes the size/shape only; the enclosing ambient supplies the paradigm.
+ * An ill-fitting shape is an explicit ParadigmShapeMismatch; no ambient is an UnresolvedAmbient. */
+ambient_params ::= Int                                        /* Binary width / Ternary trit count */
+                 | Int ',' scalar                             /* Dense shape */
+                 | Ident ',' Int ',' sparsity                 /* VSA shape */
+type_args      ::= '[' type_ref (',' type_ref)* ']'         /* RFC-0037 D1: type arguments in [] (was <…>) */
+sparsity       ::= 'Dense' | 'Sparse' '{' Int '}'
+scalar         ::= 'F16' | 'BF16' | 'F32' | 'F64'
+strength       ::= 'Exact' | 'Proven' | 'Empirical' | 'Declared'
+
+/* Expressions. */
+expr           ::= let_expr
+                 | if_expr
+                 | match_expr
+                 | for_expr
+                 | swap_expr
+                 | with_expr
+                 | wild_expr
+                 | spore_expr
+                 | consume_expr
+                 | colony_expr
+                 | fuse_expr
+                 | reclaim_expr
+                 | lambda_expr
+                 | op_expr
+
+/* with paradigm: a block-scope ambient override (RFC-0012 §4.4; M-344). Not a conversion — it
+ * fills the interior tags and elaborates away; a cross-paradigm edge in/out of the block needs an
+ * explicit swap, and an unbridged one is a never-silent MissingConversion. */
+with_expr      ::= 'with' 'paradigm' paradigm '{' expr '}'
+
+let_expr       ::= 'let' Ident (':' type_ref)? '=' expr 'in' expr
+if_expr        ::= 'if' expr 'then' expr 'else' expr
+match_expr     ::= 'match' expr '{' arm (',' arm)* ','? '}'
+
+/* for: bounded iteration — elaboration-defined sugar for a structurally-recursive fold over a
+ * linearly recursive data value, Total by construction (RFC-0007 §4.8). The spelling is adopted
+ * (r3; under the same global KC-2 gate as this whole grammar); `while`/`loop`/`break`/`continue`/
+ * `return` are NOT forms and NOT reserved (they get teaching diagnostics where they already
+ * error). */
+for_expr       ::= 'for' Ident 'in' app_expr ',' Ident '=' app_expr '=>' expr
+arm            ::= pattern ('|' pattern)* '=>' expr   /* or-patterns: A | B => e (M-823 / R20-Q3); the
+                                                       * alternatives must bind the same names at the same
+                                                       * types (checker gate, G2); desugars to one arm each */
+pattern        ::= '_'
+                 | literal
+                 | '(' pattern ',' pattern (',' pattern)* ')'   /* tuple pattern (M-826, arity >= 2) */
+                 | Ident ('(' pattern (',' pattern)* ')')?    /* constructor / binder */
+
+/* swap: the never-silent representation change — target and policy ALWAYS lexical (S1/WF2). */
+swap_expr      ::= 'swap' '(' expr ',' 'to' ':' type_ref ',' 'policy' ':' path ')'
+
+/* wild: the denied-by-default unsafe escape hatch (LR-9/S6; DN-02 §5). Grammatically a `wild` block
+ * may appear anywhere an expr may; its LEGALITY is a CHECKER gate (M-661; not a parse rule), so the
+ * accept corpus parses one (accept/18) while the typechecker enforces the '@std-sys' context + the
+ * `!{ffi}` effect (see nodule_header). The body is the trusted/opaque FFI escape (audited, not
+ * recursively type-checked — ADR-014/VR-5); execution is staged (an elaboration `Residual`) in v0. */
+wild_expr      ::= 'wild' '{' expr '}'
+
+/* spore: build a reconstruction manifest for a value (RFC-0003 §6; DN-02 themed term). */
+spore_expr     ::= 'spore' '(' expr ')'
+
+/* consume: acquire + take EXCLUSIVE ownership of an affine `Substrate` value (DN-03 §1 / LR-8;
+ * M-664). A prefix form (like unary `-`/`!`): the operand is an applicative expression. The checker
+ * requires the operand's type to be `Substrate{tag}` (never silent on any other type — G2); the
+ * result is the moved substrate. Execution + single-use affinity are STAGED (guarantee `Declared`):
+ * `Substrate` has no v0 value forms / no L0 lowering, so `consume` elaborates to a never-silent
+ * `Residual` — the type discipline is checked, the runtime behavior honestly deferred (VR-5). */
+consume_expr   ::= 'consume' app_expr
+
+/* colony / hypha: the structured-concurrency scope (RFC-0008 §4.7; DN-06 §1.3; M-666). A `colony`
+ * is the dynamic runtime grouping of `hypha` execution units; its body is a NON-EMPTY list of
+ * `hypha <expr>` spawns (a trailing comma before `}` is tolerated, the match-arm convention). RT7:
+ * a `hypha` is ONLY expressible inside a `colony` ("an orphan hypha is not expressible") — there is
+ * no free `hypha` production. Deterministic R1 fragment only (RFC-0008 §4.6 R1); the reference
+ * semantics is the spawn-order sequentialization (RT2), so the colony's observable value is its
+ * children run in order, and the colony yields the LAST hypha's value — wiring a join-result product
+ * of all hyphae's values (now expressible via the v0 tuple type, M-826) is later work). The runtime
+ * realization is `mycelium-mlir::runtime` (`Scope`/`Colony`/`Task`, M-357), a performance path
+ * validated against the RT2 sequentialization.
+ *
+ * `hypha` optionally carries a leading `@forage(policy)` placement-policy annotation (M-906;
+ * DN-70 D1; RFC-0008 RT3; D-lite — see the ACTIVE, D-LITE SUBSET note above), the same
+ * '@' attribute-before-construct shape as `@tier(mode) fn …` (DN-58 §C / `tier_fn_item` below). */
+colony_expr    ::= 'colony' '{' hypha (',' hypha)* ','? '}'
+hypha          ::= ('@' 'forage' '(' expr ')')? 'hypha' app_expr
+
+/* fuse: lawful binary merge (DN-58 §A / M-667; RFC-0008 RT6). Homogeneous operands; the
+ * checker verifies a `Fuse` semilattice instance exists for the operand type. Result type = operand
+ * type. Meta = meet of input guarantees (never silently upgraded — RFC-0001 §4.7). A non-fusible
+ * type is a never-silent CheckError (G2). The `Fuse` semilattice-law obligation (commutativity/
+ * associativity/idempotence) is carried by the type's declared instance, not by the grammar.
+ * Execution: repr-type fuse is Empirical (three-way differential green); data-type fuse prim
+ * registration is a Residual stub pending M-817. */
+fuse_expr      ::= 'fuse' '(' expr ',' expr ')'
+
+/* reclaim: reified supervision/reclamation policy attached to a structured scope (DN-58 §B / M-667;
+ * RFC-0008 RT7). The `policy` expression is any expression (a reified RT3 policy value from
+ * `std.runtime`). The `body` is any block expression (typically a `colony { … }`). Elaborates to
+ * `mycelium-std-runtime::supervision::run_supervised` + `SupervisionRecord` threading (never-silent
+ * G2 on reclamation/restart events). Execution: Residual stub pending M-817 runtime registry wiring.
+ * VR-5 — claimed as a surface with honest Residual, not a fabricated accept. */
+reclaim_expr   ::= 'reclaim' '(' expr ')' block
+block          ::= '{' expr '}'
+
+/* Operator-expression layer (RFC-0025 / M-705). Symbolic infix/prefix operators are FRONTEND-ONLY
+ * sugar: each desugars to a canonical word-function call (`a + b` -> `add(a, b)`, `-a` -> `neg(a)`),
+ * so there is NO L0/L1 kernel change (KC-3) and the word form stays valid everywhere the sugar is
+ * (the sugar is additive — words are canonical). The keyword-led forms (let/if/match/...) are NOT
+ * operands of an operator; to use one as an operand, parenthesize it. Precedence follows Rust's
+ * table (the implementation language; RFC-0025 §4); every binary operator is LEFT-associative, the
+ * prefix operators are right-associative and bind tighter than every binary operator. The tiers are
+ * written highest-binding (innermost) outward. The ANGLE-BRACKET operators are now WIRED (M-745,
+ * RFC-0025 §4.1): RFC-0037 D1 moved type arguments `<...>` -> `[...]`, so `<`/`>` no longer collide
+ * with a type-arg list and need no contextual lexing. `<<`/`>>` (shl/shr) are Tier 4 (tighter than
+ * the bitwise ops, looser than `+`/`-`); `<`/`>` (lt/gt) are Tier 8 (looser than the bitwise ops,
+ * tighter than `==`/`!=`) — matching Rust's table per §4.1. The two-char `<=`/`>=` glyphs are
+ * RETIRED (RFC-0037 D1: most ambiguous in post-type-arg position); their word forms `lte`/`gte`
+ * have NO glyph and parse as ordinary `app_expr` calls. (Note: RFC-0037 §6's illustrative sketch
+ * nested `cmp_expr ::= shift_expr` / `shift_expr ::= bor_expr`, which would place shift LOOSER than
+ * the bitwise ops; that contradicts the ratified §4.1 tiers (and Rust) and is superseded here by
+ * the precedence-correct nesting below — see the RFC-0025 changelog FLAG.) A desugared word target
+ * whose prim/stdlib function does not yet exist (`div`/`rem`/`band`/`bor`/`eq`/`ne`/`and`/`or`, and
+ * the M-745 set `lt`/`gt`/`shl`/`shr`/`lte`/`gte` until M-809) still PARSES here and surfaces an
+ * explicit "unknown function/prim" refusal downstream (never silent — G2). */
+op_expr        ::= or_expr
+or_expr        ::= and_expr ('||' and_expr)*
+and_expr       ::= eq_expr ('&&' eq_expr)*
+eq_expr        ::= cmp_expr (('==' | '!=') cmp_expr)*
+cmp_expr       ::= bor_expr (('<' | '>') bor_expr)*          /* Tier 8 (lt/gt); M-745 */
+bor_expr       ::= xor_expr ('|' xor_expr)*
+xor_expr       ::= band_expr ('^' band_expr)*
+band_expr      ::= shift_expr ('&' shift_expr)*
+shift_expr     ::= add_expr (('<<' | '>>') add_expr)*        /* Tier 4 (shl/shr); M-745 */
+add_expr       ::= mul_expr (('+' | '-') mul_expr)*
+mul_expr       ::= unary_expr (('*' | '/' | '%') unary_expr)*
+unary_expr     ::= ('-' | '!') unary_expr
+                 | app_expr
+
+/* Application / primary. Calls and atoms; ascription binds loosest. */
+app_expr       ::= primary ('(' args? ')')* (':' type_ref)?
+args           ::= expr (',' expr)*
+primary        ::= literal
+                 | path
+                 | '(' expr ',' expr (',' expr)* ')'  /* tuple literal (M-826, arity >= 2); the comma
+                                                        * distinguishes it from the grouping form below */
+                 | '(' expr ')'
+
+path           ::= Ident ('.' Ident)*
+
+/* Literals — representation-typed, universal-until-elaboration. A tagged literal (BinLit/TritLit)
+ * names its paradigm; a bare Int has no representation family on its own (Q6) UNLESS an ambient is
+ * in scope, in which case it adopts the ambient paradigm and takes its width from the checked
+ * context, else an explicit UnresolvedWidth (RFC-0012 §4.3; M-344). */
+literal        ::= BinLit | TritLit | BytesLit | StrLit | FloatLit | Int | ListLit
+ListLit        ::= '[' (expr (',' expr)*)? ']'       /* constructs a Seq{T, N} (RFC-0032 D3) */
+
+/* Terminals (lexer). */
+BinLit         ::= '0b' ('0' | '1' | '_')+
+BytesLit       ::= '0x' HexDigit (HexDigit | '_')*   /* even hex-digit count required (RFC-0032 D4) */
+HexDigit       ::= [0-9a-fA-F]
+TritLit        ::= '0t' Trit+                        /* MSB-first balanced trits (RFC-0037 D4; the `<…>` form is retired, `<` is operator-only) */
+Trit           ::= '+' | '0' | '-'
+
+/* StrLit: a textual string literal (M-910/M-911, kickoff `enb` Phase-I H1) — ergonomic, not
+ * expressive: an explicit, MINIMAL escape set (`\n \t \\ \" \0 \r`), no raw newline/CR inside the
+ * literal (use `\n`), and deliberately no `\xNN` (it would let a "textual" literal inject a
+ * non-UTF-8 byte; left for a follow-up with its own justification). Lowers to the SAME
+ * `Repr::Bytes` value form as BytesLit (UTF-8-encoded; KC-3 — no new L0 node). An unterminated
+ * literal or an unknown escape is a never-silent lex error (G2), never a silent truncation. */
+StrLit         ::= '"' (StrChar | EscapeSeq)* '"'
+StrChar        ::= [^"\\\n\r]                        /* any char but the closing quote, a backslash,
+                                                       * or a raw newline/CR */
+EscapeSeq      ::= '\' ('n' | 't' | '\\' | '"' | '0' | 'r')
+/* FloatLit: a decimal float literal (ADR-040; M-897) — it denotes the CORRECTLY-ROUNDED
+ * (round-to-nearest-even) IEEE-754 binary64 value of its decimal text (ADR-040 FLAG-3; the
+ * documented, EXPLAIN-able conversion — erroring on inexact decimals would reject nearly all real
+ * literals). Int-disambiguation is structural: digits become a float ONLY when followed by a `.`
+ * WITH a digit behind it (so `1.` stays Int `1` + `.` — the path/field glyph — and there is no
+ * leading-dot `.5` form), and/or an `e|E` exponent with at least one digit. Never-silent (G2): an
+ * exponent with no digits (`1e`, `1e+`) and a literal whose rounded binary64 value is not finite
+ * (`1e999` — beyond ~1.8e308) are explicit lex errors, mirroring Int's out-of-range refusal — a
+ * literal is a CONVERSION boundary (ADR-040 §2.4), so out-of-range never silently lands on ±inf. */
+FloatLit       ::= [0-9]+ '.' [0-9]+ Exponent?
+                 | [0-9]+ Exponent
+Exponent       ::= ('e' | 'E') ('+' | '-')? [0-9]+
+Int            ::= '-'? [0-9]+
+Ident          ::= (Letter | '_') (Letter | [0-9] | '_')*
+Letter         ::= [a-zA-Z]
+
+/* Comments: line comments start with '//' and run to end-of-line; ignored by the grammar. */

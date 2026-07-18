@@ -1,0 +1,6 @@
+// rejected: the old angle-bracket type-parameter form on a `trait` (`trait Negate<T> { … }`) is
+// RETIRED (RFC-0037 D1 — type parameters now use `[…]`, e.g. `trait Negate[T]`). A `<` where the
+// trait body `{` is expected is a never-silent parse refusal, never a silent acceptance of the old
+// angle form (G2).
+nodule bad;
+trait Negate<T> { fn negate(x: T) => T }

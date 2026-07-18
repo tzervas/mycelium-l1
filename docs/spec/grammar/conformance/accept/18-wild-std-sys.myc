@@ -1,0 +1,13 @@
+// exercises: the @std-sys nodule-header marker + a wild FFI-floor block (M-661; RFC-0016 §8-Q6)
+// The @std-sys marker (lexed atomically, after the nodule path) is the audited FFI-floor CONTEXT:
+// a wild block is legal only inside a @std-sys nodule (the checker enforces that — RFC-0016 §8-Q6 /
+// LR-9). This is the PARSE-level accept (the parser admits the marker + the wild block); the
+// std-sys CONTEXT gate and the `ffi`-effect coverage are CHECKER concerns exercised in
+// `crates/mycelium-l1/tests/check.rs` (the M-660-style parse/check split). The wild body is the
+// trusted/opaque FFI escape (audited, not verified — ADR-014/VR-5), so `foreign_read` need not be
+// a declared fn. `wild` performs the `ffi` effect, so the fn declares `!{ffi}` (M-660 binding).
+nodule std.sys.fs @std-sys;
+
+// SAFETY: foreign_read bottoms out in an audited host syscall; the result is a fixed-width byte.
+fn read_byte() => Binary{8} !{ffi} =
+    wild { foreign_read() };

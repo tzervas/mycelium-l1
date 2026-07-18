@@ -1,0 +1,747 @@
+// nodule: std.recover
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted declarative recovery bridge — the never-silent driver over a reified
+nodule std.recover;
+
+//   recovery policy: every error is explicitly recovered (honest tag, never upgraded) or
+//   explicitly re-propagated; no drop path exists (M-930, E29-1, RFC-0031 §5 D5; kickoff opp;
+//   ports the EXPRESSIBLE surface of crates/mycelium-std-recover; docs/spec/stdlib/recover.md).
+// ── Surface-check (D5 row 1, Empirical, 2026-07-02) ─────────────────────────────────────────────
+//
+// crates/mycelium-std-recover's public surface (lib.rs re-exports + modules): the result sums
+// (Outcome/Resolution/DiagError), the closed v0 action set (RecoveryAction), the class registry
+// (ClassName/ClassRegistry/UnknownClass), the reified policy (RecoveryPolicy/PolicyRef/
+// PolicyHashError/policy_effects), the effect surface (EffectKind/EffectBudget/Budgets/
+// EffectBudgetExhausted/EffectSet/check_effects/UndeclaredEffect), the never-silent driver
+// (handle_classified/recover_classified), and the §4.5 guarantee matrix as checked data.
+// Checked against today's `.myc` surface (parser/checker in crates/mycelium-l1/src):
+//
+// PORTED (all below): Outcome (+ from_result/into_result/is_ok/is_err), Resolution
+// (+ is_recovered/is_propagated/resolution_witness), RecoveryAction (closed 4-action set),
+// ClassName/UnknownClass/ClassRegistry (+ register/resolve/registry_contains), RecoveryPolicy
+// (+ on/action_for/policy_is_empty/policy_insert/policy_effects), EffectKind (closed 5-kind
+// kernel), EffectBudget/Budgets (+ budget_set/budget_remaining/budget_consume),
+// EffectBudgetExhausted, EffectSet/check_effects/UndeclaredEffect, handle_classified/
+// recover_classified, and the guarantee matrix (11 rows, checked data — diag-port precedent).
+//
+// FLAGGED — NOT expressible today, no enabler landed (never forced, VR-5/G2):
+// - FLAG-recover-1 (`PolicyRef` / `RecoveryPolicy::policy_ref` / `PolicyHashError`): PolicyRef is
+//   `mycelium_core::ContentHash` — a kernel-only type computed by BLAKE3 over a serde_json
+//   canonical encoding. No content-hash primitive is exposed to `.myc` (RFC-0031 D1 — the kernel
+//   stays Rust), so the content-addressed policy identity CANNOT be computed here. The
+//   `Option<PolicyRef>` field on `Resolution` is substituted by `PolicyWitness` (below) — the
+//   *presence* of an acting policy is carried (EXPLAIN-able: did a policy act?), the content
+//   address is NOT fabricated (VR-5). Consequently the Rust driver's policy_ref-hash-failure path
+//   (serde error → Propagated with policy: None) has no `.myc` analog: with no hash there is no
+//   hash-failure path (captured, not faked). This is the kernel D1 boundary the kickoff intel
+//   named for the RFC-0014 recover/PolicyRef bridge.
+// - FLAG-recover-2 (`DiagError<E>`): bundles the kernel `mycelium_diag::Diag` record — the same
+//   D1 kernel boundary the std.diag port FLAGged for its part (b) (String/Vec fields, BLAKE3
+//   content_hash, serde). Not ported; the generic `E` payload discipline (FR-R5) is documented,
+//   not enforced, exactly as in the Rust crate's generic driver.
+// - FLAG-recover-3 (`EffectKind::Named(String)` / `EffectBudget::Named(String, u64)`): an OPEN
+//   string-named effect vocabulary needs byte-string equality for ledger lookup, and RFC-0032 D4
+//   exposes no `bytes_eq` prim (only bytes_len/get/slice/concat — the same gap std.diag FLAGged).
+//   The CLOSED 5-kind kernel (Retry/Alloc/Io/Cascade/Time) is ported; `Named` is not.
+// - FLAG-recover-4 (open `String` class vocabulary): `ClassRegistry` over Rust `String` names
+//   hits the same missing-bytes_eq gap. Substituted: a CLOSED typed `ClassName` vocabulary
+//   (ClsIoError/ClsParseError/ClsTimeout/ClsFatal — the classes the Rust crate's own tests use).
+//   The registry stays a RUNTIME SUBSET of that vocabulary, so `resolve`'s explicit
+//   `Err(UnknownClass)` path (X1 — a class is looked up, never an eval'd string) is preserved,
+//   not statically discharged.
+// - The Rust crate's substring-assertion tests (e.g. `guarantee.contains("Declared")`,
+//   `error_set.contains("Recovered")`) do not port — no bytes_eq/contains prim (same FLAG as
+//   std.diag). Their SEMANTIC content is covered executably instead: the fallback-is-Declared /
+//   Ok-pass-through-is-Exact / overrun-recorded properties are asserted on `handle_classified`
+//   itself in std_recover.rs.
+//
+// SUBSTITUTIONS made honestly (never a silent signature change — VR-5/G2):
+// - `Outcome`'s constructors are `OOk`/`OErr` (Rust: `Ok`/`Err`) — the local `Result` mirror
+//   (needed by recover_classified/budget_consume/check_effects/resolve/on) already owns the
+//   bare `Ok`/`Err` constructor names, and constructor names are nodule-global.
+// - `Result[A,E]`/`Option[A]` are redeclared locally, not `use`d from std.result/std.option —
+//   the single-nodule `include_str!` harness precedent (same note as std.error.myc).
+// - `GuaranteeStrength` (kernel) is mirrored as `Guarantee` with `G`-prefixed constructors
+//   (`GExact`/`GProven`/`GEmpirical`/`GDeclared`): `Exact`/`Proven`/`Empirical`/`Declared` are
+//   RESERVED strength-annotation keywords (std.diag precedent).
+// - `u64` budget/attempt scalars are `Binary{8}` (domain 0..=127 — covers every bound the Rust
+//   crate's tests exercise; `lt`/`sub_u` are the Exact kernel prims at that width).
+// - `&mut Budgets` mutation is functional update: `budget_consume` returns the NEW ledger in
+//   `Ok` (value semantics — no mutation surface in `.myc`). `handle_classified` threads the
+//   ledger internally and returns the same observable the Rust driver returns (the Resolution).
+// - `attempt: FnMut() -> (Outcome, GuaranteeStrength)` is `attempt: Unit => AttemptOut` — HOF
+//   stage 1 (RFC-0024 §3) has no stateful closures and no nullary closure type, so the attempt
+//   thunk is a PURE fn over the `Unit` marker (std.error.myc precedent) returning the
+//   `AttemptOut` product (no tuple surface form). A pure attempt is deterministic across retry
+//   iterations; the Rust driver behaves identically for a pure closure, which is exactly what
+//   the differential compares (std_recover.rs).
+// - `RecoveryPolicy`'s `BTreeMap` is an association list (`PNil`/`PRule`) with replace-on-insert
+//   (`policy_insert`) — same rule semantics; `rules()` iteration IS the list (inspectable, C3).
+//   `on` returns the updated policy in `Ok` (functional update) rather than Rust's
+//   `Ok(Option<prior action>)`; the replaced-prior return value is dropped (documented, not
+//   silent). `EffectSet`'s `BTreeSet` is likewise a dedup cons-list (`ENil`/`ECons`).
+// - `Box<T>` on `Fallback` is plain `T` (value semantics — no box needed).
+// - `budget_consume` is not named `consume` and policy parameters are not named `policy`:
+//   `consume` and `policy` are reserved keywords (token.rs), as is `to` (Escalate's binding is
+//   `target`) and `with` (`Budgets::with` is `budget_set`, which Rust's `with` delegates to).
+//
+// Never-silent floor (C1/I1) carried over intact: `Resolution` has NO drop variant — every path
+// through `handle_classified` yields `Recovered` (honest tag, never upgraded — I2/VR-5) or
+// `Propagated` (the error survives). Budget overruns are explicit (`Exhausted`, I4); an effect
+// with no declared budget cannot run (I5); an undeclared performed effect is an explicit checker
+// error (I3). Guarantee tags (VR-5, carried at the SAME strength as the Rust crate's matrix):
+// Ok pass-through GExact (FR-R3); fallback GDeclared (fixed ceiling); retry success inherits the
+// attempt's own tag; policy/ledger/check ops Exact (no accuracy semantics); differential
+// agreement Empirical (std_recover.rs).
+// ── local mirrors (single-nodule harness — see the substitution notes above) ────────────────────
+type Result[A, E] = Ok(A) | Err(E);
+
+type Option[A] = Some(A) | None;
+
+// Unit — the missing `() => T` closure-domain form (std.error.myc precedent) is filled by the
+// built-in PRELUDE `Unit` type since DN-137/M-1102 (a hand-seeded `type Unit = Unit;`,
+// `checkty::unit_prelude`); the local nullary-marker redeclaration this file used to carry here
+// is gone (it would now collide with the prelude — "duplicate type declaration").
+// Guarantee — the kernel `GuaranteeStrength` lattice `Exact ⊐ Proven ⊐ Empirical ⊐ Declared`
+// as VALUE-level data, `G`-prefixed (reserved-keyword substitution; std.diag precedent).
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// ── outcome (RFC-0014 §4.1–§4.2) ────────────────────────────────────────────────────────────────
+// The input sum `Ok(T) | Err(E)` — errors propagate by default; an OErr must be explicitly acted
+// on by a recovery policy or it continues to surface. Constructors `OOk`/`OErr` (see the
+// substitution note above).
+type Outcome[T, E] = OOk(T) | OErr(E);
+
+// PolicyWitness — the honest substitution for `Option<PolicyRef>` (FLAG-recover-1): records
+// WHETHER a policy acted on the outcome (ByPolicy) or none did (NoPolicy). The content-addressed
+// identity itself is kernel-only and is NOT fabricated here (VR-5).
+type PolicyWitness = ByPolicy | NoPolicy;
+
+// Resolution — the output sum of the driver: `Recovered(value, tag, witness)` or
+// `Propagated(error, witness, cleanup_overrun)`. There is NO `Dropped` variant (I1): a handler
+// cannot express "discard the error" using this sum — never-silent is enforced by the type.
+// The recovered `tag` is never upgraded (I2/VR-5): GDeclared for a fallback, the attempt's own
+// tag for a retry success, GExact for a clean OOk pass-through (FR-R3). `cleanup_overrun` (spec
+// §7-Q4): True means a cleanup_then_propagate cleanup was SKIPPED on budget overrun — recorded,
+// not swallowed; the original error propagates regardless.
+type Resolution[T, E] = Recovered(T, Guarantee, PolicyWitness) | Propagated(E, PolicyWitness, Bool);
+
+// AttemptOut — the product substitution for the Rust attempt thunk's
+// `(Outcome<T, E>, GuaranteeStrength)` tuple: the re-attempt's outcome plus that value's honest
+// tag (inherited on retry success, never upgraded — I2/VR-5).
+type AttemptOut[T, E] = Attempted(Outcome[T, E], Guarantee);
+
+// ── error classes (RFC-0013 §4.5 / X1; FLAG-recover-4 — closed typed vocabulary) ───────────────
+// The class vocabulary the Rust crate's own tests exercise ("io-error"/"parse-error"/"timeout"/
+// "fatal"), as a closed typed ADT (no bytes_eq prim for open string names).
+type ClassName = ClsIoError | ClsParseError | ClsTimeout | ClsFatal;
+
+// UnknownClass — the explicit error returned by `resolve`/`on` when a class is not REGISTERED
+// (X1): a configuration error, never a silent fabrication (G2).
+type UnknownClass = UnknownCls(ClassName);
+
+// ClassRegistry — the append-only runtime registry: a class resolves only if explicitly
+// registered (a runtime SUBSET of the closed vocabulary, so the X1 lookup discipline is
+// preserved, not statically discharged).
+type ClassRegistry = RegNil | RegCons(ClassName, ClassRegistry);
+
+// ── effects (RFC-0014 §4.5 I3–I5; FLAG-recover-3 — closed 5-kind kernel, no Named) ─────────────
+// The closed kernel of effect kinds (mycelium-interp::budget::EffectKind minus `Named(String)`).
+type EffectKind = EkRetry | EkAlloc | EkIo | EkCascade | EkTime;
+
+// EffectBudget — one budget variant per kind, distinct vocabulary (Attempts/Depth/AllocBytes/
+// Fuel/Ops for Retry/Cascade/Alloc/Time/Io), all enforced by the one `budget_consume`
+// mechanism. `AllocBytes` renames Rust's `Bytes` variant — `Bytes` is a reserved repr-type
+// keyword. Amounts are Binary{8} (see the width substitution note above).
+type EffectBudget =
+    Attempts(Binary{8})
+  | Depth(Binary{8})
+  | AllocBytes(Binary{8})
+  | Fuel(Binary{8})
+  | Ops(Binary{8});
+
+// EffectBudgetExhausted — the explicit, graceful overrun (I4): `Exhausted(kind, requested,
+// remaining)` — never a hang, stack overflow, or OOM.
+type EffectBudgetExhausted = Exhausted(EffectKind, Binary{8}, Binary{8});
+
+// Budgets — the budget ledger: one enforcement mechanism over separate named budgets (RFC-0014
+// §8 resolved). An effect with NO entry cannot consume anything (default tightly scoped, I5).
+type Budgets = BNil | BEntry(EffectKind, Binary{8}, Budgets);
+
+// EffectList — a definition's declared/performed effect SET (§4.5 I3) as a dedup cons-list
+// (BTreeSet substitution).
+type EffectList = ENil | ECons(EffectKind, EffectList);
+
+// UndeclaredEffect — a performed-but-undeclared effect (I3): an explicit checker error, never
+// silent.
+type UndeclaredEffect = Undeclared(EffectKind);
+
+// ── the closed v0 recovery-action set (RFC-0014 §4.4; §8 resolved closed) ───────────────────────
+// No action variant makes an error vanish (I1): Fallback replaces it with an explicit value
+// (honestly GDeclared — I2/VR-5); Retry propagates the ORIGINAL error on exhaustion; Escalate and
+// CleanupThenPropagate re-propagate an explicit error. A handler using this closed set CANNOT
+// express a "drop" — the type enforces I1. `Retry(n)`: n = max re-attempts (the budget ceiling,
+// I4); 0 is valid and means NO retry (immediate propagation, never a silent drop). `Escalate`:
+// the target class intent is carried in the action (X1-validated by `on`); like the Rust generic
+// driver, the propagated `E` payload is not re-typed (the honest Rust-first seam, carried over).
+type RecoveryAction[T] =
+    Fallback(T)
+  | Retry(Binary{8})
+  | Escalate(ClassName)
+  | CleanupThenPropagate(EffectKind);
+
+// Policy — the reified recovery policy: an `on <class> => <action>` association list with
+// replace-on-insert (the BTreeMap substitution). The rule list IS the inspection surface (C3);
+// the content-addressed PolicyRef identity is FLAG-recover-1.
+type Policy[T] = PNil | PRule(ClassName, RecoveryAction[T], Policy[T]);
+
+// ── shared helpers (Exact — total, match-defined, finite domain) ────────────────────────────────
+// bin_eq: Bool projection of the Exact `eq` prim at Binary{8}.
+fn bin_eq(a: Binary{8}, b: Binary{8}) => Bool =
+  match eq(a, b) { 0b1 => True, _ => False };
+
+// bool_and: local total conjunction (std.diag precedent — no cross-leaf import).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+// class_code: injective code map over the closed ClassName vocabulary (Exact — total,
+// match-defined, checkable by inspection).
+fn class_code(c: ClassName) => Binary{8} =
+  match c {
+    ClsIoError => 0b0000_0000,
+    ClsParseError => 0b0000_0001,
+    ClsTimeout => 0b0000_0010,
+    ClsFatal => 0b0000_0011
+  };
+
+// class_eq: ADT equality via the injective code map (Exact).
+fn class_eq(a: ClassName, b: ClassName) => Bool =
+  bin_eq(class_code(a), class_code(b));
+
+// effect_code: injective code map over the closed EffectKind kernel (Exact).
+fn effect_code(k: EffectKind) => Binary{8} =
+  match k {
+    EkRetry => 0b0000_0000,
+    EkAlloc => 0b0000_0001,
+    EkIo => 0b0000_0010,
+    EkCascade => 0b0000_0011,
+    EkTime => 0b0000_0100
+  };
+
+// effect_eq: ADT equality via the injective code map (Exact).
+fn effect_eq(a: EffectKind, b: EffectKind) => Bool =
+  bin_eq(effect_code(a), effect_code(b));
+
+// ── outcome ops (Exact — pure structural; RFC-0014 §4.1) ────────────────────────────────────────
+fn from_result[T, E](r: Result[T, E]) => Outcome[T, E] =
+  match r { Ok(v) => OOk(v), Err(e) => OErr(e) };
+
+fn into_result[T, E](o: Outcome[T, E]) => Result[T, E] =
+  match o { OOk(v) => Ok(v), OErr(e) => Err(e) };
+
+fn is_ok[T, E](o: Outcome[T, E]) => Bool =
+  match o { OOk(_) => True, OErr(_) => False };
+
+fn is_err[T, E](o: Outcome[T, E]) => Bool =
+  match o { OOk(_) => False, OErr(_) => True };
+
+// ── resolution ops (Exact — pure structural; I1: no Dropped variant to observe) ────────────────
+fn is_recovered[T, E](r: Resolution[T, E]) => Bool =
+  match r { Recovered(_, _, _) => True, Propagated(_, _, _) => False };
+
+fn is_propagated[T, E](r: Resolution[T, E]) => Bool =
+  match r { Recovered(_, _, _) => False, Propagated(_, _, _) => True };
+
+// resolution_witness: the acting-policy witness on either variant (C3 — the presence half of
+// Rust's `Resolution::policy_ref`; the content address is FLAG-recover-1).
+fn resolution_witness[T, E](r: Resolution[T, E]) => PolicyWitness =
+  match r { Recovered(_, _, w) => w, Propagated(_, w, _) => w };
+
+// ── class registry (X1 — a class is looked up, never an eval'd string) ──────────────────────────
+fn registry_contains(reg: ClassRegistry, c: ClassName) => Bool =
+  match reg {
+    RegNil => False,
+    RegCons(x, rest) => match class_eq(x, c) { True => True, False => registry_contains(rest, c) }
+  };
+
+// register: idempotent insert (registering the same name twice is a no-op) — Exact.
+fn register(reg: ClassRegistry, c: ClassName) => ClassRegistry =
+  match registry_contains(reg, c) { True => reg, False => RegCons(c, reg) };
+
+// resolve: a class resolves only if registered; unregistered names are an explicit
+// Err(UnknownCls) — never a silent fabrication (X1/G2). Exact.
+fn resolve(reg: ClassRegistry, c: ClassName) => Result[ClassName, UnknownClass] =
+  match registry_contains(reg, c) { True => Ok(c), False => Err(UnknownCls(c)) };
+
+// ── budget ledger (I4/I5 — one enforcement mechanism over separate named budgets) ───────────────
+// budget_kind: the effect kind a budget bounds (mirrors EffectBudget::kind) — Exact.
+fn budget_kind(eb: EffectBudget) => EffectKind =
+  match eb {
+    Attempts(_) => EkRetry,
+    Depth(_) => EkCascade,
+    AllocBytes(_) => EkAlloc,
+    Fuel(_) => EkTime,
+    Ops(_) => EkIo
+  };
+
+// budget_amount: the budget's scalar ceiling (mirrors EffectBudget::amount) — Exact.
+fn budget_amount(eb: EffectBudget) => Binary{8} =
+  match eb { Attempts(n) => n, Depth(n) => n, AllocBytes(n) => n, Fuel(n) => n, Ops(n) => n };
+
+// budget_set: declare (or reset) a budget for its effect kind (mirrors Budgets::set/with) —
+// functional update; Exact.
+fn budget_set(b: Budgets, eb: EffectBudget) => Budgets =
+  match b {
+    BNil => BEntry(budget_kind(eb), budget_amount(eb), BNil),
+    BEntry(bk, rem, rest) => match effect_eq(bk, budget_kind(eb)) {
+      True => BEntry(bk, budget_amount(eb), rest),
+      False => BEntry(bk, rem, budget_set(rest, eb))
+    }
+  };
+
+// budget_remaining: the remaining budget for a kind; None if none was declared — Exact.
+fn budget_remaining(b: Budgets, k: EffectKind) => Option[Binary{8}] =
+  match b {
+    BNil => None,
+    BEntry(bk, rem, rest) =>
+      match effect_eq(bk, k) {
+        True => Some(rem),
+        False => budget_remaining(rest, k)
+      }
+  };
+
+// budget_consume: consume `amount` of `k`'s budget. An overrun — INCLUDING consuming an effect
+// with NO declared budget (I5: remaining 0) — is the explicit, graceful
+// Err(Exhausted(kind, requested, remaining)) (I4); never a hang or a silent stall. On success
+// the NEW ledger (decremented via the Exact sub_u prim) is returned in Ok — the functional
+// form of Rust's `&mut` decrement. Exact (budget arithmetic; no accuracy semantics).
+fn budget_consume(
+  b: Budgets,
+  k: EffectKind,
+  amount: Binary{8}
+) => Result[Budgets, EffectBudgetExhausted] =
+  match b {
+    BNil => Err(Exhausted(k, amount, 0b0000_0000)),
+    BEntry(bk, rem, rest) => match effect_eq(bk, k) {
+      True => match lt(rem, amount) {
+        0b1 => Err(Exhausted(k, amount, rem)),
+        _ => Ok(BEntry(bk, sub_u(rem, amount), rest))
+      },
+      False => match budget_consume(rest, k, amount) {
+        Ok(rest2) => Ok(BEntry(bk, rem, rest2)),
+        Err(x) => Err(x)
+      }
+    }
+  };
+
+// ── declared-effect discipline (I3 — manual-declare + compositional-check) ──────────────────────
+fn effect_member(xs: EffectList, k: EffectKind) => Bool =
+  match xs {
+    ENil => False,
+    ECons(x, rest) => match effect_eq(x, k) { True => True, False => effect_member(rest, k) }
+  };
+
+// effect_insert: set-insert (no-op when already present) — the dedup that keeps EffectList a
+// set. Exact.
+fn effect_insert(xs: EffectList, k: EffectKind) => EffectList =
+  match effect_member(xs, k) { True => xs, False => ECons(k, xs) };
+
+// check_effects: every performed effect must be in the declared set; the FIRST undeclared one is
+// an explicit Err(Undeclared) (I3 — no unknown side effects). This CHECKS that declared effects
+// compose — it never INFERS one. Exact (static check; no accuracy semantics).
+fn check_effects(declared: EffectList, performed: EffectList) => Result[Unit, UndeclaredEffect] =
+  match performed {
+    ENil => Ok(Unit),
+    ECons(k, rest) => match effect_member(declared, k) {
+      True => check_effects(declared, rest),
+      False => Err(Undeclared(k))
+    }
+  };
+
+// ── reified policy (RFC-0014 §4.4; C3 — the rule list is the inspection surface) ───────────────
+// policy_insert: add or REPLACE the rule for a class (the BTreeMap insert semantic) — Exact.
+// (`PRule(c, a, p)` reuses the matched empty `p` rather than a bare `PNil` in field position —
+// a bare nullary generic constructor cannot determine its type argument there; the
+// std.collections `snoc` precedent.)
+fn policy_insert[T](p: Policy[T], c: ClassName, a: RecoveryAction[T]) => Policy[T] =
+  match p {
+    PNil => PRule(c, a, p),
+    PRule(pc, pa, rest) => match class_eq(pc, c) {
+      True => PRule(c, a, rest),
+      False => PRule(pc, pa, policy_insert(rest, c, a))
+    }
+  };
+
+// escalate_target: the Escalate action's target class, if any (the X1 validation hook for `on`).
+fn escalate_target[T](a: RecoveryAction[T]) => Option[ClassName] =
+  match a {
+    Fallback(_) => None,
+    Retry(_) => None,
+    Escalate(target) => Some(target),
+    CleanupThenPropagate(_) => None
+  };
+
+// on: add an `on <class> => <action>` rule, resolving the LHS class AND any Escalate target
+// through the registry (X1 — both are membership-checked, never unvalidated). An unknown class
+// (either side) is an explicit Err(UnknownCls), never a silent fabrication (G2). Returns the
+// UPDATED policy in Ok (functional update — see the substitution note on the dropped
+// prior-action return). Exact (builds a config value; no accuracy semantics).
+fn on[T](
+  reg: ClassRegistry,
+  p: Policy[T],
+  c: ClassName,
+  a: RecoveryAction[T]
+) => Result[Policy[T], UnknownClass] =
+  match registry_contains(reg, c) {
+    False => Err(UnknownCls(c)),
+    True => match escalate_target(a) {
+      None => Ok(policy_insert(p, c, a)),
+      Some(target) => match registry_contains(reg, target) {
+        True => Ok(policy_insert(p, c, a)),
+        False => Err(UnknownCls(target))
+      }
+    }
+  };
+
+// action_for: the recovery action for a class, if any — None is explicit absence, never a silent
+// fallthrough to a default action (G2). Exact.
+fn action_for[T](p: Policy[T], c: ClassName) => Option[RecoveryAction[T]] =
+  match p {
+    PNil => None,
+    PRule(pc, pa, rest) => match class_eq(pc, c) { True => Some(pa), False => action_for(rest, c) }
+  };
+
+fn policy_is_empty[T](p: Policy[T]) => Bool =
+  match p { PNil => True, PRule(_, _, _) => False };
+
+// action_effect: the effect an action declares, if any (Retry → EkRetry; CleanupThenPropagate →
+// its cleanup effect; Fallback/Escalate are effect-free).
+fn action_effect[T](a: RecoveryAction[T]) => Option[EffectKind] =
+  match a {
+    Fallback(_) => None,
+    Retry(_) => Some(EkRetry),
+    Escalate(_) => None,
+    CleanupThenPropagate(ef) => Some(ef)
+  };
+
+// policy_effects: the policy's declared, closed effect set (I3) — the input to check_effects.
+// Exact.
+fn policy_effects[T](p: Policy[T]) => EffectList =
+  match p {
+    PNil => ENil,
+    PRule(_, a, rest) => match action_effect(a) {
+      Some(k) => effect_insert(policy_effects(rest), k),
+      None => policy_effects(rest)
+    }
+  };
+
+// ── the never-silent driver (RFC-0014 §4.2/§4.3; RFC-0016 C1) ───────────────────────────────────
+// retry_loop: re-attempt up to `remaining` times, consuming one EkRetry budget unit BEFORE each
+// attempt (I4/I5 — a budget overrun propagates the ORIGINAL error immediately; the attempt is
+// not run). A successful attempt recovers with the attempt's OWN tag (inherited, never upgraded
+// — I2/VR-5/FR-R3). Exhaustion propagates the ORIGINAL error (additive — I1).
+fn retry_loop[T, E](
+  remaining: Binary{8},
+  err: E,
+  b: Budgets,
+  attempt: Unit => AttemptOut[T, E]
+) => Resolution[T, E] =
+  match eq(remaining, 0b0000_0000) {
+    0b1 => Propagated(err, ByPolicy, False),
+    _ => match budget_consume(b, EkRetry, 0b0000_0001) {
+      Err(_) => Propagated(err, ByPolicy, False),
+      Ok(b2) => match attempt(Unit) {
+        Attempted(o2, tag) => match o2 {
+          OOk(v) => Recovered(v, tag, ByPolicy),
+          OErr(_) => retry_loop(sub_u(remaining, 0b0000_0001), err, b2, attempt)
+        }
+      }
+    }
+  };
+
+// apply_action: apply one matched action — every arm yields Recovered or Propagated (I1).
+// Fallback recovers with the fixed GDeclared ceiling (a substituted value has no checked basis —
+// I2/VR-5). Escalate re-propagates explicitly (the target intent is policy-recorded; the E
+// payload is not re-typed — the honest Rust-first seam). CleanupThenPropagate consumes its
+// declared effect ONCE; an overrun SKIPS the cleanup only and records it (True) — the original
+// error propagates regardless (spec §7-Q4: recorded, not swallowed).
+fn apply_action[T, E](
+  a: RecoveryAction[T],
+  err: E,
+  b: Budgets,
+  attempt: Unit => AttemptOut[T, E]
+) => Resolution[T, E] =
+  match a {
+    Fallback(v) => Recovered(v, GDeclared, ByPolicy),
+    Retry(n) => retry_loop(n, err, b, attempt),
+    Escalate(_) => Propagated(err, ByPolicy, False),
+    CleanupThenPropagate(ef) => match budget_consume(b, ef, 0b0000_0001) {
+      Ok(_) => Propagated(err, ByPolicy, False),
+      Err(_) => Propagated(err, ByPolicy, True)
+    }
+  };
+
+// handle_classified: the spine — map an Outcome through a Policy; ALWAYS yields a Resolution,
+// never a drop (I1 — enforced by the type). OOk passes through Recovered with tag GExact
+// (FR-R3: a clean pass-through is not a fallback substitution — never GDeclared). An OErr with
+// no matching rule propagates UNCHANGED with NoPolicy (the I1 floor). A matched rule is applied
+// per apply_action, with the ByPolicy witness (C3 presence — FLAG-recover-1 for the content
+// address). Guarantee: inherited honest floor (I2/VR-5); total over budgets.
+fn handle_classified[T, E](
+  o: Outcome[T, E],
+  p: Policy[T],
+  b: Budgets,
+  class_of: E => ClassName,
+  attempt: Unit => AttemptOut[T, E]
+) => Resolution[T, E] =
+  match o {
+    OOk(v) => Recovered(v, GExact, NoPolicy),
+    OErr(e) => match action_for(p, class_of(e)) {
+      None => Propagated(e, NoPolicy, False),
+      Some(a) => apply_action(a, e, b, attempt)
+    }
+  };
+
+// recover_classified: the Result bridge — handle_classified with a Result input (the concrete
+// shape that resolves error.md §7-Q1: RecoverOutcome = Recovered | Propagated, no drop variant,
+// honest inherited tag).
+fn recover_classified[T, E](
+  r: Result[T, E],
+  p: Policy[T],
+  b: Budgets,
+  class_of: E => ClassName,
+  attempt: Unit => AttemptOut[T, E]
+) => Resolution[T, E] =
+  handle_classified(from_result(r), p, b, class_of, attempt);
+
+// ── guarantee matrix (RFC-0016 §4.5; spec §4) — the §4.5 table as CHECKED DATA ──────────────────
+// Mirrors guarantee_matrix.rs::MATRIX row-for-row (11 rows). The `guarantee` column is prose
+// (Bytes — it mixes lattice tags with scoping notes in the Rust source); `fallibility`/
+// `explainable` are typed ADTs (never stringly). Row DATA is Declared (hand-transcribed,
+// matching the Rust source's own literal data); the structural checks below are Empirical over
+// it (std_recover.rs three-way).
+type Fallibility = Total | FallibleConfig | FallibleBudget;
+
+type Explainable = PolicyRef | IsPolicyRef | NotApplicable;
+
+type MatrixRow = Row(Bytes, Bytes, Fallibility, Bytes, Bytes, Explainable, Bytes);
+
+// ── field accessors ─────────────────────────────────────────────────────────────────────────────
+fn row_op(r: MatrixRow) => Bytes =
+  match r { Row(op, _, _, _, _, _, _) => op };
+
+fn row_guarantee(r: MatrixRow) => Bytes =
+  match r { Row(_, g, _, _, _, _, _) => g };
+
+fn row_fallibility(r: MatrixRow) => Fallibility =
+  match r { Row(_, _, f, _, _, _, _) => f };
+
+fn row_error_set(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, e, _, _, _) => e };
+
+fn row_effects(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, _, ef, _, _) => ef };
+
+fn row_explainable(r: MatrixRow) => Explainable =
+  match r { Row(_, _, _, _, _, x, _) => x };
+
+fn row_never_silent(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, _, _, _, n) => n };
+
+// ── structural predicates (ADT equality — no bytes_eq needed) ───────────────────────────────────
+fn is_total(f: Fallibility) => Bool =
+  match f { Total => True, FallibleConfig => False, FallibleBudget => False };
+
+fn is_fallible_config(f: Fallibility) => Bool =
+  match f { Total => False, FallibleConfig => True, FallibleBudget => False };
+
+fn is_fallible_budget(f: Fallibility) => Bool =
+  match f { Total => False, FallibleConfig => False, FallibleBudget => True };
+
+fn is_expl_policy_ref(x: Explainable) => Bool =
+  match x { PolicyRef => True, IsPolicyRef => False, NotApplicable => False };
+
+// nonempty: True iff `b` has at least one byte (bytes_len is the Exact prim at Binary{32};
+// std.diag precedent).
+fn nonempty(b: Bytes) => Bool =
+  match eq(bytes_len(b), 0b0000_0000_0000_0000_0000_0000_0000_0000) { 0b1 => False, _ => True };
+
+// ── the 11 rows (hand-transcribed verbatim from guarantee_matrix.rs::MATRIX) ────────────────────
+fn row_handle() => MatrixRow =
+  Row(
+    "handle (never-silent driver)",
+    "Inherited-honest-floor: Exact for Ok pass-through, Declared for fallback, attempt-tag for retry success",
+    Total,
+    "total over budgets — yields Recovered | Propagated; no drop (I1); budget overrun is EffectBudgetExhausted routed through the outcome",
+    "the policy's actions' effects (retry → EffectKind::Retry budgeted Attempts(N); cleanup_then_propagate → declared effect budgeted); Ok / fallback / escalate paths are effect-free",
+    PolicyRef,
+    "Resolution has no Dropped variant; every call yields Recovered or Propagated — enforced by the type (I1)"
+  );
+
+fn row_recover_bridge() => MatrixRow =
+  Row(
+    "recover / handle_classified (std.error bridge)",
+    "= handle — inherits the honest floor; never upgraded (I2/VR-5)",
+    Total,
+    "RecoverOutcome = Resolution = Recovered | Propagated; never a drop (I1)",
+    "= handle (the policy's declared, budgeted effects)",
+    PolicyRef,
+    "Resolution = Recovered | Propagated; no Dropped variant — I1 is a property of the type"
+  );
+
+fn row_fallback() => MatrixRow =
+  Row(
+    "fallback(value) (action)",
+    "Declared — a substituted fallback has no checked basis (I2/VR-5)",
+    Total,
+    "always Recovered(value, Declared) — the one always-recovering action",
+    "none (pure value substitution)",
+    PolicyRef,
+    "always Recovered — the error is replaced by an explicit value (I1); the substitution is honest-tagged Declared"
+  );
+
+fn row_retry() => MatrixRow =
+  Row(
+    "retry(<=N) (action)",
+    "Inherited-from-attempt — the successful attempt's own tag; on exhaustion no value is produced",
+    Total,
+    "Recovered on success; Propagated(original_error) on exhaustion — bounded by <=N (I4); EffectBudgetExhausted on budget overrun",
+    "EffectKind::Retry, budgeted Attempts(N); overrun → graceful EffectBudgetExhausted (I4)",
+    PolicyRef,
+    "either Recovered (attempt succeeded) or Propagated(original_error) (exhausted) — original error never discarded (I1)"
+  );
+
+fn row_escalate() => MatrixRow =
+  Row(
+    "escalate(class') (action)",
+    "n/a — re-propagates an error, not a value; no accuracy semantics",
+    Total,
+    "always Propagated(transformed_error) — still explicit; never a drop (I1)",
+    "none (pure structural transform — class label changes, error continues)",
+    PolicyRef,
+    "always Propagated — the error is re-tagged but never discarded (I1); the escalated class is in the PolicyRef (C3)"
+  );
+
+fn row_cleanup() => MatrixRow =
+  Row(
+    "cleanup_then_propagate(effect) (action)",
+    "n/a — re-propagates the original error",
+    Total,
+    "always Propagated(original_error); cleanup budget overrun is recorded in cleanup_overrun field (legible — spec §7-Q4); original error propagates regardless (I1)",
+    "declared cleanup effect, budgeted (I4/I5); overrun graceful (skips cleanup, records overrun, propagates original error)",
+    PolicyRef,
+    "original error always propagates (I1) — even if the cleanup budget overruns; the overrun is recorded (not swallowed)"
+  );
+
+fn row_on() => MatrixRow =
+  Row(
+    "on (policy registration)",
+    "Exact (builds a config value; no accuracy semantics)",
+    FallibleConfig,
+    "Err(UnknownClass) — a class not in the diag registry is an explicit config error, never an eval'd string (X1)",
+    "none",
+    NotApplicable,
+    "Err(UnknownClass) is explicit — an unknown class never silently becomes a default action (X1/G2)"
+  );
+
+fn row_policy_ref() => MatrixRow =
+  Row(
+    "policy_ref",
+    "Exact",
+    Total,
+    "",
+    "none",
+    IsPolicyRef,
+    "pure deterministic hash — no error path; policy_ref is the EXPLAIN identity (C3)"
+  );
+
+fn row_action_for() => MatrixRow =
+  Row(
+    "action_for",
+    "Exact",
+    Total,
+    "Option<RecoveryAction> — None if no rule for the class (never a silent fallthrough)",
+    "none",
+    NotApplicable,
+    "None is explicit absence — no silent fallthrough to a default action (G2)"
+  );
+
+fn row_consume() => MatrixRow =
+  Row(
+    "consume (budget ledger)",
+    "Exact (budget arithmetic; no accuracy semantics)",
+    FallibleBudget,
+    "Err(EffectBudgetExhausted) — the graceful, explicit overrun (I4); names kind + requested + remaining; never a hang/OOM",
+    "the consumed EffectKind, bounded",
+    NotApplicable,
+    "Err(EffectBudgetExhausted) is explicit — an overrun never hangs or silently stalls (I4)"
+  );
+
+fn row_check_effects() => MatrixRow =
+  Row(
+    "check_effects (I3)",
+    "Exact (static check; no accuracy semantics)",
+    FallibleConfig,
+    "Err(UndeclaredEffect) — a performed-but-undeclared effect is an explicit checker error (I3); names the undeclared effect",
+    "none (a static checker — not a runtime concern; KC-3)",
+    NotApplicable,
+    "Err(UndeclaredEffect) is explicit — an undeclared effect never silently becomes a valid side effect (I3/G2)"
+  );
+
+// ── Vec (local, self-contained — std.diag precedent) ────────────────────────────────────────────
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// matrix: the full 11-row table, in the same order as guarantee_matrix.rs::MATRIX.
+fn matrix() => Vec[MatrixRow] =
+  [
+    row_handle(),
+    row_recover_bridge(),
+    row_fallback(),
+    row_retry(),
+    row_escalate(),
+    row_cleanup(),
+    row_on(),
+    row_policy_ref(),
+    row_action_for(),
+    row_consume(),
+    row_check_effects()
+  ];
+
+// matrix_len: the row count as Binary{8} (11 rows fits trivially). O(n) spine-walk.
+fn matrix_len(xs: Vec[MatrixRow]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, matrix_len(rest)) };
+
+// ── structural checks (the ADT-typed analogs of guarantee_matrix.rs::tests; the Rust file's
+// substring-based assertions are FLAGged above — their semantics are asserted executably on
+// handle_classified in std_recover.rs instead) ───────────────────────────────────────────────────
+// every_row_states_never_silent_property (C1/I1).
+fn all_never_silent_nonempty(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(nonempty(row_never_silent(r)), all_never_silent_nonempty(rest))
+  };
+
+// driver_rows_are_total: the handle/recover bridge rows are Total (total over budgets — I1/I4).
+fn driver_rows_are_total() => Bool =
+  bool_and(is_total(row_fallibility(row_handle())), is_total(row_fallibility(row_recover_bridge())));
+
+// driver_rows_are_policy_ref_explainable: both driver rows carry PolicyRef for EXPLAIN (C3).
+fn driver_rows_are_policy_ref_explainable() => Bool =
+  bool_and(
+    is_expl_policy_ref(row_explainable(row_handle())),
+    is_expl_policy_ref(row_explainable(row_recover_bridge()))
+  );
+
+// config_ops_fallibility_is_typed: the typed half of the Rust exact-ops row check — `on` and
+// `check_effects` are FallibleConfig, `consume` is FallibleBudget, `policy_ref`/`action_for`
+// are Total (read off the typed Fallibility column, no substring needed).
+fn config_ops_fallibility_is_typed() => Bool =
+  bool_and(is_fallible_config(row_fallibility(row_on())),
+  bool_and(is_fallible_config(row_fallibility(row_check_effects())),
+  bool_and(is_fallible_budget(row_fallibility(row_consume())),
+  bool_and(is_total(row_fallibility(row_policy_ref())),
+  is_total(row_fallibility(row_action_for()))))));

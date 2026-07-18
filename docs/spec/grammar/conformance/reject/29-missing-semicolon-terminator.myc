@@ -1,0 +1,8 @@
+// reject: DN-57 §3 / M-818 — the `;` component terminator is MANDATORY. A top-level item that is
+// not terminated by `;` (here the first `fn` runs straight into the second with no terminator) is a
+// never-silent parse refusal (G2): the boundary between components is the `;` token, never the mere
+// start of the next item-opening keyword. The diagnostic names the unterminated component and where
+// the `;` belongs. Never-silent counterpart of every accept fixture (which all now carry `;`).
+nodule d;
+fn a(x: Binary{8}) => Binary{8} = not(x)
+fn b(x: Binary{8}) => Binary{8} = not(x);

@@ -1,0 +1,21 @@
+// exercises: RFC-0037 D2-b (M-915) — the short repr-keyword aliases `bin`/`tern`/`emb`/`hvec` for
+// `Binary`/`Ternary`/`Dense`/`VSA`. Each short form elaborates identically to its long form (the
+// same AST node either way — no new BaseType variant); both spellings are pinned side by side so a
+// mix within one program is legal. `vec` was rejected (collides with `std.collections.Vec`) and is
+// exercised as a never-silent parse refusal in reject/30.
+nodule rfc0037.short_repr;
+
+// `bin{N}` — short alias for `Binary{N}`.
+fn widen(x: bin{8}) => Binary{8} = x;
+
+// `tern{N}` — short alias for `Ternary{N}`, mixed with the long form in the same signature.
+fn trit_id(x: Ternary{6}) => tern{6} = x;
+
+// `emb{D,S}` — short alias for `Dense{D,S}`.
+fn embed(v: emb{768, F32}) => Dense{768, F32} = v;
+
+// `hvec{model,dim,sparsity}` — short alias for `VSA{model,dim,sparsity}`.
+fn hv(h: hvec{MAP, 10000, Dense}) => VSA{MAP, 10000, Dense} = h;
+
+// a width-parameter name works identically for the short form (DN-42 / M-753 v1).
+fn generic_widen{N}(x: bin{N}) => bin{N} = x;

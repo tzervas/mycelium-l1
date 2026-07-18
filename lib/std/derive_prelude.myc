@@ -1,0 +1,104 @@
+// nodule: std.derive_prelude
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-13
+// @summary: DN-138 WU-1 — the missing primitive/std-type derive-instances: `Init`/`Ord3` over
+nodule std.derive_prelude;
+
+//   `Binary{64}`/`Bytes`/`Bool` (the `Show` instances already exist, `lib/std/fmt.myc:221/227/234`).
+//   Together with the seeded resolution facts (`crates/mycelium-l1/src/checkty.rs`'s
+//   `PRELUDE_INSTANCE_SEEDS`, DN-138 §4.1 Alt A / §8 WU-2), these are what let a freshly-transpiled
+//   `.myc` file's derived `Debug`/`Default`/`PartialOrd` impl actually type-check + eventually
+//   evaluate over a scalar/`Bytes`/`Bool` field, closing the DeriveAttr-class top unblock (§1).
+// SELF-CONTAINED BY DESIGN (disclosed, VR-5): this file declares NO `use` of `std.cmp`/`std.fmt`.
+// Every `lib/std/*.myc` nodule today checks standalone with zero cross-nodule imports (`grep '^use
+// ' lib/std/*.myc` is empty at `@dev 871b166f`), so this file follows the same convention rather
+// than being the first to depend on cross-nodule `use` actually working end-to-end for `lib/std` --
+// an orthogonal risk this leaf does not need to take on. Where DN-138 §5 obligation 2 cites
+// `std.cmp::cmp{N}`/`bool_cmp` as the ALGORITHM to mirror, this file reimplements the identical
+// `eq`/`lt`-based three-way comparison directly (same Exact prims, same case structure) rather than
+// importing it -- an explicit, disclosed design choice (KISS/DRY note: the duplication is ~6 lines
+// per op, not a new mechanism).
+// ── Init — the canonical zero/identity value (DN-129 §3; DN-138 §5 obligation 2) ───────────────────
+// `Init[Binary{64}]`: the all-zeros 64-bit value. Exact (a fixed literal, no computation, no
+// selection/approximation).
+impl Init[Binary{64}] for Binary{64} {
+  fn init() => Binary{64} =
+    0b0000000000000000000000000000000000000000000000000000000000000000;
+};
+
+// `Init[Bool]`: `False`. Declared (an asserted convention -- matches Rust's own
+// `Default::default()` for `bool`, which is also `false` by fiat, not derived from any structural
+// property of the two-constructor sum); never claimed `Exact` past that basis (VR-5).
+impl Init[Bool] for Bool {
+  fn init() => Bool =
+    False;
+};
+
+// `Init[Bytes]`: the empty byte string. Exact (the unique zero-length `Bytes` value).
+impl Init[Bytes] for Bytes {
+  fn init() => Bytes =
+    "";
+};
+
+// ── Ord3 — the three-way order (DN-122 §13; DN-138 §5 obligation 2) ────────────────────────────────
+//
+// Every `cmp` below returns the SAME `Binary{8}` three-way sentinel convention
+// `crates/mycelium-transpile/src/emit/derives/ord.rs` already fixes for the derived `PartialOrd`
+// row (`Lt = 0b00000000`, `Eq = 0b00000001`, `Gt = 0b00000010`) -- the identical mapping
+// `crates/mycelium-l1/src/tests/ord3.rs`'s own worked example uses. `Ord3` itself carries no fixed
+// law (DN-122 §13's own module doc), so this is this file's own disclosed, self-consistent
+// convention, matching the one the *consumer* row already relies on.
+// `Ord3[Binary{64}]`: the same Exact `eq`/`lt` unsigned three-way comparison `std.cmp::cmp{N}`
+// implements (`lib/std/cmp.myc`), inlined directly per this file's header note. Exact: `eq`/`lt`
+// are Exact prims over the finite `Binary{64}` domain (RFC-0032 D1).
+impl Ord3[Binary{64}] for Binary{64} {
+  fn cmp(a: Binary{64}, b: Binary{64}) => Binary{8} =
+    match eq(a, b) { 0b1 => 0b00000001, _ => match lt(a, b) { 0b1 => 0b00000000, _ => 0b00000010 } };
+};
+
+// `Ord3[Bool]`: `False < True` -- the same convention `lib/std/cmp.myc`'s `bool_cmp` fixes,
+// mapped onto the `Binary{8}` sentinel. Declared (an asserted total order over the two
+// constructors -- there is no structural "smaller" fact to derive it from, exactly `bool_cmp`'s
+// own honesty boundary).
+impl Ord3[Bool] for Bool {
+  fn cmp(a: Bool, b: Bool) => Binary{8} =
+    match a {
+      False => match b { False => 0b00000001, True => 0b00000000 },
+      True => match b { False => 0b00000010, True => 0b00000001 }
+    };
+};
+
+fn bytes_cmp_from(a: Bytes, b: Bytes, i: Binary{32}, la: Binary{32}, lb: Binary{32}) => Binary{8} =
+  match eq(i, la) {
+    0b1 => match eq(i, lb) { 0b1 => 0b00000001, _ => 0b00000000 },
+    _ => match eq(i, lb) {
+      0b1 => 0b00000010,
+      _ => match eq(bytes_get(a, i), bytes_get(b, i)) {
+        0b1 => bytes_cmp_from(a, b, add_u(i, 0b00000000000000000000000000000001), la, lb),
+        _ => match lt(bytes_get(a, i), bytes_get(b, i)) { 0b1 => 0b00000000, _ => 0b00000010 }
+      }
+    }
+  };
+
+// `bytes_cmp_from`: lexicographic byte-wise comparison of `a`/`b` starting at index `i`, given
+// their pre-computed lengths `la`/`lb`. The shorter, equal-prefix string sorts first (the standard
+// lexicographic-with-length-tiebreak order); the first differing byte (compared as an unsigned
+// `Binary{8}` magnitude, matching `bytes_get`'s own return type) decides otherwise.
+//
+// Guarantee: Exact per byte compared (`eq`/`lt` are Exact prims); the overall composition is
+// Declared (structural recursion, not a machine-proven termination bound). Totality: this
+// self-recursion increments a `Binary{32}` index bounded by `la`/`lb` (`bytes_len`) rather than
+// descending through a `Match` on a constructor sub-binder -- the same shape `lib/std/fmt.myc`'s
+// `to_dec` already carries via its `div_u`-based recursion -- so the structural totality checker's
+// Foetus-style criterion (constructor-pattern descent only) honestly classifies this `Partial`, not
+// `Total`. That is disclosed, not a defect: `Partial` only withholds the `matured` privilege (RFC-
+// 0017 §4.2); it does not block an ordinary (non-`matured`) `myc check`, exactly as `to_dec`'s own
+// `Partial` classification does not block `lib/std/fmt.myc` today.
+// `Ord3[Bytes]`: the lexicographic order via `bytes_cmp_from` above, seeded from index 0 and each
+// operand's own `bytes_len`.
+impl Ord3[Bytes] for Bytes {
+  fn cmp(a: Bytes, b: Bytes) => Binary{8} =
+    bytes_cmp_from(a, b, 0b00000000000000000000000000000000, bytes_len(a), bytes_len(b));
+};

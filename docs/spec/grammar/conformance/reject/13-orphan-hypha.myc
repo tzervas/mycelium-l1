@@ -1,0 +1,8 @@
+// rejected: a bare `hypha <expr>` outside a `colony { … }` block is not expressible — RFC-0008
+// §4.7 RT7 ("an orphan hypha is not expressible": every concurrent unit lives inside a structured
+// scope). `hypha` is an active keyword (M-666), but only inside a colony body; used loose at
+// expression position it is an explicit, never-silent parse error (G2), not a silent accept.
+nodule demo;
+fn worker() => Binary{8} = not(0b0000_0001);
+
+fn run() => Binary{8} = hypha worker()

@@ -1,0 +1,59 @@
+// nodule: std.option
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-06-23
+// @updated: 2026-06-23
+// @summary: Self-hosted Option<A> — the never-silent optional value (Some(A) | None) plus the core
+nodule std.option;
+
+// combinators is_some, is_none, unwrap_or, map, and_then, fold, or_else, flatten. M-715 (E13-1,
+// RFC-0031 §5 D4 Tier-0). Sibling of std.result; follows the lib/std/result.myc composition
+// prototype exactly. Guarantee (per-op, audit-precise): the Some/None constructors and the total
+// Bool discriminators is_some/is_none are Exact (total, RFC-0016 / core spec §3); the value
+// combinators that extract/transform/eliminate (unwrap_or, map, and_then, fold, or_else, flatten)
+// carry a Declared type-level contract. Differential agreement (L1-eval ≡ L0-interp ≡ AOT) is
+// Empirical (trials, std_option.rs). Never-silent (G2): unwrap_or, fold, and or_else take a
+// caller-supplied fallback/eliminator/alternative — no panic, no sentinel; None never silently
+// becomes a value.
+type Option[A] = Some(A) | None;
+
+// is_some: True iff the optional holds a value. Total projection (Exact).
+fn is_some[A](o: Option[A]) => Bool =
+  match o { Some(_) => True, None => False };
+
+// is_none: True iff the optional is empty. Total projection (Exact).
+fn is_none[A](o: Option[A]) => Bool =
+  match o { Some(_) => False, None => True };
+
+// unwrap_or: the held value, else the caller-supplied fallback. Never-silent (G2): None yields the
+// explicit fallback — no panic, no sentinel. Declared (type-level contract).
+fn unwrap_or[A](o: Option[A], fallback: A) => A =
+  match o { Some(x) => x, None => fallback };
+
+// map: apply `f` to the held value; None passes through untouched. Why: lift a pure A -> B over an
+// Option without forcing the caller to match — never-silent (None is preserved). Declared.
+fn map[A, B](o: Option[A], f: A => B) => Option[B] =
+  match o { Some(x) => Some(f(x)), None => None };
+
+// and_then: chain an Option-returning step on Some; None short-circuits. The monadic bind for
+// Option — sequence fallible-by-absence steps without nesting matches. Declared.
+fn and_then[A, B](o: Option[A], f: A => Option[B]) => Option[B] =
+  match o { Some(x) => f(x), None => None };
+
+// fold: eliminate an Option into one B via on_some (a transform) and on_none (a default value).
+// The catamorphism for Option — collapse both cases to a common type, total + never-silent (G2:
+// the None case is an explicit caller-supplied B, never a fabricated one). Declared.
+fn fold[A, B](o: Option[A], on_some: A => B, on_none: B) => B =
+  match o { Some(x) => on_some(x), None => on_none };
+
+// or_else: keep a Some; on None, fall back to an alternative Option. Why: chain "try this, else
+// that" over optionals without unwrapping — the alternative is caller-supplied (never-silent, G2).
+// Declared.
+fn or_else[A](o: Option[A], alt: Option[A]) => Option[A] =
+  match o { Some(x) => Some(x), None => alt };
+
+// flatten: collapse a nested Option<Option<A>> by one level — an outer None, or an inner None,
+// both yield None; only Some(Some(x)) survives as Some(x). The join for Option. Declared.
+fn flatten[A](o: Option[Option[A]]) => Option[A] =
+  match o { Some(inner) => inner, None => None };

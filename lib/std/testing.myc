@@ -1,0 +1,885 @@
+// nodule: std.testing
+// @version: 0.1.0
+// @license: MIT
+// @authors: Tyler Zervas
+// @since: 2026-07-02
+// @updated: 2026-07-02
+// @summary: Self-hosted structural testing surface — property / golden / differential harness
+nodule std.testing;
+
+//   whose honesty crux (C1/G2) survives translation: a skipped or undetermined check is a
+//   first-class reported verdict, never a silent pass (M-932, E29-1, RFC-0031 §5 D5; kickoff
+//   opp; ports the EXPRESSIBLE surface of crates/mycelium-std-testing; docs/spec/stdlib/testing.md).
+// ── Surface-check (D5 row 1, Empirical, 2026-07-02) ─────────────────────────────────────────────
+//
+// crates/mycelium-std-testing's public surface (lib.rs + verdict.rs + cert_mode_test.rs +
+// guarantee_matrix.rs): the verdict sums (Verdict/FailRecord/SkipReason/UndetReason/Summary), the
+// seeded generator (Rng), the trial budget (Budget), the Gen trait, the three harness ops
+// (for_all/golden/differential), the honest aggregator (summarize/is_green), the M-796
+// mode-parametric surface (ModeScope/ModeTestConfig/ModeVisit/for_each_mode/for_each_mode_in/
+// assert_mode_scope/assert_mode_negative + the CertMode/CertScope/CertDecl/ResolvedMode resolver
+// vocabulary), and the §4 guarantee matrix as checked data (5 rows).
+// Checked against today's `.myc` surface (parser/checker in crates/mycelium-l1/src):
+//
+// PORTED (all below): Verdict (4 variants, generic over the reified counterexample payload) +
+// FailRecord + SkipReason (5) + UndetReason (3) + Summary (+ summarize/is_green/summary_total/
+// field accessors), Budget (budget_new/budget_trials/budget_default/budget_min), Rng as pure
+// state threading (rng_new with the zero-seed promotion, rng_next = Xorshift64 bit-exact at
+// Binary{64}, rng_next_u32 via the never-silent width_cast prim), for_all (+ the bounded
+// shrink-to-minimal loop, 1000-step ceiling carried over), golden (closed-vocabulary name code +
+// width-generic snapshot), differential (width-generic, thunked backends, explicit availability),
+// the full ModeScope algebra (6 predefined scopes, contains/count/is_empty/union/intersect/
+// modes_in_scope/modes_out_of_scope/from_resolved_mode), ModeTestConfig (config_new/
+// config_default/config_with_granular/config_provenance/config_resolve over a reimplemented
+// most-specific-wins fold — FLAG-testing-7), ModeVisit (+ visited_all/matches_scope),
+// for_each_mode/for_each_mode_in (pure substitutions), the reified violation cores of the two
+// panic-based asserts (mode_scope_violation/mode_negative_violation — FLAG-testing-6), and the
+// 5-row guarantee matrix as checked data with TYPED tag/fallibility/effects-class columns.
+//
+// FLAGGED — NOT expressible today, no enabler landed (never forced, VR-5/G2):
+// - FLAG-testing-1 (the `Gen<T>` trait): no trait-bound/trait-object HOF surface in `.myc`
+//   HOF stage 1 (RFC-0024 §3/§5). The trait's two methods are substituted by two explicit fn
+//   params (`gen: Binary{64} => GenStep[T]`, `shrink: T => Vec[T]`) — the capability is carried;
+//   the trait *as a trait* (a caller-supplied instance bundling both) awaits the trait surface.
+// - FLAG-testing-2 (`Rng::next_usize_below`): `usize` is a platform-width type with no `.myc`
+//   analog (the Rust impl's own comment is about 32-bit-target truncation), and its
+//   rejection-sampling loop is a non-structural recursion (probabilistically bounded only).
+//   `next_u64` (the Xorshift core) and `next_u32` ARE ported; the bounded-draw helper awaits a
+//   deliberate width/termination design, not a forced approximation.
+// - FLAG-testing-3 (Debug-formatted `FailRecord.description` + `make_diff`): no Debug/format
+//   prim is exposed to `.myc` fn bodies. The description String is substituted by a REIFIED
+//   typed payload (FailRecord's first field, generic — for for_all the shrunk counterexample
+//   VALUE itself; for golden/differential the typed expected/produced or lhs/rhs pair), which is
+//   the C3 EXPLAIN artifact in value form rather than its rendering. `make_diff` (a line-based
+//   String diff) is not ported — the typed pair IS the inspectable diff; rendering it is the
+//   runner's presentation concern (same seam as the Rust doc's "full diff tool lives in the
+//   runner").
+// - FLAG-testing-4 (open `String` golden names/snapshots): baseline `name`/`expected` are Rust
+//   `String`s compared by `==`, and RFC-0032 D4 exposes no `bytes_eq` prim (the std.diag/
+//   std.recover FLAG). Substituted: the name is a closed-vocabulary `Binary{8}` code
+//   (FLAG-recover-4 precedent) and the snapshot is width-generic `Binary{N}`, both compared by
+//   the width-typed Exact `eq` prim. The never-silent shape (missing/mismatched baseline →
+//   Skipped(NeedsRecord), never an auto-accept) carries over intact.
+// - FLAG-testing-5 (`FailRecord::to_diag`): projects to the kernel `mycelium_diag::Diag`
+//   (String/Vec fields + BLAKE3 content hash — the RFC-0031 D1 boundary std.diag's own port
+//   FLAGged), and would need a cross-nodule `use` the single-nodule harness cannot resolve.
+// - FLAG-testing-6 (`assert_mode_scope` / `assert_mode_negative`): panic-based refusal needs a
+//   host panic/diagnostic-refusal primitive that `.myc` fn bodies do not have (FLAG-error-1
+//   precedent; spec §7-Q3 / M-510/M-520 co-design). The DECISION core is ported as
+//   mode_scope_violation/mode_negative_violation returning Option[ModeViolation] — None is
+//   "the assertion holds"; Some(violation) reifies exactly what the Rust panic message carries
+//   (the violating mode + direction). The panicking wrappers await the failure mechanism.
+// - FLAG-testing-7 (`ModeTestConfig::resolve` delegating to `mycelium_proj::resolve_mode`): the
+//   Rust crate's KC-3 claim is "one shared resolver, no drift". `.myc` has no kernel resolver to
+//   call, so the most-specific-wins fold is REIMPLEMENTED here (resolve_decls below, mirroring
+//   `max_by_key`: the LAST maximal-specificity declaration wins) and pinned against the Rust
+//   resolver by the live oracle differential in std_testing.rs. Drift is caught by trial
+//   (Empirical), not prevented by sharing — the KC-3 no-second-implementation property does NOT
+//   carry over; flagged, not silently claimed.
+//
+// SUBSTITUTIONS made honestly (never a silent signature change — VR-5/G2):
+// - `&mut Rng` / `&mut state` mutation is pure state threading: `rng_next(state)` returns the
+//   next state (which for Xorshift64 IS the drawn value, exactly as in Rust where the output
+//   equals the new state); `GenStep[G] = Stepped(Option[G], Binary{64})` carries a generator's
+//   drawn value plus the advanced state (the AttemptOut product precedent, std.recover).
+// - `u64` seeds/draws are `Binary{64}` (bit-exact — the Xorshift constants 13/7/17 and the
+//   0xDEAD_BEEF_CAFE_1337 zero-seed promotion are carried verbatim); `u32` trial indices and
+//   `Summary` counts are `Binary{8}` (domain 0..=255 covers every budget the Rust crate's tests
+//   exercise; `add_u` REFUSES at 256 on all paths — never a silent wrap — where Rust's
+//   `Summary::total` saturates; the overflow discipline differs and is documented, not hidden).
+//   The shrink-loop step ceiling keeps Rust's literal 1000 at Binary{16}.
+// - `FnOnce() -> O` backend thunks are `Unit => Binary{N}` pure fns over the built-in PRELUDE
+//   `Unit` type (DN-137/M-1102; std.error/std.recover precedent — HOF stage 1 has no nullary
+//   closure type); `differential`'s
+//   `O: PartialEq` generic is width-generic `Binary{N}` compared by the width-typed Exact `eq`
+//   prim (no user-type equality surface).
+// - `for_each_mode`'s `FnMut(CertMode)` side-effecting visitor is a PURE map returning the
+//   per-mode results Vec (the visit evidence — never-silent about what ran); `for_each_mode_in`
+//   applies `f` per in-scope mode (result computed then discarded — the std.error `inspect`
+//   let-binding technique) and returns the ModeVisit record exactly as Rust does.
+// - `[bool; 3]` ModeScope storage is the `MScope(Bool, Bool, Bool)` product in the same
+//   `[Fast, Balanced, Certified]` order; the six scope constants are nullary fns.
+// - Kernel/cross-crate types are mirrored locally for the single-nodule `include_str!` harness
+//   (std.error precedent): `CertMode`/`CertScope`/`CertDecl`/`ResolvedMode` (mycelium_core/
+//   mycelium_proj), `GuaranteeStrength` as `Guarantee` with `G`-prefixed constructors
+//   (`Exact`/`Proven`/`Empirical`/`Declared` are reserved strength keywords — std.diag/
+//   std.recover precedent), and `Result`-free `Option`/`Vec` mirrors (`Unit` is the built-in
+//   prelude type since DN-137/M-1102, no longer a local mirror).
+// - `FailRecord.context` Strings are Bytes literals (constructed, never compared);
+//   `differential`'s Rust context `format!("differential({input_desc})")` is composed with the
+//   Exact `bytes_concat` prim for parity; `golden`'s context is the fixed literal "golden" (the
+//   name code rides in the typed payload instead — see FLAG-testing-3/4).
+// - `Verdict` is generic over the reified fail payload (`Verdict[V]`), where Rust erases the
+//   counterexample into a String: a homogeneous suite summarizes directly; a mixed-kind suite
+//   unifies the payload first (the aggregation semantics — distinct counts, skip never green-
+//   washed — are identical).
+//
+// Never-silent floor (C1/G2) carried over intact: Skipped and Undetermined are first-class
+// variants aggregated DISTINCTLY from Pass ("green" = checked-and-passed, never did-not-check);
+// a missing/mismatched golden baseline is Skipped(NeedsRecord), never an auto-accept; an
+// unavailable differential backend is Skipped(BackendUnavailable), never a silent pass; a
+// generator that produces nothing is Skipped(NeedsRecord). Guarantee tags (VR-5, carried at the
+// SAME strength as the Rust crate's matrix): every harness op is an Exact MECHANISM (a verdict
+// is an exact, deterministic function of the run) and the harness never inflates the subject's
+// tag — a passing for_all backs an Empirical claim about the property, never Proven; there is
+// no op here that upgrades "passed N trials" into a proof. Three-way differential agreement is
+// Empirical (trials, std_testing.rs).
+// ── local mirrors (single-nodule harness — see the substitution notes above) ────────────────────
+type Option[Opt] = Some(Opt) | None;
+
+type Vec[A] = Nil | Cons(A, Vec[A]);
+
+// Guarantee — the kernel GuaranteeStrength lattice as value-level data, G-prefixed
+// (reserved-keyword substitution; std.diag/std.recover precedent).
+type Guarantee = GExact | GProven | GEmpirical | GDeclared;
+
+// ── verdicts (spec §3; the honesty crux C1/G2) ──────────────────────────────────────────────────
+// SkipReason — a Skipped verdict ALWAYS carries a reason; never an absent or unnamed skip.
+type SkipReason = Ignored | UnmetPrecondition | NeedsRecord | BackendUnavailable | ToolMissing;
+
+// UndetReason — ran but could not decide; distinct from both Pass and Skipped. A non-decision is
+// never a Pass (C1/G2).
+type UndetReason = OracleUnavailable | BudgetExhaustedInconclusive | NonDeterministicInput;
+
+// FailRecord — the structured failure record: FRec(payload, seed, trial, context). The payload
+// (generic F) is the REIFIED counterexample/diff value substituting Rust's Debug-formatted
+// description String (FLAG-testing-3 — the EXPLAIN artifact in value form); the seed makes the
+// failure reproducible (RT3); the trial index locates it; the context Bytes names the op.
+type FailRecord[F] = FRec(F, Binary{64}, Binary{8}, Bytes);
+
+// Verdict — the outcome sum. Skipped and Undetermined are FIRST-CLASS variants, not flavours of
+// Pass (the honesty crux): the aggregator below keeps their counts distinct, so "green" can never
+// silently include "did not actually check".
+type Verdict[V] = Pass | Fail(FailRecord[V]) | Skipped(SkipReason) | Undetermined(UndetReason);
+
+// Summary — the aggregated outcome: Counts(passed, failed, skipped, undetermined). skipped and
+// undetermined are DISTINCT from passed (C1/G2). Counts are Binary{8} (see the width substitution
+// note: add_u refuses at 256 — never a silent wrap).
+type Summary = Counts(Binary{8}, Binary{8}, Binary{8}, Binary{8});
+
+// ── budget (C6 — a property cannot run unbounded) ───────────────────────────────────────────────
+// Budget — a declared, bounded trial budget. Trials(0) is unconstructible through budget_new
+// (an explicit None, C1 — never silent).
+type Budget = Trials(Binary{8});
+
+// ── generator step (FLAG-testing-1 substitution) ────────────────────────────────────────────────
+// GenStep — one generator step: the drawn value (None = exhausted / cannot produce) plus the
+// advanced Rng state (the &mut Rng threading made explicit).
+type GenStep[G] = Stepped(Option[G], Binary{64});
+
+// ── golden baseline (FLAG-testing-4 substitution) ───────────────────────────────────────────────
+// GoldenBaseline — GB(name_code, expected): a content-addressed snapshot under a closed-
+// vocabulary Binary{8} name code, width-generic in the snapshot value.
+type GoldenBaseline[S] = GB(Binary{8}, S);
+
+// GoldenFail — the reified golden mismatch: GFail(name_code, expected, produced) — the typed
+// substitute for Rust's rendered "expected …, got …; diff: …" description (FLAG-testing-3).
+type GoldenFail[W] = GFail(Binary{8}, W, W);
+
+// DiffFail — the reified differential disagreement: DFail(lhs, rhs) — both outputs, inspectable
+// (C3); the input description rides in the FailRecord context.
+type DiffFail[D] = DFail(D, D);
+
+// ── mode-parametric vocabulary (M-796; RFC-0034 §13) — local kernel mirrors ─────────────────────
+// CertMode — the certification-mode tiers (mycelium_core::cert_mode::CertMode), weakest first.
+type CertMode = Fast | Balanced | Certified;
+
+// CertScope — the @certification declaration scopes (mycelium_proj::CertScope),
+// least-specific first.
+type CertScope = ScGlobal | ScPhylum | ScNodule;
+
+// CertDecl — one @certification declaration: Decl(scope, mode).
+type CertDecl = Decl(CertScope, CertMode);
+
+// ResolvedMode — the resolution EXPLAIN: RMode(mode, source). source None = the project default
+// (Fast) or a granular override (above the scope lattice), exactly as in mycelium_proj.
+type ResolvedMode = RMode(CertMode, Option[CertScope]);
+
+// ModeScope — the typed per-mode predicate set: MScope(fast_in, balanced_in, certified_in) in
+// CertMode::ALL order. Guarantee: Declared — a scope is a declaration, not a checked theorem.
+type ModeScope = MScope(Bool, Bool, Bool);
+
+// ModeTestConfig — MTC(decls, granular): the configurable per-test scope; the granular override
+// wins over all scope tiers (above the lattice).
+type ModeTestConfig = MTC(Vec[CertDecl], Option[CertMode]);
+
+// ModeVisit — MVisit(visited, skipped): the never-silent audit of which tiers ran.
+type ModeVisit = MVisit(Vec[CertMode], Vec[CertMode]);
+
+// ModeViolation — the reified cross-mode assertion failure (FLAG-testing-6): the property fires
+// where the scope says it should not (NegativeFires) or is absent where it must fire
+// (PositiveAbsent) — exactly the two panic directions of the Rust assert.
+type ModeViolation = NegativeFires(CertMode) | PositiveAbsent(CertMode);
+
+// ── guarantee matrix vocabulary (spec §4) ───────────────────────────────────────────────────────
+// FallibilityClass — the typed half of the Rust matrix's fallibility column: total fns vs
+// Verdict-shaped ops (the class the Rust tests assert; the prose rides alongside as Bytes).
+type FallibilityClass = FalTotal | FalVerdict;
+
+// EffectsClass — the typed half of the effects column: pure, io-declaring, or per-backend io
+// (the "only golden and differential declare IO" discipline, typed instead of substring-matched).
+type EffectsClass = EffNone | EffIo | EffPerBackend;
+
+// MatrixRow — Row(op, tag, fallibility_class, fallibility_prose, effects_class, effects_prose,
+// explainable). Row DATA is Declared (hand-transcribed from guarantee_matrix.rs::MATRIX); the
+// structural checks below are Empirical over it (std_testing.rs three-way + live Rust oracle).
+type MatrixRow = Row(Bytes, Guarantee, FallibilityClass, Bytes, EffectsClass, Bytes, Bool);
+
+// ── shared helpers (Exact — total, match-defined, finite domain) ────────────────────────────────
+// bin_eq: Bool projection of the Exact `eq` prim at Binary{8}.
+fn bin_eq(a: Binary{8}, b: Binary{8}) => Bool =
+  match eq(a, b) { 0b1 => True, _ => False };
+
+// bool_and / bool_or / bool_not / bool_eq: local total connectives (std.diag precedent).
+fn bool_and(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn bool_or(a: Bool, b: Bool) => Bool =
+  match a { True => True, False => b };
+
+fn bool_not(a: Bool) => Bool =
+  match a { True => False, False => True };
+
+fn bool_eq(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => bool_not(b) };
+
+// bool_to_bin: the 0/1 indicator (for scope_count).
+fn bool_to_bin(a: Bool) => Binary{8} =
+  match a { True => 0b0000_0001, False => 0b0000_0000 };
+
+// zero64: the Binary{64} zero (seed/trial placeholder in golden/differential FailRecords —
+// Rust sets seed: 0, trial: 0 there).
+fn zero64() => Binary{64} =
+  0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000000;
+
+// vec_len: the number of elements as Binary{8}; add_u refuses at 256 on all paths — never a
+// silent wrap (G2; the std.collections `len` contract, Empirical).
+fn vec_len[A](xs: Vec[A]) => Binary{8} =
+  match xs { Nil => 0b0000_0000, Cons(_, rest) => add_u(0b0000_0001, vec_len(rest)) };
+
+// ── Rng — pure Xorshift64 state threading (RT3/C6: seeded, no undeclared entropy) ───────────────
+// rng_default_seed: the zero-seed promotion constant 0xDEAD_BEEF_CAFE_1337, verbatim from Rust
+// (a seed of 0 would be a degenerate Xorshift fixed point).
+fn rng_default_seed() => Binary{64} =
+  0b11011110_10101101_10111110_11101111_11001010_11111110_00010011_00110111;
+
+// rng_new: construct the initial state from a fixed seed; 0 is promoted (never a silent
+// degenerate state). Exact.
+fn rng_new(seed: Binary{64}) => Binary{64} =
+  match eq(seed, zero64()) { 0b1 => rng_default_seed(), _ => seed };
+
+// rng_next: advance the state and return it — Xorshift64 (x ^= x<<13; x ^= x>>7; x ^= x<<17),
+// bit-exact vs Rust's Rng::next_u64 (whose output IS its new state). Exact: deterministic; the
+// same state always yields the same output (C4/RT3).
+fn rng_next(state: Binary{64}) => Binary{64} =
+  let a = xor(
+    state,
+    shl_u(state, 0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00001101)
+  ) in
+  let b = xor(a, shr_u(a, 0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000111)) in
+  xor(b, shl_u(b, 0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00010001));
+
+// rng_next_u32: the high 32 bits of the next draw, as Binary{32} — mirrors Rust's
+// `(next_u64() >> 32) as u32`. The narrow is in-range by construction (the high 32 bits are zero
+// after the shift), so the never-silent width_cast prim narrows Exactly (its second operand is a
+// width witness whose bits are ignored). The caller threads the advanced state via rng_next.
+fn rng_next_u32(state: Binary{64}) => Binary{32} =
+  width_cast(
+    shr_u(
+      rng_next(state),
+      0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00100000
+    ),
+    0b00000000_00000000_00000000_00000000
+  );
+
+// ── budget ops (C6 — declared, bounded trial budgets) ───────────────────────────────────────────
+// budget_new: a budget from a trial count; 0 trials is an explicit None (C1 — never silent).
+// Exact.
+fn budget_new(trials: Binary{8}) => Option[Budget] =
+  match eq(trials, 0b0000_0000) { 0b1 => None, _ => Some(Trials(trials)) };
+
+// budget_trials: the number of trials this budget permits. Exact.
+fn budget_trials(b: Budget) => Binary{8} =
+  match b { Trials(n) => n };
+
+// budget_default: the default budget (100 trials — Budget::DEFAULT). Exact.
+fn budget_default() => Budget =
+  Trials(0b0110_0100);
+
+// budget_min: the minimum budget (1 trial — Budget::MIN). Exact.
+fn budget_min() => Budget =
+  Trials(0b0000_0001);
+
+// ── property harness (spec §3; the C2 crux: a passing for_all backs Empirical, never Proven) ────
+// find_failing: the first shrink candidate that still violates the property, if any. Exact.
+fn find_failing[T](candidates: Vec[T], prop: T => Bool) => Option[T] =
+  match candidates {
+    Nil => None,
+    Cons(c, rest) => match prop(c) { False => Some(c), True => find_failing(rest, prop) }
+  };
+
+// shrink_loop: descend through shrink candidates keeping the smallest still-failing value; the
+// step count is bounded (Rust's literal 1000, at Binary{16}) so shrinking itself is bounded (C6).
+fn shrink_loop[T](
+  best: T,
+  candidates: Vec[T],
+  shrink: T => Vec[T],
+  prop: T => Bool,
+  steps: Binary{16}
+) => T =
+  match eq(steps, 0b00000000_00000000) {
+    0b1 => best,
+    _ => match find_failing(candidates, prop) {
+      None => best,
+      Some(c) => shrink_loop(c, shrink(c), shrink, prop, sub_u(steps, 0b00000000_00000001))
+    }
+  };
+
+// shrink_to_minimal: shrink a failing value to a minimal counterexample (spec §3). The result is
+// the REIFIED minimal value (FLAG-testing-3 — Rust renders it into the description String).
+fn shrink_to_minimal[T](initial: T, shrink: T => Vec[T], prop: T => Bool) => T =
+  shrink_loop(initial, shrink(initial), shrink, prop, 0b00000011_11101000);
+
+// for_all_loop: the trial spine — generate, check, recurse. generated_any distinguishes "budget
+// done, everything passed" (Pass) from "the generator never produced" (Skipped(NeedsRecord) —
+// C1: a property that could not run is reported, never a silent pass).
+fn for_all_loop[T](
+  gen: Binary{64} => GenStep[T],
+  shrink: T => Vec[T],
+  prop: T => Bool,
+  state: Binary{64},
+  seed: Binary{64},
+  remaining: Binary{8},
+  trial: Binary{8},
+  generated_any: Bool
+) => Verdict[T] =
+  match eq(remaining, 0b0000_0000) {
+    0b1 => match generated_any { True => Pass, False => Skipped(NeedsRecord) },
+    _ => match gen(state) {
+      Stepped(drawn, state2) => match drawn {
+        None => match generated_any { True => Pass, False => Skipped(NeedsRecord) },
+        Some(input) => match prop(input) {
+          True =>
+            for_all_loop(
+              gen,
+              shrink,
+              prop,
+              state2,
+              seed,
+              sub_u(remaining, 0b0000_0001),
+              add_u(trial, 0b0000_0001),
+              True
+            ),
+          False =>
+            Fail(
+              FRec(shrink_to_minimal(input, shrink, prop), seed, trial, "for_all property violated")
+            )
+        }
+      }
+    }
+  };
+
+// for_all: run a property over `budget` generated inputs. Returns the first failure (shrunk to a
+// minimal counterexample, with the reproducing seed + trial index), Skipped(NeedsRecord) if the
+// generator cannot produce, or Pass. The gen/shrink fn pair substitutes the Gen<T> trait instance
+// (FLAG-testing-1). Guarantee: Exact as a MECHANISM (the verdict is an exact function of the
+// run); a passing for_all backs an EMPIRICAL claim about the property — never Proven; no op here
+// performs that upgrade (C2/VR-5 — the crux this module exists to prevent).
+fn for_all[T](
+  gen: Binary{64} => GenStep[T],
+  shrink: T => Vec[T],
+  seed: Binary{64},
+  budget: Budget,
+  prop: T => Bool
+) => Verdict[T] =
+  for_all_loop(gen, shrink, prop, rng_new(seed), seed, budget_trials(budget), 0b0000_0000, False);
+
+// ── golden / snapshot harness (spec §3; C1: a missing baseline is NEVER auto-accepted) ──────────
+// golden: compare `produced` against the stored baseline. A missing baseline or a name-code
+// mismatch (the wrong baseline supplied) is Skipped(NeedsRecord) — reported, never a silent
+// auto-accept (the golden-test honesty crux). A mismatch carries the typed GFail(name, expected,
+// produced) diff (C3 — both values inspectable). Exact mechanism; width-generic snapshot
+// (FLAG-testing-4).
+fn golden{N}(
+  baseline: Option[GoldenBaseline[Binary{N}]],
+  name: Binary{8},
+  produced: Binary{N}
+) => Verdict[GoldenFail[Binary{N}]] =
+  match baseline {
+    None => Skipped(NeedsRecord),
+    Some(gb) => match gb {
+      GB(bname, expected) => match eq(bname, name) {
+        0b1 => match eq(expected, produced) {
+          0b1 => Pass,
+          _ => Fail(FRec(GFail(name, expected, produced), zero64(), 0b0000_0000, "golden"))
+        },
+        _ => Skipped(NeedsRecord)
+      }
+    }
+  };
+
+// ── differential / oracle harness (M-151/M-210 pattern; NFR-7) ──────────────────────────────────
+// diff_compare: the observable-equality floor (§8-Q5) over two produced values. A disagreement
+// carries BOTH outputs (C3) and the input description in the context (composed with the Exact
+// bytes_concat prim — parity with Rust's `differential({input_desc})` context).
+fn diff_compare{N}(
+  input_desc: Bytes,
+  lhs_out: Binary{N},
+  rhs_out: Binary{N}
+) => Verdict[DiffFail[Binary{N}]] =
+  match eq(lhs_out, rhs_out) {
+    0b1 => Pass,
+    _ =>
+      Fail(
+        FRec(
+          DFail(lhs_out, rhs_out),
+          zero64(),
+          0b0000_0000,
+          bytes_concat(bytes_concat("differential(", input_desc), ")")
+        )
+      )
+  };
+
+// differential: require lhs() == rhs() through two thunked backends. An unavailable backend is
+// Skipped(BackendUnavailable) — NEVER a silent pass (C1/G2, the differential honesty crux); the
+// thunks are only forced when both backends are available. Exact mechanism; the two-level §8-Q5
+// bar's tag/EXPLAIN level is the Rust crate's own FLAG-Q5, carried over unresolved.
+fn differential{N}(
+  input_desc: Bytes,
+  lhs_available: Bool,
+  lhs: Unit => Binary{N},
+  rhs_available: Bool,
+  rhs: Unit => Binary{N}
+) => Verdict[DiffFail[Binary{N}]] =
+  match bool_and(lhs_available, rhs_available) {
+    False => Skipped(BackendUnavailable),
+    True => diff_compare(input_desc, lhs(Unit), rhs(Unit))
+  };
+
+// ── the honest aggregator (spec §4; the C1 crux made structural) ────────────────────────────────
+// bump_* — per-class count increments (functional update; add_u refuses at 256, never a
+// silent wrap).
+fn bump_pass(s: Summary) => Summary =
+  match s { Counts(p, f, k, u) => Counts(add_u(p, 0b0000_0001), f, k, u) };
+
+fn bump_fail(s: Summary) => Summary =
+  match s { Counts(p, f, k, u) => Counts(p, add_u(f, 0b0000_0001), k, u) };
+
+fn bump_skipped(s: Summary) => Summary =
+  match s { Counts(p, f, k, u) => Counts(p, f, add_u(k, 0b0000_0001), u) };
+
+fn bump_undetermined(s: Summary) => Summary =
+  match s { Counts(p, f, k, u) => Counts(p, f, k, add_u(u, 0b0000_0001)) };
+
+// summarize: aggregate verdicts keeping Skipped/Undetermined counts DISTINCT from Pass — "green"
+// can never silently include "did not actually check" (C1/G2). Exact (a total function over
+// verdicts).
+fn summarize[V](vs: Vec[Verdict[V]]) => Summary =
+  match vs {
+    Nil => Counts(0b0000_0000, 0b0000_0000, 0b0000_0000, 0b0000_0000),
+    Cons(v, rest) => match v {
+      Pass => bump_pass(summarize(rest)),
+      Fail(_) => bump_fail(summarize(rest)),
+      Skipped(_) => bump_skipped(summarize(rest)),
+      Undetermined(_) => bump_undetermined(summarize(rest))
+    }
+  };
+
+// is_green: True iff there are no failures. Skipped/undetermined counts are SURFACED in the
+// Summary (the caller can inspect them), not hidden and not treated as failures — treating
+// "could not run" as "failed" would itself violate C1 (the Rust doc's exact reasoning). Exact.
+fn is_green(s: Summary) => Bool =
+  match s { Counts(_, f, _, _) => bin_eq(f, 0b0000_0000) };
+
+// summary field accessors (the .myc idiom for Rust's named struct fields). Exact.
+fn summary_passed(s: Summary) => Binary{8} =
+  match s { Counts(p, _, _, _) => p };
+
+fn summary_failed(s: Summary) => Binary{8} =
+  match s { Counts(_, f, _, _) => f };
+
+fn summary_skipped(s: Summary) => Binary{8} =
+  match s { Counts(_, _, k, _) => k };
+
+fn summary_undetermined(s: Summary) => Binary{8} =
+  match s { Counts(_, _, _, u) => u };
+
+// summary_total: the total verdict count. Substitution note: Rust saturates (saturating_add);
+// add_u instead REFUSES past 255 on all paths — a louder, never-silent overflow discipline
+// (G2), documented rather than hidden.
+fn summary_total(s: Summary) => Binary{8} =
+  match s { Counts(p, f, k, u) => add_u(add_u(p, f), add_u(k, u)) };
+
+// ── mode-parametric testing (M-796; RFC-0034 §13) ───────────────────────────────────────────────
+// mode_code: injective code map over CertMode — mirrors CertMode::depth() (Fast 0, Balanced 1,
+// Certified 2). Exact.
+fn mode_code(m: CertMode) => Binary{8} =
+  match m { Fast => 0b0000_0000, Balanced => 0b0000_0001, Certified => 0b0000_0010 };
+
+// mode_eq: ADT equality via the injective code map. Exact.
+fn mode_eq(a: CertMode, b: CertMode) => Bool =
+  bin_eq(mode_code(a), mode_code(b));
+
+// modes_all: CertMode::ALL — every tier, weakest first. Exact.
+fn modes_all() => Vec[CertMode] =
+  [Fast, Balanced, Certified];
+
+// scope_specificity: mirrors CertScope::specificity (Global 0 < Phylum 1 < Nodule 2). Exact.
+fn scope_specificity(sc: CertScope) => Binary{8} =
+  match sc { ScGlobal => 0b0000_0000, ScPhylum => 0b0000_0001, ScNodule => 0b0000_0010 };
+
+// ── ModeScope algebra ───────────────────────────────────────────────────────────────────────────
+// The six predefined scopes (the common RFC-0034 cases), as nullary constructors. Declared —
+// a scope is a declaration; whether it is the RIGHT scope for a property is the test author's
+// responsibility (the Rust doc's own tag).
+fn scope_all_modes() => ModeScope =
+  MScope(True, True, True);
+
+fn scope_fast_only() => ModeScope =
+  MScope(True, False, False);
+
+fn scope_non_fast() => ModeScope =
+  MScope(False, True, True);
+
+fn scope_certified_only() => ModeScope =
+  MScope(False, False, True);
+
+// scope_emit_modes: alias for scope_non_fast (the certificate-emitting modes — RFC-0034 §5).
+fn scope_emit_modes() => ModeScope =
+  MScope(False, True, True);
+
+fn scope_balanced_only() => ModeScope =
+  MScope(False, True, False);
+
+// scope_contains: True iff the mode is in scope. Exact (total, match-defined).
+fn scope_contains(s: ModeScope, m: CertMode) => Bool =
+  match s { MScope(f, b, c) => match m { Fast => f, Balanced => b, Certified => c } };
+
+// scope_filter: the modes whose membership equals `want`, in CertMode::ALL order. Exact.
+fn scope_filter(s: ModeScope, ms: Vec[CertMode], want: Bool) => Vec[CertMode] =
+  match ms {
+    Nil => Nil,
+    Cons(m, rest) => match bool_eq(scope_contains(s, m), want) {
+      True => Cons(m, scope_filter(s, rest, want)),
+      False => scope_filter(s, rest, want)
+    }
+  };
+
+// modes_in_scope / modes_out_of_scope: the membership split (0..=3 elements each). Exact.
+fn modes_in_scope(s: ModeScope) => Vec[CertMode] =
+  scope_filter(s, modes_all(), True);
+
+fn modes_out_of_scope(s: ModeScope) => Vec[CertMode] =
+  scope_filter(s, modes_all(), False);
+
+// scope_count: the number of modes in scope (0..=3). Exact.
+fn scope_count(s: ModeScope) => Binary{8} =
+  match s { MScope(f, b, c) => add_u(bool_to_bin(f), add_u(bool_to_bin(b), bool_to_bin(c))) };
+
+// scope_is_empty: an empty scope is surfaced explicitly, not silently ignored (C1/G2). Exact.
+fn scope_is_empty(s: ModeScope) => Bool =
+  bin_eq(scope_count(s), 0b0000_0000);
+
+// scope_union / scope_intersect: composable derived scopes. Exact.
+fn scope_union(a: ModeScope, b: ModeScope) => ModeScope =
+  match a {
+    MScope(f1, b1, c1) =>
+      match b {
+        MScope(f2, b2, c2) => MScope(bool_or(f1, f2), bool_or(b1, b2), bool_or(c1, c2))
+      }
+  };
+
+fn scope_intersect(a: ModeScope, b: ModeScope) => ModeScope =
+  match a {
+    MScope(f1, b1, c1) =>
+      match b {
+        MScope(f2, b2, c2) => MScope(bool_and(f1, f2), bool_and(b1, b2), bool_and(c1, c2))
+      }
+  };
+
+// from_resolved_mode: the resolver→scope bridge — "the modes at or above the resolved depth":
+// Fast → ALL_MODES, Balanced → NON_FAST, Certified → CERTIFIED_ONLY. Exact.
+fn from_resolved_mode(r: ResolvedMode) => ModeScope =
+  match r {
+    RMode(m, _) => match m {
+      Fast => scope_all_modes(),
+      Balanced => scope_non_fast(),
+      Certified => scope_certified_only()
+    }
+  };
+
+// ── ModeTestConfig — the configurable per-test scope (FLAG-testing-7) ───────────────────────────
+// decl accessors. Exact.
+fn decl_scope(d: CertDecl) => CertScope =
+  match d { Decl(sc, _) => sc };
+
+fn decl_mode(d: CertDecl) => CertMode =
+  match d { Decl(_, m) => m };
+
+// decl_beats: True iff the NEW declaration's specificity is >= the current winner's — the LAST
+// maximal element wins, mirroring Iterator::max_by_key's documented tie behaviour (the
+// resolve_mode fold this port reimplements — FLAG-testing-7). Exact.
+fn decl_beats(new_d: CertDecl, cur: CertDecl) => Bool =
+  match lt(scope_specificity(decl_scope(new_d)), scope_specificity(decl_scope(cur))) {
+    0b1 => False,
+    _ => True
+  };
+
+// resolve_fold: the left-to-right max-specificity fold. Exact.
+fn resolve_fold(decls: Vec[CertDecl], acc: Option[CertDecl]) => ResolvedMode =
+  match decls {
+    Nil => match acc {
+      None => RMode(Fast, None),
+      Some(w) => match w { Decl(sc, m) => RMode(m, Some(sc)) }
+    },
+    Cons(d, rest) => match acc {
+      None => resolve_fold(rest, Some(d)),
+      Some(w) => match decl_beats(d, w) {
+        True => resolve_fold(rest, Some(d)),
+        False => resolve_fold(rest, Some(w))
+      }
+    }
+  };
+
+// resolve_decls: the reimplemented most-specific-wins resolution (mycelium_proj::resolve_mode's
+// observable contract: highest specificity wins; no declaration → the Fast project default with
+// source None). Pinned against the Rust resolver by the live oracle differential
+// (FLAG-testing-7 — the KC-3 shared-resolver property does not carry over). Exact mechanism.
+fn resolve_decls(decls: Vec[CertDecl]) => ResolvedMode =
+  resolve_fold(decls, None);
+
+// config_new: a config from @certification scope declarations (no granular override). Exact.
+fn config_new(decls: Vec[CertDecl]) => ModeTestConfig =
+  MTC(decls, None);
+
+// config_default: no declarations → project default Fast → ALL_MODES scope (widening from fast
+// is always safe — the Rust Default impl). Exact.
+fn config_default() => ModeTestConfig =
+  MTC(Nil, None);
+
+// config_with_granular: add/replace the granular per-test override — wins over all scope tiers.
+// Exact.
+fn config_with_granular(cfg: ModeTestConfig, m: CertMode) => ModeTestConfig =
+  match cfg { MTC(d, _) => MTC(d, Some(m)) };
+
+// config_provenance: the resolved mode + its source scope — the EXPLAIN of the scope decision
+// (never ambient, G2). A granular override reports source None (above the lattice), exactly as
+// in Rust. Exact.
+fn config_provenance(cfg: ModeTestConfig) => ResolvedMode =
+  match cfg { MTC(decls, g) => match g { Some(m) => RMode(m, None), None => resolve_decls(decls) } };
+
+// config_resolve: the effective ModeScope (provenance → from_resolved_mode — the canonical
+// shared mapping). Exact.
+fn config_resolve(cfg: ModeTestConfig) => ModeScope =
+  from_resolved_mode(config_provenance(cfg));
+
+// ── mode-parametric iteration ───────────────────────────────────────────────────────────────────
+// visit accessors. Exact.
+fn visit_visited(v: ModeVisit) => Vec[CertMode] =
+  match v { MVisit(vs, _) => vs };
+
+fn visit_skipped(v: ModeVisit) => Vec[CertMode] =
+  match v { MVisit(_, ks) => ks };
+
+// visited_all: True iff all three modes ran. Exact.
+fn visited_all(v: ModeVisit) => Bool =
+  bin_eq(vec_len(visit_visited(v)), 0b0000_0011);
+
+// mode_list_eq: element-wise Vec[CertMode] equality. Exact.
+fn mode_list_eq(xs: Vec[CertMode], ys: Vec[CertMode]) => Bool =
+  match xs {
+    Nil => match ys { Nil => True, Cons(_, _) => False },
+    Cons(x, xrest) => match ys {
+      Nil => False,
+      Cons(y, yrest) => match mode_eq(x, y) { True => mode_list_eq(xrest, yrest), False => False }
+    }
+  };
+
+// matches_scope: True iff exactly the in-scope modes were visited (no more, no fewer). Exact.
+fn matches_scope(v: ModeVisit, s: ModeScope) => Bool =
+  mode_list_eq(visit_visited(v), modes_in_scope(s));
+
+// for_each_mode: visit EVERY mode (weakest → strongest) — the pure-map substitution for Rust's
+// FnMut visitor: the per-mode results are RETURNED in order (the visit evidence; never-silent
+// about what ran). There is no way to skip a mode through this fn (use for_each_mode_in). Exact.
+fn map_modes[B](ms: Vec[CertMode], f: CertMode => B) => Vec[B] =
+  match ms { Nil => Nil, Cons(m, rest) => Cons(f(m), map_modes(rest, f)) };
+
+fn for_each_mode[B](f: CertMode => B) => Vec[B] =
+  map_modes(modes_all(), f);
+
+// visit_apply: apply `f` per in-scope mode (result computed then discarded — the std.error
+// `inspect` technique; `.myc` has no effect surface, so this preserves "f runs per visited
+// mode"), collecting the visited modes.
+fn visit_apply[B](s: ModeScope, ms: Vec[CertMode], f: CertMode => B) => Vec[CertMode] =
+  match ms {
+    Nil => Nil,
+    Cons(m, rest) => match scope_contains(s, m) {
+      True =>
+        let peeked = f(m) in
+        Cons(m, visit_apply(s, rest, f)),
+      False => visit_apply(s, rest, f)
+    }
+  };
+
+// for_each_mode_in: run `f` for each mode IN scope, returning the never-silent visited/skipped
+// audit (the caller can assert matches_scope and inspect the skips — C1/G2). Exact.
+fn for_each_mode_in[B](s: ModeScope, f: CertMode => B) => ModeVisit =
+  MVisit(visit_apply(s, modes_all(), f), modes_out_of_scope(s));
+
+// ── cross-mode assertion cores (FLAG-testing-6 — the reified halves of the panic asserts) ───────
+// scope_check_walk: the two-direction conformance walk. neg_only True checks only the negative
+// direction (assert_mode_negative); False checks both (assert_mode_scope). Exact.
+fn scope_check_walk(
+  s: ModeScope,
+  pred: CertMode => Bool,
+  ms: Vec[CertMode],
+  neg_only: Bool
+) => Option[ModeViolation] =
+  match ms {
+    Nil => None,
+    Cons(m, rest) => match pred(m) {
+      True => match scope_contains(s, m) {
+        True => scope_check_walk(s, pred, rest, neg_only),
+        False => Some(NegativeFires(m))
+      },
+      False => match scope_contains(s, m) {
+        True => match neg_only {
+          True => scope_check_walk(s, pred, rest, neg_only),
+          False => Some(PositiveAbsent(m))
+        },
+        False => scope_check_walk(s, pred, rest, neg_only)
+      }
+    }
+  };
+
+// mode_scope_violation: the decision core of assert_mode_scope — the FIRST violation of either
+// direction (the property fires outside scope, or is absent inside it), reified; None = the
+// assertion holds. The panicking wrapper awaits a host refusal primitive (FLAG-testing-6). Exact.
+fn mode_scope_violation(s: ModeScope, pred: CertMode => Bool) => Option[ModeViolation] =
+  scope_check_walk(s, pred, modes_all(), False);
+
+// mode_negative_violation: the negative-only half — the property must be ABSENT outside scope
+// (the "invariant fires where it doesn't apply" check). Exact.
+fn mode_negative_violation(s: ModeScope, pred: CertMode => Bool) => Option[ModeViolation] =
+  scope_check_walk(s, pred, modes_all(), True);
+
+// ── guarantee matrix (spec §4) — the table as CHECKED DATA ──────────────────────────────────────
+// guarantee_code / guarantee_eq: injective code map + ADT equality over the tag lattice. Exact.
+fn guarantee_code(g: Guarantee) => Binary{8} =
+  match g {
+    GExact => 0b0000_0000,
+    GProven => 0b0000_0001,
+    GEmpirical => 0b0000_0010,
+    GDeclared => 0b0000_0011
+  };
+
+fn guarantee_eq(a: Guarantee, b: Guarantee) => Bool =
+  bin_eq(guarantee_code(a), guarantee_code(b));
+
+// row accessors. Exact.
+fn row_op(r: MatrixRow) => Bytes =
+  match r { Row(op, _, _, _, _, _, _) => op };
+
+fn row_tag(r: MatrixRow) => Guarantee =
+  match r { Row(_, g, _, _, _, _, _) => g };
+
+fn row_fallibility_class(r: MatrixRow) => FallibilityClass =
+  match r { Row(_, _, fc, _, _, _, _) => fc };
+
+fn row_fallibility(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, fp, _, _, _) => fp };
+
+fn row_effects_class(r: MatrixRow) => EffectsClass =
+  match r { Row(_, _, _, _, ec, _, _) => ec };
+
+fn row_effects(r: MatrixRow) => Bytes =
+  match r { Row(_, _, _, _, _, ep, _) => ep };
+
+fn row_explainable(r: MatrixRow) => Bool =
+  match r { Row(_, _, _, _, _, _, x) => x };
+
+// typed column predicates (the ADT analogs of the Rust tests' substring assertions —
+// FLAG-recover precedent: comparisons over typed vocabulary, never over strings). Exact.
+fn is_fal_total(f: FallibilityClass) => Bool =
+  match f { FalTotal => True, FalVerdict => False };
+
+fn declares_io(e: EffectsClass) => Bool =
+  match e { EffNone => False, EffIo => True, EffPerBackend => True };
+
+// ── the 5 rows (hand-transcribed from guarantee_matrix.rs::MATRIX; tags carried at the SAME
+// strength — every harness op is an Exact MECHANISM; the subject's tag is never inflated) ────────
+fn row_for_all() => MatrixRow =
+  Row(
+    "for_all",
+    GExact,
+    FalVerdict,
+    "Verdict::Fail{record} / Verdict::Skipped{NeedsRecord}",
+    EffNone,
+    "none (pure; seeded — C6/RT3)",
+    True
+  );
+
+fn row_golden() => MatrixRow =
+  Row(
+    "golden",
+    GExact,
+    FalVerdict,
+    "Verdict::Fail{diff} / Verdict::Skipped{NeedsRecord}",
+    EffIo,
+    "io (baseline read — declared, C6)",
+    True
+  );
+
+fn row_differential() => MatrixRow =
+  Row(
+    "differential",
+    GExact,
+    FalVerdict,
+    "Verdict::Fail{lhs,rhs} / Verdict::Skipped{BackendUnavailable}",
+    EffPerBackend,
+    "none / io per backend (declared, C6)",
+    True
+  );
+
+fn row_summarize() => MatrixRow =
+  Row("summarize", GExact, FalTotal, "total", EffNone, "none", True);
+
+fn row_is_green() => MatrixRow =
+  Row("is_green", GExact, FalTotal, "total", EffNone, "none", True);
+
+// matrix: the full 5-row table, in guarantee_matrix.rs::MATRIX order.
+fn matrix() => Vec[MatrixRow] =
+  [row_for_all(), row_golden(), row_differential(), row_summarize(), row_is_green()];
+
+// ── structural checks (the typed analogs of guarantee_matrix.rs::tests) ─────────────────────────
+// all_rows_exact: every harness op's tag is Exact-as-mechanism (spec §4; accidentally tagging a
+// row Empirical/Declared would overclaim SUBJECT strength — the Rust test's own guard).
+fn all_rows_exact(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(guarantee_eq(row_tag(r), GExact), all_rows_exact(rest))
+  };
+
+// all_rows_explainable: every op surfaces an EXPLAIN artifact (C3/G11/SC-3 — no black boxes).
+fn all_rows_explainable(xs: Vec[MatrixRow]) => Bool =
+  match xs {
+    Nil => True,
+    Cons(r, rest) => bool_and(row_explainable(r), all_rows_explainable(rest))
+  };
+
+// only_golden_and_differential_declare_io: the spec §4 effects discipline, read off the typed
+// column (no substring matching).
+fn only_golden_and_differential_declare_io() => Bool =
+  bool_and(declares_io(row_effects_class(row_golden())),
+  bool_and(declares_io(row_effects_class(row_differential())),
+  bool_and(bool_not(declares_io(row_effects_class(row_for_all()))),
+  bool_and(bool_not(declares_io(row_effects_class(row_summarize()))),
+  bool_not(declares_io(row_effects_class(row_is_green())))))));
+
+// aggregator_rows_are_total: summarize/is_green are total functions over verdicts (spec §4).
+fn aggregator_rows_are_total() => Bool =
+  bool_and(
+    is_fal_total(row_fallibility_class(row_summarize())),
+    is_fal_total(row_fallibility_class(row_is_green()))
+  );

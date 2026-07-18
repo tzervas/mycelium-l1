@@ -1,0 +1,4 @@
+// rejected: a `0x..` byte-string literal has an odd number of hex digits (a byte is two hex chars)
+// — a never-silent lex refusal, never a silent half-byte (RFC-0032 D4, M-750).
+nodule bad;
+fn f() => Bytes = 0x123

@@ -1,0 +1,5 @@
+// rejected: `while` is not a Mycelium form — unbounded iteration would undermine the totality
+// posture; the diagnostic teaches recursion / `for` instead (RFC-0007 §4.8)
+nodule imperative;
+fn spin(x: Binary{8}) => Binary{8} =
+    while x

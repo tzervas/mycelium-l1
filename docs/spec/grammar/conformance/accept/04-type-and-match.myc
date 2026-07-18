@@ -1,0 +1,11 @@
+// exercises: sum-type declaration + exhaustive match with constructor and wildcard patterns
+nodule shapes;
+
+type Sign = Neg | Zero | Pos;
+
+fn label(s: Sign) => Ternary{1} =
+    match s {
+        Neg => 0t-,
+        Zero => 0t0,
+        _ => 0t+
+    };

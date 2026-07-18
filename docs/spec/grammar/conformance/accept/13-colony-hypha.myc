@@ -1,0 +1,11 @@
+// exercises: the RFC-0008 §4.7 structured-concurrency surface (M-666) — a `colony { … }` block
+// (the dynamic runtime grouping, DN-06) whose body is a non-empty list of `hypha <expr>` spawns
+// (each a concurrent execution unit, RFC-0008 §4.5). Deterministic R1 fragment only (RFC-0008
+// §4.6 R1); the reference semantics is the spawn-order sequentialization (RT2). `hypha`/`colony`
+// are now ACTIVE keywords (they left the reserved-not-active set with M-666).
+nodule signals;
+
+fn compute(x: Binary{8}) => Binary{8} = not(x);
+
+fn run() => Binary{8} =
+    colony { hypha compute(0b0000_0001), hypha compute(0b0000_0010) };
