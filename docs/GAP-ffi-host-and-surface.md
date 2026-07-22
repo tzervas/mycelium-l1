@@ -35,10 +35,12 @@ gates every host capability (`std-net`, `std-process`, real-OS fs).
 ## 2. Language-surface gaps surfaced by porting real Rust
 
 `mycelium-transpile --vet` on `gha-runner-ctl` (see
-`mycelium-transpile/docs/vet-gha-runner-ctl-2026-07-22/`) produced **0.0%
-`checked_fraction`** — not because the logic is unportable (the pure core ports fine by
-hand; see `gha-runner-ctl/mycelium-port/`), but because idiomatic imperative Rust hits
-frontend-surface gaps. The dominant, quantified ones:
+`mycelium-transpile/docs/vet-gha-runner-ctl-2026-07-22/`) could not compute a valid
+`checked_fraction` in this standalone setup (the `--vet` oracle needs `mycelium-check`
+in-workspace and recorded an un-run 0/192). Measured directly with `myc check`, one emitted
+file (`pool.myc`) type-checks clean and another (`lib.myc`) fails (≈2.1% file-gated) — the
+limit is idiomatic imperative Rust hitting frontend-surface gaps, not the logic being
+unportable (the pure core ports fine by hand; see `gha-runner-ctl/mycelium-port/`). The dominant, quantified ones:
 
 | Gap | Vet signal | Implication |
 |---|---|---|
