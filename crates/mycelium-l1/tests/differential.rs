@@ -18,9 +18,7 @@ use mycelium_cert::{
     check, check_core, BinaryTernarySwapEngine, CheckVerdict, Evidence, RefinementRelation,
 };
 use mycelium_core::{GuaranteeStrength, Payload, Repr, Value};
-use mycelium_interp::{
-    HostCapabilities, HostOpRegistry, Interpreter, PrimRegistry,
-};
+use mycelium_interp::{HostCapabilities, HostOpRegistry, Interpreter, PrimRegistry};
 use mycelium_l1::elab::build_registry;
 use mycelium_l1::{
     check_nodule, check_phylum, elaborate, monomorphize, parse, parse_phylum, ElabError, Evaluator,
@@ -1317,10 +1315,8 @@ fn host_op_registry() -> HostOpRegistry {
 
 /// L0 interpreter with A1 host floor for the mock `echo` op (not the min OS floor).
 fn host_interpreter() -> Interpreter {
-    Interpreter::new(host_prim_registry(), Box::new(BinaryTernarySwapEngine)).with_host_ops(
-        host_op_registry(),
-        HostCapabilities::default().with_ffi(),
-    )
+    Interpreter::new(host_prim_registry(), Box::new(BinaryTernarySwapEngine))
+        .with_host_ops(host_op_registry(), HostCapabilities::default().with_ffi())
 }
 
 /// **M-720/M-721 — the `wild`/FFI execution floor, three-way.** A `wild` block in a `@std-sys` nodule
