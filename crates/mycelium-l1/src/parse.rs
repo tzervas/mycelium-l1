@@ -2425,6 +2425,12 @@ impl Parser {
             | Tok::Int(_)
             | Tok::LBracket => Ok(Expr::Lit(self.parse_literal()?)),
             Tok::Ident(_) => Ok(Expr::Path(self.parse_path()?)),
+            // Statement-sequencing block: `{ a; b; …; e }` desugars to nested
+            // `let _ = a in let _ = b in … in e` (KC-3 — zero kernel growth; the nested-let
+            // target already evaluates end-to-end). `{ e }` is identity sugar for `e`.
+            // Empty `{}` and a trailing `;` with no following expression are explicit refusals:
+            // both would need a unit value, and `()` has no surface spelling yet (G2).
+            Tok::LBrace => self.parse_block(),
             Tok::LParen => {
                 // M-826: `(e, e2, …)` is a tuple literal (arity ≥ 2); `(e)` is grouping.
                 self.bump();
@@ -2458,6 +2464,72 @@ impl Parser {
             }
             _ => self.err("an expression"),
         }
+    }
+
+    /// `{ stmt; …; expr }` — **statement-sequencing block** (surface sugar only; KC-3).
+    ///
+    /// Desugars **identically** to the already-admissible nested discard chain:
+    ///
+    /// ```text
+    /// { a; b; c }  ≡  let _ = a in let _ = b in c
+    /// { e }        ≡  e
+    /// ```
+    ///
+    /// No new AST node: the sugar leaves the same `Expr::Let { name: "_", ty: None, … }` spine
+    /// that `parse_let` builds for a hand-written `let _ = a in b`, so parse-AST identity is the
+    /// behaviour-neutrality proof (same shape as the `[…]` list-literal desugar).
+    ///
+    /// **Explicit refusals (never silent — G2):**
+    /// - empty `{}` — would need a unit value; `()` has no expression spelling yet
+    /// - trailing `;` before `}` (e.g. `{ a; }`) — same unit gap; the last component must be a
+    ///   value-producing expression, not a discarded statement
+    ///
+    /// `;` remains the *component separator inside a block only*. Outside braces it is still the
+    /// DN-57 item terminator (a bare `a; b` at fn-body position stays a stray top-level item).
+    fn parse_block(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Tok::LBrace, "`{` to open a block")?;
+        if self.at(&Tok::RBrace) {
+            return Err(ParseError::new(
+                self.pos(),
+                "an empty block `{}` has no value — unit `()` is not a surface spelling yet; \
+                 write a value-producing expression, or end a discard chain with an explicit \
+                 `Unit` constructor (the Unit prelude value)"
+                    .to_owned(),
+            ));
+        }
+        // Collect discarded prefixes; the final expression (not followed by `;`) is the block value.
+        let mut discarded: Vec<Expr> = Vec::new();
+        let result = loop {
+            let e = self.parse_expr()?;
+            if self.eat(&Tok::Semi) {
+                if self.at(&Tok::RBrace) {
+                    return Err(ParseError::new(
+                        self.pos(),
+                        "a trailing `;` before `}` would make the block yield unit, but unit `()` \
+                         has no surface spelling yet — omit the final `;` so the last expression \
+                         is the block's value, or end with an explicit `Unit` constructor"
+                            .to_owned(),
+                    ));
+                }
+                discarded.push(e);
+            } else {
+                break e;
+            }
+        };
+        self.expect(
+            &Tok::RBrace,
+            "`}` to close the block (or `;` and another statement)",
+        )?;
+        // Right-nested `let _ = s in …` so `{ a; b; c }` ≡ `let _ = a in let _ = b in c`.
+        Ok(discarded
+            .into_iter()
+            .rev()
+            .fold(result, |body, bound| Expr::Let {
+                name: "_".to_owned(),
+                ty: None,
+                bound: Box::new(bound),
+                body: Box::new(body),
+            }))
     }
 
     fn parse_literal(&mut self) -> Result<Literal, ParseError> {

@@ -1,7 +1,5 @@
-//! **Statement-sequencing surface inventory** — the measured refusal boundary for multi-statement
-//! `fn` bodies and the `()` unit spelling (the dominant expressibility gap: `MultiStmtBody` = 38 of
-//! 196 recorded gaps in `mycelium-transpile/docs/vet-gha-runner-ctl-2026-07-22/summary.json`, plus
-//! 13 `Other` gaps whose reason is "no unit value is representable in this grammar").
+//! **Statement-sequencing surface** — `{ a; b; …; e }` block form and the remaining unit-spelling
+//! refusal boundary.
 //!
 //! **What this file establishes, by execution rather than by reading the code:**
 //!
@@ -9,14 +7,13 @@
 //!    parses, type-checks, classifies `Total`, and elaborates to an L0 `Node::Let`. The DN-137
 //!    `Unit` prelude type (`checkty::unit_prelude`, seeded never parsed) type-checks and elaborates
 //!    to `Node::Construct { args: [] }`. Nothing in the IR is missing.
-//! 2. The gap is **purely surface syntax**: there is no `{ s1; s2 }` block form and no `()`
-//!    spelling, so every refusal below is a `ParseError` from one of exactly four sites in
-//!    `src/parse.rs` — *not* a typed `ElabError::Residual` / `CheckError`.
-//!
-//! Tests 1–5 are **characterization** tests: they pin the exact refusal site + message so a future
-//! surface landing has a precise before/after witness. Test 6 is the **goal state**, `#[ignore]`d so
-//! the suite stays green; run it with `cargo test --test multi_statement_body -- --ignored` to see
-//! the refusal reproduce.
+//! 2. The **block surface is landed**: `{ a; b }` is a primary expression that desugars **identically**
+//!    (parse-AST equality) to `let _ = a in b`. Empty `{}` and trailing-`;` blocks still refuse
+//!    explicitly (they would need a unit value; `()` has no surface spelling yet).
+//! 3. The remaining refusals pin honesty guarantees that must not regress:
+//!    - bare `a; b` at fn-body position (no braces) is still a stray top-level item (DN-57);
+//!    - `let y = e;` without `in` is still refused at the missing `in`;
+//!    - `()` has no expression or type spelling.
 //!
 //! Guarantee: `Empirical` (every claim here is an executed assertion, not a reading of the code).
 
@@ -33,13 +30,13 @@ fn parse_err(src: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 1..5 — the four refusal sites, characterized.
+// Deliberate refusals that must remain (honesty / DN-57 / unit gap).
 // ---------------------------------------------------------------------------------------------
 
 /// **Refusal site A** — `src/parse.rs::Parser::parse_item` fallthrough (`"a top-level item …"`).
 /// A Rust-shaped `fn f() => T = stmt1; stmt2;` body ends at the first `;` (DN-57 makes `;` the
-/// *component terminator*, never a statement separator), so the second statement is read as a new
-/// top-level item and refused there. The diagnostic never mentions statements.
+/// *component terminator*, never a statement separator **outside** a braced block), so the second
+/// statement is read as a new top-level item and refused there. Sequencing requires braces.
 #[test]
 fn two_semicolon_separated_statements_are_refused_as_a_stray_top_level_item() {
     let msg = parse_err(&format!(
@@ -55,33 +52,50 @@ fn two_semicolon_separated_statements_are_refused_as_a_stray_top_level_item() {
     );
 }
 
-/// **Refusal site B** — `src/parse.rs::Parser::parse_primary`'s `_ => self.err("an expression")`
-/// arm (parse.rs:2459 at this revision). `{` is not an expression-opening token: there is **no
-/// block form** in the expression grammar at all, so even a *single*-expression block `{ e }` is a
-/// parse error. `docs/spec/grammar/mycelium.ebnf` confirms it: `block ::= '{' expr '}'` exists only
-/// as the operand of `reclaim_expr`, and `expr` has no `block` alternative.
+/// Braced blocks **are** expression forms. A single-expression block `{ e }` is identity sugar
+/// for `e`; a two-statement block is covered by the goal test below. This replaces the prior
+/// characterization that `{` was not an expression-opening token (refusal site B).
 #[test]
-fn a_braced_block_is_not_an_expression_form_at_all() {
-    let two = parse_err(&format!(
-        "{PRE}fn f() => Binary{{8}} = {{ g(0b0000_0010); g(0b0000_0001) }};\n"
-    ));
-    assert!(
-        two.contains("expected an expression") && two.contains("found LBrace"),
-        "unexpected refusal: {two}"
+fn a_braced_block_is_an_expression_form() {
+    let one = format!("{PRE}fn f() => Binary{{8}} = {{ 0b0000_0001 }};\n");
+    let bare = format!("{PRE}fn f() => Binary{{8}} = 0b0000_0001;\n");
+    let body_of = |src: &str| {
+        parse(src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .items
+            .into_iter()
+            .find_map(|i| match i {
+                mycelium_l1::ast::Item::Fn(fd) if fd.sig.name == "f" => Some(fd.body),
+                _ => None,
+            })
+            .expect("fn f")
+    };
+    assert_eq!(
+        body_of(&one),
+        body_of(&bare),
+        "`{{ e }}` must parse identically to bare `e`"
     );
-    // …and the single-expression block is refused identically — the gap is the *block*, not the `;`.
-    let one = parse_err(&format!(
-        "{PRE}fn f() => Binary{{8}} = {{ 0b0000_0001 }};\n"
-    ));
+}
+
+/// Empty `{}` and a trailing-`;` block still refuse explicitly — both would need a unit value,
+/// and `()` has no surface spelling (G2 / never-silent).
+#[test]
+fn empty_and_trailing_semi_blocks_are_refused_for_the_unit_gap() {
+    let empty = parse_err(&format!("{PRE}fn f() => Unit = {{}};\n"));
     assert!(
-        one.contains("expected an expression") && one.contains("found LBrace"),
-        "unexpected refusal: {one}"
+        empty.contains("empty block") || empty.contains("unit"),
+        "unexpected refusal: {empty}"
+    );
+    let trailing = parse_err(&format!("{PRE}fn f() => Unit = {{ h(); }};\n"));
+    assert!(
+        trailing.contains("trailing") || trailing.contains("unit"),
+        "unexpected refusal: {trailing}"
     );
 }
 
 /// **Refusal site C** — `src/parse.rs::Parser::parse_let`'s `expect(&Tok::In, …)`. `let` is an
 /// *expression* (`let … in …`), never a statement; the Rust-shaped `let y = e;` has no continuation
-/// to bind, so it is refused at the missing `in`.
+/// to bind, so it is refused at the missing `in`. (A block may contain full `let … in …` exprs.)
 #[test]
 fn a_statement_let_without_in_is_refused_at_the_missing_in() {
     let msg = parse_err(&format!(
@@ -108,10 +122,8 @@ fn unit_has_no_expression_spelling() {
 }
 
 /// **Refusal site D(type)** — `src/parse.rs::Parser::parse_base_type`'s `Tok::LParen` arm reaches
-/// `parse_type_ref` on the immediately-following `)` and falls through to `_ => self.err("a type")`
-/// (parse.rs:1734 at this revision). `() ` has no *type* spelling either, which is exactly the
-/// transpiler's 13 "function has no return type (implicit `()`) — no unit value is representable in
-/// this grammar" gaps.
+/// `parse_type_ref` on the immediately-following `)` and falls through to `_ => self.err("a type")`.
+/// `()` has no *type* spelling either.
 #[test]
 fn unit_has_no_type_spelling() {
     let msg = parse_err(&format!("{PRE}fn f() => () = 0b0000_0001;\n"));
@@ -163,17 +175,12 @@ fn the_desugar_target_already_works_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The goal state — currently FAILS. Ignored so the suite stays green.
+// Goal state — block surface ≡ nested-let desugar (parse-AST identity).
 // ---------------------------------------------------------------------------------------------
 
-/// **GOAL (currently refused).** The smallest program that needs statement sequencing: a two-
-/// statement body. It must become observationally identical to its hand-written `let _ = a in b`
+/// A two-statement body must be observationally identical to its hand-written `let _ = a in b`
 /// desugar — AST identity after parse, the same proof shape `tests/list_literal.rs` uses for `[…]`.
-///
-/// Run with `cargo test --test multi_statement_body -- --ignored`.
 #[test]
-#[ignore = "GOAL: `{ a; b }` block sequencing is not in the surface grammar yet — see this \
-            file's module doc for the measured refusal sites"]
 fn goal_a_two_statement_block_body_parses_identically_to_its_let_desugar() {
     let block = format!("{PRE}fn f() => Binary{{8}} = {{ g(0b0000_0001); 0b0000_0011 }};\n");
     let desugared =
@@ -190,4 +197,40 @@ fn goal_a_two_statement_block_body_parses_identically_to_its_let_desugar() {
             .expect("fn f")
     };
     assert_eq!(body_of(&block), body_of(&desugared));
+}
+
+/// Three-statement block ≡ nested discard chain (extends the two-statement identity proof).
+#[test]
+fn three_statement_block_parses_identically_to_nested_lets() {
+    let block = format!(
+        "{PRE}fn f() => Binary{{8}} = {{ g(0b0000_0001); g(0b0000_0010); 0b0000_0011 }};\n"
+    );
+    let desugared = format!(
+        "{PRE}fn f() => Binary{{8}} = \
+         let _ = g(0b0000_0001) in let _ = g(0b0000_0010) in 0b0000_0011;\n"
+    );
+    let body_of = |src: &str| {
+        parse(src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .items
+            .into_iter()
+            .find_map(|i| match i {
+                mycelium_l1::ast::Item::Fn(fd) if fd.sig.name == "f" => Some(fd.body),
+                _ => None,
+            })
+            .expect("fn f")
+    };
+    assert_eq!(body_of(&block), body_of(&desugared));
+}
+
+/// End-to-end: a block body checks, classifies Total, and elaborates (not only parse identity).
+#[test]
+fn block_body_checks_and_elaborates_end_to_end() {
+    let src = format!("{PRE}fn f() => Binary{{8}} = {{ h(); h(); 0b0000_0011 }};\n");
+    let nodule = parse(&src).unwrap_or_else(|e| panic!("parse: {e}"));
+    let env = check_nodule(&nodule).unwrap_or_else(|e| panic!("check: {e}"));
+    let tot =
+        mycelium_l1::totality::classify_all(&env.fns).unwrap_or_else(|e| panic!("totality: {e:?}"));
+    assert_eq!(tot.get("f"), Some(&mycelium_l1::Totality::Total));
+    elaborate(&env, "f").unwrap_or_else(|e| panic!("elaborate: {e:?}"));
 }
