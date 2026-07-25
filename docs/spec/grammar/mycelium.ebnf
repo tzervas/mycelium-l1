@@ -282,6 +282,7 @@ expr           ::= let_expr
                  | reclaim_expr
                  | lambda_expr
                  | op_expr
+                 | block_expr
 
 /* with paradigm: a block-scope ambient override (RFC-0012 §4.4; M-344). Not a conversion — it
  * fills the interior tags and elaborates away; a cross-paradigm edge in/out of the block needs an
@@ -360,7 +361,17 @@ fuse_expr      ::= 'fuse' '(' expr ',' expr ')'
  * G2 on reclamation/restart events). Execution: Residual stub pending M-817 runtime registry wiring.
  * VR-5 — claimed as a surface with honest Residual, not a fabricated accept. */
 reclaim_expr   ::= 'reclaim' '(' expr ')' block
+/* `block` is the braced body of `reclaim` (and historically only that). A free-standing
+ * statement-sequencing block is `block_expr` below — same braces, but multi-statement. */
 block          ::= '{' expr '}'
+
+/* Statement-sequencing block (surface sugar; KC-3). Desugars to nested discard lets:
+ *   { a; b; c }  ≡  let _ = a in let _ = b in c
+ *   { e }        ≡  e
+ * Empty `{}` and a trailing `;` before `}` are explicit parse refusals (both would need a unit
+ * value; `()` has no surface spelling yet). Outside braces, `;` remains the DN-57 item terminator
+ * — a bare `a; b` at fn-body position is still a stray top-level item, not sequencing. */
+block_expr     ::= '{' expr (';' expr)* '}'
 
 /* Operator-expression layer (RFC-0025 / M-705). Symbolic infix/prefix operators are FRONTEND-ONLY
  * sugar: each desugars to a canonical word-function call (`a + b` -> `add(a, b)`, `-a` -> `neg(a)`),
