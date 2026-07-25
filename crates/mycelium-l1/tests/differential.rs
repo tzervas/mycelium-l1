@@ -18,7 +18,9 @@ use mycelium_cert::{
     check, check_core, BinaryTernarySwapEngine, CheckVerdict, Evidence, RefinementRelation,
 };
 use mycelium_core::{GuaranteeStrength, Payload, Repr, Value};
-use mycelium_interp::{Interpreter, PrimRegistry};
+use mycelium_interp::{
+    HostCapabilities, HostOpRegistry, Interpreter, PrimRegistry,
+};
 use mycelium_l1::elab::build_registry;
 use mycelium_l1::{
     check_nodule, check_phylum, elaborate, monomorphize, parse, parse_phylum, ElabError, Evaluator,
@@ -1274,10 +1276,15 @@ fn the_hof_differential_distinguishes_different_named_fn_arguments() {
 // --- M-720/M-721: the `wild`/FFI execution floor, three-way differential ------------------------
 //
 // RFC-0028 §4.2/§4.3: a `wild { name(args…) }` block in a `@std-sys` nodule lowers to a host-dispatch
-// `Op{prim:"wild:name"}` (M-720, **no new Core-IR node** — KC-3) and *executes* by dispatching through
-// the prim registry — the capability handle. Because all three paths thread the SAME registry, a
-// `wild`-backed op resolves identically on L1-eval, L0-interp, and AOT — so the three-way differential
-// extends to it (closing DN-14 row 9's staged-execution gap for a deterministic host op, `Empirical`).
+// `Op{prim:"wild:name"}` (M-720, **no new Core-IR node** — KC-3).
+//
+// **A1 split dispatch (mycelium-runtime#6):** the three paths no longer share one registry for
+// `wild:`:
+//   - L1-eval + codegen AOT env-machine still dispatch via `PrimRegistry` (`wild:name` key).
+//   - L0 interpreter routes `wild:` exclusively through `HostOpRegistry` (bare name) + `ffi`.
+// Three-way agreement therefore requires **dual registration** of the same handler until L1/AOT
+// migrate onto `HostOpRegistry`. Pin-bumping runtime A1 without this dual-reg is a red
+// differential — never a silent wrong value (G2).
 
 /// A deterministic mock host op for the `wild`/FFI differential (M-721): `wild:echo` returns its single
 /// argument unchanged. It is *deterministic* (unlike a real syscall), so the three paths can be asserted
@@ -1294,23 +1301,37 @@ fn wild_echo(_prim: &str, args: &[&Value]) -> Result<Value, mycelium_interp::Eva
     }
 }
 
-/// The trusted built-ins **plus** the `wild:echo` host op registered — a host that *grants* the `echo`
-/// capability (RFC-0028 §4.3). The default `with_builtins()` registry grants no `wild:` op.
-fn host_registry() -> PrimRegistry {
+/// PrimRegistry half of the dual-reg (L1-eval + AOT): `wild:echo` key.
+fn host_prim_registry() -> PrimRegistry {
     let mut prims = PrimRegistry::with_builtins();
     prims.register("wild:echo", wild_echo);
     prims
 }
 
+/// HostOpRegistry half of the dual-reg (L0 interpreter after A1): bare `echo` + `ffi` grant.
+fn host_op_registry() -> HostOpRegistry {
+    let mut host = HostOpRegistry::empty();
+    host.register("echo", wild_echo);
+    host
+}
+
+/// L0 interpreter with A1 host floor for the mock `echo` op (not the min OS floor).
+fn host_interpreter() -> Interpreter {
+    Interpreter::new(host_prim_registry(), Box::new(BinaryTernarySwapEngine)).with_host_ops(
+        host_op_registry(),
+        HostCapabilities::default().with_ffi(),
+    )
+}
+
 /// **M-720/M-721 — the `wild`/FFI execution floor, three-way.** A `wild` block in a `@std-sys` nodule
-/// lowers to `Op{prim:"wild:echo"}` (no new Core-IR node, KC-3) and *executes* by dispatching through
-/// the prim registry (the capability handle, §4.3), so L1-eval ≡ elaborate→L0-interp ≡ AOT agree on the
-/// `wild`-backed value — the recorded `Empirical` basis closing DN-14 row 9's staged-execution gap.
+/// lowers to `Op{prim:"wild:echo"}` (no new Core-IR node, KC-3). After runtime A1 the three paths
+/// dual-register the same handler (see module note above) so L1-eval ≡ L0-interp ≡ AOT still agree —
+/// the recorded `Empirical` basis closing DN-14 row 9's staged-execution gap.
 #[test]
 fn wild_ffi_execution_agrees_three_ways() {
-    let prims = host_registry();
+    let prims = host_prim_registry();
     let engine = BinaryTernarySwapEngine;
-    let interp = Interpreter::new(host_registry(), Box::new(BinaryTernarySwapEngine));
+    let interp = host_interpreter();
 
     let src =
         "nodule std.sys.x @std-sys;\nfn main() => Binary{8} !{ffi} = wild { echo(0b1011_0010) };";
@@ -1323,14 +1344,14 @@ fn wild_ffi_execution_agrees_three_ways() {
         "wild must lower to Op{{prim:\"wild:echo\"}} — no new Core-IR node (KC-3); got {node:?}"
     );
 
-    // Path 1: L1-eval, with the host registry injected (the capability granted).
+    // Path 1: L1-eval, with the PrimRegistry host key injected (L1 evaluator still uses PrimRegistry).
     let l1 = Evaluator::new(&env)
-        .with_engines(host_registry(), Box::new(BinaryTernarySwapEngine))
+        .with_engines(host_prim_registry(), Box::new(BinaryTernarySwapEngine))
         .call("main", vec![])
         .expect("L1-eval runs the wild host op");
     let l1 = l1.as_repr().expect("a repr result").clone();
 
-    // Path 2: L0-interp. Path 3: AOT. Both dispatch the same `wild:echo` through the shared registry.
+    // Path 2: L0-interp via HostOpRegistry + ffi (A1). Path 3: AOT still via PrimRegistry.
     let l0 = interp.eval(&node).expect("L0-interp runs the wild host op");
     let aot = mycelium_mlir::run(&node, &prims, &engine).expect("AOT runs the wild host op");
 
@@ -1381,14 +1402,18 @@ fn an_ungranted_wild_host_op_is_an_explicit_refusal() {
     let env = check_nodule(&parse(src).expect("parses")).expect("checks");
     let node = elaborate(&env, "main").expect("elaborates to a host-dispatch Op");
 
-    // L0-interp with the DEFAULT (no host) registry — an explicit, named refusal for the ungranted op.
+    // L0-interp with the DEFAULT (empty HostOpRegistry, no ffi) — explicit typed miss (A1).
     let err = Interpreter::default()
         .eval(&node)
         .expect_err("an ungranted wild op must refuse, never fabricate a value");
     let msg = err.to_string();
     assert!(
-        msg.contains("echo") && msg.contains("not granted"),
-        "the refusal must name the ungranted host capability `echo`; got: {msg}"
+        msg.contains("echo")
+            && (msg.contains("host-op-not-registered")
+                || msg.contains("not granted")
+                || msg.contains("UnknownPrim")
+                || msg.contains("capability")),
+        "the refusal must name the ungranted host op `echo` (A1 typed miss); got: {msg}"
     );
 
     // L1-eval likewise refuses on the default registry — never silently runs.
