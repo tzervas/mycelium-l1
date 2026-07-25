@@ -2027,8 +2027,9 @@ impl Elab<'_> {
     /// body shape is an explicit [`ElabError::Residual`] (never a fabricated lowering — G2).
     ///
     /// The resulting `Op { prim: "wild:name", … }` is resolved at runtime through the interpreter's
-    /// prim registry — the capability handle (RFC-0028 §4.3) — which registers **no** `wild:` op by
-    /// default, so an ungranted host op is a never-silent `UnknownPrim` (G2). The `wild:` prefix is
+    /// [`HostOpRegistry`](mycelium_interp::HostOpRegistry) + `ffi` capability grant (RFC-0028 §4.3 /
+    /// A1) — which register **no** host op and grant **no** `ffi` by default, so an ungranted host
+    /// op is a never-silent `UnknownPrim` / `HostCapabilityDenied` (G2). The `wild:` prefix is
     /// reserved: no built-in paradigm primitive uses it, so a `wild:`-prefixed `Op` is unambiguously
     /// a host call. **No new Core-IR node** (KC-3).
     fn elab_wild(
