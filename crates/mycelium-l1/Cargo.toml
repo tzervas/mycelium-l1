@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 # The L1 evaluator produces L0 values and reuses the trusted primitive/swap semantics — the same
 # registries the reference interpreter and the AOT path share (RFC-0007 §4.6).
-mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "57ef45b453eef1f02bdfb1f0cad1034dabd32b1f" }
 mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "cb3a96348f718661dbd3db43224a036df272e177" }
 mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "cb3a96348f718661dbd3db43224a036df272e177" }
 # W-C X5 (RFC-0013 Amendment A1 first-fault envelope): mycelium-l1 already transitively depends on
@@ -39,12 +39,12 @@ mycelium-diag = { git = "https://github.com/tzervas/mycelium-runtime", rev = "cb
 mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "cb3a96348f718661dbd3db43224a036df272e177" }
 # Host-stack management for the recursive checker/elaborator, kept OUTSIDE this trusted kernel so the
 # kernel stays `#![forbid(unsafe_code)]` (ADR-014). The kernel calls only its safe `with_deep_stack`.
-mycelium-stack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-stack = { git = "https://github.com/tzervas/mycelium-core", rev = "57ef45b453eef1f02bdfb1f0cad1034dabd32b1f" }
 # RFC-0041 (Wave-1): the shared never-silent recursion budget the frontend's recursive checker passes
 # charge against (usefulness / decision-tree / grade / list-literal spine), so a pathological input is
 # refused with an explicit `BudgetError` — never a host-stack overflow (§4.7). Leaf crate (DN-68
 # acyclic, downward-only): depends only on `std` + `mycelium-stack`, never upward on `l1`.
-mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "57ef45b453eef1f02bdfb1f0cad1034dabd32b1f" }
 
 [dev-dependencies]
 # The RFC-0007 §4.6 differential: L1-eval vs elaborate→L0-interp vs elaborate→AOT, validated
