@@ -49,7 +49,7 @@ mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "
 [dev-dependencies]
 # The RFC-0007 §4.6 differential: L1-eval vs elaborate→L0-interp vs elaborate→AOT, validated
 # through the M-210 shared TV checker.
-mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "0c1cc66afc0f11ad96994124dba28aa07a8e0d3f" }
+mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "5458549e682749e4558717623217230cdc633290" }
 mycelium-numerics = { git = "https://github.com/tzervas/mycelium-value", rev = "6d230ad2023a716704c697ac6812a2062624b4eb" }
 # M-890 (kickoff `enb`, Gap C): the dense elementwise prim group's conformance/three-way tests
 # build their `Dense` input values through the kernel's own constructor (`DenseSpace::value`) —
