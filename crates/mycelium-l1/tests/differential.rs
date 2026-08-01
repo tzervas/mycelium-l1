@@ -1391,7 +1391,13 @@ fn an_ungranted_wild_host_op_is_an_explicit_refusal() {
     assert!(
         msg.contains("echo")
             && (msg.contains("not granted")
-                || msg.contains("not-registered")
+    assert!(
+        msg.contains("echo")
+            && (msg.contains("not granted")
+                || msg.contains("host-op-not-registered")
+                || msg.contains("no host capability")),
+        "the refusal must name the ungranted host capability `echo`; got: {msg}"
+    );
                 || msg.contains("no host capability")),
         "the refusal must name the ungranted host capability `echo`; got: {msg}"
     );
