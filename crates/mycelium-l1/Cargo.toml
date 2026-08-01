@@ -15,8 +15,8 @@ workspace = true
 # The L1 evaluator produces L0 values and reuses the trusted primitive/swap semantics — the same
 # registries the reference interpreter and the AOT path share (RFC-0007 §4.6).
 mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "57ef45b453eef1f02bdfb1f0cad1034dabd32b1f" }
-mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "2317cd1694496b72225213a9fdc59407a907b495" }
-mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "2317cd1694496b72225213a9fdc59407a907b495" }
+mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "7842042d770108b2d179ff2874f1871dc4821604" }
+mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "7842042d770108b2d179ff2874f1871dc4821604" }
 # W-C X5 (RFC-0013 Amendment A1 first-fault envelope): mycelium-l1 already transitively depends on
 # mycelium-diag via mycelium-cert (mode.rs's swap_check emitter, W-A) — this makes that dependency
 # DIRECT so the checker itself can build envelope instances (`policy_resolve`/`legal_pair_refuse`/
@@ -25,7 +25,7 @@ mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "23
 # edge is strictly downward (mycelium-l1 stratum 4 -> mycelium-diag stratum 1, well under l1's
 # existing stratum), and no new node enters the workspace dependency graph (mycelium-diag was
 # already pulled in transitively).
-mycelium-diag = { git = "https://github.com/tzervas/mycelium-runtime", rev = "2317cd1694496b72225213a9fdc59407a907b495" }
+mycelium-diag = { git = "https://github.com/tzervas/mycelium-runtime", rev = "7842042d770108b2d179ff2874f1871dc4821604" }
 # `forage` activation (M-906, DN-70 D1/DN-63 §3.5): reuses the existing RFC-0005 SelectionPolicy
 # machinery verbatim ("no new mechanism", DN-70) for the D-lite single-node placement decision +
 # its mandatory EXPLAIN. FLAG (M-906 kickoff-note deviation): the task brief's file-ownership list
@@ -36,7 +36,7 @@ mycelium-diag = { git = "https://github.com/tzervas/mycelium-runtime", rev = "23
 # established pattern for five other crates (`mycelium-lsp`/`mlir`/`std-runtime`/`vsa`/
 # `std-select`). Reusing the *existing* mechanism (DN-70's explicit mandate) outweighs the default
 # swarm-hygiene caution here; flagged for integrator review rather than silently applied.
-mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "2317cd1694496b72225213a9fdc59407a907b495" }
+mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "7842042d770108b2d179ff2874f1871dc4821604" }
 # Host-stack management for the recursive checker/elaborator, kept OUTSIDE this trusted kernel so the
 # kernel stays `#![forbid(unsafe_code)]` (ADR-014). The kernel calls only its safe `with_deep_stack`.
 mycelium-stack = { git = "https://github.com/tzervas/mycelium-core", rev = "57ef45b453eef1f02bdfb1f0cad1034dabd32b1f" }
@@ -49,7 +49,7 @@ mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "
 [dev-dependencies]
 # The RFC-0007 §4.6 differential: L1-eval vs elaborate→L0-interp vs elaborate→AOT, validated
 # through the M-210 shared TV checker.
-mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "5a8638de9f964e8f1136751b0ec78f4014562353" }
+mycelium-mlir = { git = "https://github.com/tzervas/mycelium-codegen", rev = "b1e53b7c57597215ba65402af33551467c576bd3" }
 mycelium-numerics = { git = "https://github.com/tzervas/mycelium-value", rev = "fd4c3b307918fe6d58251a0b24a81e9f384d65ba" }
 # M-890 (kickoff `enb`, Gap C): the dense elementwise prim group's conformance/three-way tests
 # build their `Dense` input values through the kernel's own constructor (`DenseSpace::value`) —
