@@ -6528,10 +6528,12 @@ impl Cx<'_> {
     ///    declare `!{ffi}`. That is enforced separately, in the effect-coverage pass
     ///    ([`check_body_effect_coverage`]) — which credits a `wild` with performing `ffi` — so it
     ///    composes with the M-660 machinery rather than duplicating it here.
-    /// 4. **Execution is staged.** There is no FFI host in v0, so `wild` *type-checks + gates + is
-    ///    audited* now; actually *running* it elaborates to an explicit [`crate::elab::ElabError::Residual`]
-    ///    (a future capability) — consistent with M-657/659/660 staging. The body is preserved
-    ///    **verbatim** in the returned expression (opaque — no interior resolution).
+    /// 4. **Execution is runtime-gated, not elab-residual.** A host-call-shaped body elaborates to
+    ///    `Op { prim: "wild:name", … }` (M-720). The default L1/L0 host registry is empty and `ffi`
+    ///    is ungranted (A1 / RFC-0028 §4.3) — so evaluation refuses with a typed miss until the
+    ///    caller installs a floor via `Evaluator::with_host_floor` / `Interpreter::with_host_floor`.
+    ///    The body is preserved **verbatim** in the returned expression (opaque — no interior
+    ///    resolution; audited, not verified — ADR-014/VR-5).
     fn check_wild(&self, body: &Expr, expected: Option<&Ty>) -> Result<(Ty, Expr), CheckError> {
         if !self.std_sys {
             return self.err(

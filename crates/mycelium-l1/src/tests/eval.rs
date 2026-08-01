@@ -419,11 +419,12 @@ fn asserting_stronger_than_actual_is_an_explicit_error() {
 
 #[test]
 fn an_ungranted_wild_host_op_is_an_explicit_refusal() {
-    // M-721: a `wild` host op now *dispatches* (M-720 lowering), but the default registry grants
-    // no `wild:` op (RFC-0028 §4.3 — the capability handle), so running `wild { foreign(…) }`
-    // without the host capability is an explicit `Kernel(UnknownPrim)` refusal — never silent
-    // (G2). Drive the evaluator directly on an unchecked nodule (the checker would also gate the
-    // `@std-sys` context) to confirm the refusal is the evaluator's own.
+    // M-721 + A1: a `wild` host op now *dispatches* through `HostOpRegistry` (M-720 lowering), but
+    // the default host registry grants no op and no `ffi` (RFC-0028 §4.3), so running
+    // `wild { foreign(…) }` without the host capability is an explicit `Kernel(UnknownPrim)`
+    // refusal — never silent (G2). Drive the evaluator directly on an unchecked nodule (the
+    // checker would also gate the `@std-sys` context) to confirm the refusal is the evaluator's
+    // own.
     let nodule =
         parse("nodule d;\nfn main() => Binary{8} = wild { foreign(0b0000_0001) };").unwrap();
     let env = Env {

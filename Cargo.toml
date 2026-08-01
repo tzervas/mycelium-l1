@@ -31,3 +31,15 @@ undocumented_unsafe_blocks = "warn"
 # G2 never-silent arithmetic: release builds panic on overflow (monorepo parity).
 [profile.release]
 overflow-checks = true
+
+# Unify mycelium-runtime crates onto gate A1 (`HostOpRegistry` / `HostCapabilities`).
+# `mycelium-mlir` (codegen pin `505448c`) still declares the pre-A1 rev in its own Cargo.toml;
+# Cargo refuses a same-URL git→git rev patch, so we path-patch the pinned A1 tree under
+# `vendor/mycelium-runtime` (see `vendor/README.md`). Fleet pin-bump of codegen retires this.
+[patch."https://github.com/tzervas/mycelium-runtime"]
+mycelium-interp = { path = "vendor/mycelium-runtime/crates/mycelium-interp" }
+mycelium-cert = { path = "vendor/mycelium-runtime/crates/mycelium-cert" }
+mycelium-diag = { path = "vendor/mycelium-runtime/crates/mycelium-diag" }
+mycelium-select = { path = "vendor/mycelium-runtime/crates/mycelium-select" }
+mycelium-sched = { path = "vendor/mycelium-runtime/crates/mycelium-sched" }
+mycelium-rt-abi = { path = "vendor/mycelium-runtime/crates/mycelium-rt-abi" }

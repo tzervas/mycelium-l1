@@ -4,6 +4,17 @@
 //! primitive registry and swap engine the L0 interpreter and the AOT path dispatch through, so
 //! "two execution paths" can never mean "two semantics" (NFR-7).
 //!
+//! # Host ops (`wild:`, A1 / RFC-0028 §4.3)
+//!
+//! `wild { name(args…) }` elaborates to `Node::Op { prim: "wild:name", … }` (KC-3 — no new Core-IR
+//! node). The L1 evaluator routes those ops through a dedicated [`HostOpRegistry`] +
+//! [`HostCapabilities::ffi`] gate — **not** the pure [`PrimRegistry`] — matching the L0 interpreter
+//! after mycelium-runtime gate A1. Default is fail-closed: empty host registry and `ffi = false`.
+//! Opt in with [`Evaluator::with_host_floor`] (min built-ins + `ffi` grant) or
+//! [`Evaluator::with_host_ops`]. An unregistered `wild:` is [`KernelError::UnknownPrim`]; a
+//! registered-but-ungranted op is [`KernelError::HostCapabilityDenied`] — never a silent success
+//! (G2 / VR-5).
+//!
 //! Programs **inside** the evaluation-complete fragment also elaborate to L0
 //! ([`crate::elab::elaborate`]) and must agree with this evaluator on the observable
 //! (`repr + payload + guarantee`) — the §4.6 differential obligation, validated through the M-210
@@ -34,8 +45,8 @@ use std::sync::Arc;
 use mycelium_cert::BinaryTernarySwapEngine;
 use mycelium_core::{CoreValue, DataRegistry, Datum, GuaranteeStrength, Value};
 use mycelium_interp::{
-    Budgets, EffectBudget, EffectBudgetExhausted, EvalError as KernelError, PrimRegistry,
-    SwapEngine,
+    Budgets, EffectBudget, EffectBudgetExhausted, EvalError as KernelError, HostCapabilities,
+    HostOpRegistry, PrimRegistry, SwapEngine, FFI_EFFECT,
 };
 // RFC-0041 W5 (M-979): the shared never-silent recursion budget the CEK work-stack charges at each
 // source-call/β boundary (§4.0 metric). The canonical `BudgetError::DepthExceeded` maps to
@@ -550,12 +561,22 @@ impl TcoTrace {
 /// L0 paths use: the built-in prim registry and the certified binary↔ternary swap engine
 /// (M-120/M-210) — override with [`Evaluator::with_engines`] for tests or extensions.
 ///
+/// **Host ops (A1):** default is an empty [`HostOpRegistry`] and `ffi = false` (fail closed).
+/// Install the min OS-contact floor with [`Evaluator::with_host_floor`], or a custom table with
+/// [`Evaluator::with_host_ops`]. Pure/deterministic fragments therefore cannot invoke host ops
+/// silently (G2).
+///
 /// [`Evaluator::call`] runs the [work-stack CEK machine](Self::run_machine) on a deep worker stack
 /// (see [`DEFAULT_DEPTH`]); the swap engine must be `Send + Sync` so `&Evaluator` can be shared
 /// across the scoped worker thread (all built-in engines are `Copy`, hence `Send + Sync`).
 pub struct Evaluator<'e> {
     env: &'e Env,
     prims: PrimRegistry,
+    /// Host-op registry for the reserved `wild:` prim namespace (RFC-0028 §4.3; A1). Empty by
+    /// default — pure fragments see a typed miss on every `wild:<name>`.
+    host_ops: HostOpRegistry,
+    /// Runtime half of `@std-sys` + `!{ffi}`: must grant `ffi` before a registered host op runs.
+    host_caps: HostCapabilities,
     swap: Box<dyn SwapEngine + Send + Sync>,
     fuel: u64,
     depth: u32,
@@ -580,11 +601,17 @@ pub struct Evaluator<'e> {
 
 impl<'e> Evaluator<'e> {
     /// An evaluator over `env` with the trusted default engines and the default budgets.
+    ///
+    /// Host ops stay empty and `ffi` ungranted — use [`with_host_floor`](Self::with_host_floor) or
+    /// [`with_host_ops`](Self::with_host_ops) to opt into the `wild:` seam (RFC-0028 §4.3 / A1).
     #[must_use]
     pub fn new(env: &'e Env) -> Self {
         Evaluator {
             env,
             prims: PrimRegistry::with_builtins(),
+            // A1: default grants **no** host ops and **no** `ffi` — pure fragments stay pure (G2).
+            host_ops: HostOpRegistry::empty(),
+            host_caps: HostCapabilities::default(),
             swap: Box::new(BinaryTernarySwapEngine),
             fuel: DEFAULT_FUEL,
             depth: DEFAULT_DEPTH,
@@ -673,6 +700,9 @@ impl<'e> Evaluator<'e> {
 
     /// Replace the prim registry and swap engine. The swap engine must be `Send + Sync` (all
     /// built-in engines are `Copy`, hence `Send + Sync`; a custom engine for tests likewise).
+    ///
+    /// Does **not** touch the host-op registry or `ffi` grant — configure those with
+    /// [`with_host_floor`](Self::with_host_floor) / [`with_host_ops`](Self::with_host_ops).
     #[must_use]
     pub fn with_engines(
         mut self,
@@ -681,6 +711,35 @@ impl<'e> Evaluator<'e> {
     ) -> Self {
         self.prims = prims;
         self.swap = swap;
+        self
+    }
+
+    /// Install the A1 min host-op floor (`wild:entropy_fill`, `wild:mono_nanos`,
+    /// `wild:read_capped`) **and** grant the runtime `ffi` capability.
+    ///
+    /// **WHY:** this is the only one-shot opt-in that makes a real host-contact program evaluate on
+    /// the L1 path. The default evaluator remains fail-closed (G2). Results from the min floor are
+    /// tagged **`Declared`** (VR-5 — OS contact has no proven bound). See
+    /// `mycelium_interp::HostOpRegistry::with_min_floor` for per-op signatures and hard caps.
+    ///
+    /// **Honesty residual (AOT):** the min floor is interpreter/L1-only until codegen learns
+    /// `HostOpRegistry`. Three-way equality on non-deterministic host ops is not claimed.
+    #[must_use]
+    pub fn with_host_floor(mut self) -> Self {
+        self.host_ops = HostOpRegistry::with_min_floor();
+        self.host_caps = HostCapabilities::default().with_ffi();
+        self
+    }
+
+    /// Install a custom host-op registry and capability grants (A1 extensibility / tests).
+    ///
+    /// **WHY separate from [`with_engines`]:** pure prims and host ops are distinct capability
+    /// surfaces (RFC-0028 §4.3). A registered host op without `caps.ffi` is still refused — that
+    /// is a security property, not a convenience.
+    #[must_use]
+    pub fn with_host_ops(mut self, host_ops: HostOpRegistry, host_caps: HostCapabilities) -> Self {
+        self.host_ops = host_ops;
+        self.host_caps = host_caps;
         self
     }
 
@@ -1676,13 +1735,19 @@ impl<'e> Evaluator<'e> {
         }))
     }
 
-    /// Dispatch a `wild { name(args…) }` host op through the reserved `wild:` prim namespace (the
-    /// former `eval_wild` tail). All arguments must be repr values; an ungranted host op is an
-    /// explicit [`KernelError::UnknownPrim`] (never silent — G2). `wild` is not a source-call/β
-    /// boundary in the §4.0 metric (a host op never recurses), so it charges no depth.
+    /// Dispatch a `wild { name(args…) }` host op through the reserved `wild:` host-op registry
+    /// (RFC-0028 §4.3; A1 — the former PrimRegistry-only path is retired for host ops).
+    ///
+    /// Order (fail closed, never silent — G2), matching L0 `wild::dispatch_wild`:
+    /// 1. Look up bare `name` in [`HostOpRegistry`] → [`KernelError::UnknownPrim`] on miss.
+    /// 2. Require [`HostCapabilities::ffi`] → [`KernelError::HostCapabilityDenied`] if ungranted.
+    /// 3. Invoke the handler.
+    ///
+    /// All arguments must be repr values. `wild` is not a source-call/β boundary in the §4.0 metric
+    /// (a host op never recurses), so it charges no depth.
     fn wild_dispatch<'b>(&self, regs: &Regs<'e, 'b>, key: String, argv: Vec<L1Value>) -> Ctrl<'e> {
         let site = regs.site;
-        // `key` is `wild:<name>`; recover the bare op name for diagnostics.
+        // `key` is `wild:<name>`; recover the bare op name for registry lookup + diagnostics.
         let opname = key.strip_prefix("wild:").unwrap_or(&key);
         let vals: Result<Vec<&Value>, L1Error> = argv
             .iter()
@@ -1697,10 +1762,27 @@ impl<'e> Evaluator<'e> {
             .collect();
         Ctrl::Settle(match vals {
             Err(e) => Err(e),
-            Ok(vals) => match self.prims.get(&key) {
-                None => Err(L1Error::Kernel(KernelError::UnknownPrim(key.clone()))),
-                Some(f) => f(&key, &vals).map(L1Value::Repr).map_err(L1Error::from),
-            },
+            Ok(vals) => {
+                let Some(f) = self.host_ops.get(opname) else {
+                    return Ctrl::Settle(Err(L1Error::Kernel(KernelError::UnknownPrim(
+                        key.clone(),
+                    ))));
+                };
+                if !self.host_caps.ffi {
+                    return Ctrl::Settle(Err(L1Error::Kernel(
+                        KernelError::HostCapabilityDenied {
+                            op: opname.to_owned(),
+                            why: format!(
+                                "the `{FFI_EFFECT}` effect is not granted on this evaluator \
+                                 (runtime half of `@std-sys` + `!{{{FFI_EFFECT}}}`); pure/\
+                                 deterministic fragments cannot invoke host ops — use \
+                                 Evaluator::with_host_floor() to opt in"
+                            ),
+                        },
+                    )));
+                }
+                f(&key, &vals).map(L1Value::Repr).map_err(L1Error::from)
+            }
         })
     }
 
