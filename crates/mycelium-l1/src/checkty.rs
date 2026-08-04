@@ -6523,7 +6523,15 @@ impl Cx<'_> {
     ///    escape** — it is **not** recursively type-checked (it conforms to the expected type; it is
     ///    *audited*, not *verified* — VR-5/ADR-014). So a result type must be supplied by the context
     ///    (`expected`); in a synthesis position the checker refuses with "ascribe the `wild` block's
-    ///    result type" (never a guessed type — G2). The block then **has** that expected type.
+    ///    result type" (never a guessed type — G2). The block then **has** that expected type — by
+    ///    ASSUMPTION. S-WILD-DISCLOSURE-DOC: neither this check nor anything downstream of it ever
+    ///    verifies the ascribed/declared result type against what the host op actually returns at
+    ///    runtime (there is no host-op signature catalog to check it against today — only the prose
+    ///    table in `docs/planning/orchestration/surfaces/S-HOST-REGISTRY.md`). An ascribed `wild`
+    ///    block whose declared type does not match the host op's real return checks clean and runs
+    ///    clean **today, silently** — the mismatched value flows straight into ordinary code with no
+    ///    diagnostic anywhere. Closing that gap for real needs a machine-checkable registry
+    ///    (PKG-LINKAGE); this comment exists so that assumption is never mistaken for a guarantee.
     /// 3. **Effect source.** `wild` is the `ffi` effect source (M-660 binding): the enclosing fn must
     ///    declare `!{ffi}`. That is enforced separately, in the effect-coverage pass
     ///    ([`check_body_effect_coverage`]) — which credits a `wild` with performing `ffi` — so it
@@ -6551,8 +6559,10 @@ impl Cx<'_> {
                  `let v: Binary{8} = wild { … }`) — never a guess (G2).",
             );
         };
-        // `@std-sys` + a known expected type: the block *has* that type; the body is preserved
-        // verbatim (opaque). Effect coverage (`ffi`) is checked by the M-660 pass, not here.
+        // `@std-sys` + a known expected type: the block *has* that type — by ASSUMPTION, never
+        // verified against the host op's real return (see item 2 of this fn's doc comment,
+        // S-WILD-DISCLOSURE-DOC). The body is preserved verbatim (opaque). Effect coverage (`ffi`) is
+        // checked by the M-660 pass, not here.
         Ok((want.clone(), Expr::Wild(Box::new(body.clone()))))
     }
 
@@ -10444,6 +10454,80 @@ pub(crate) fn infer_type(
         stage3_sabotage_skip_substitution: false,
     };
     cx.infer(scope, e)
+}
+
+/// Re-infer an expression's type **against an expected type** (S-LET-REINFER) — the bidirectional
+/// twin of [`infer_type`], for the one re-inference call site that DOES have a surface annotation to
+/// honour (a `let`'s own `ty` ascription — RFC-0011). Identical `Cx` construction to `infer_type`
+/// (copied verbatim — do not let the two drift), but calls [`Cx::check`] with `Some(expected)`
+/// instead of [`Cx::infer`]'s forced synthesis (`None`), so a `wild` block (whose `check_wild` only
+/// accepts in checking mode — see [`Cx::check_wild`]) can re-infer successfully when the `let` that
+/// bound it carried its own type annotation, exactly as `check_ascribe` already lets it for the
+/// `(wild { … }) : T` parenthesized-ascription workaround (checkty.rs:6891-6898). Without this, a
+/// `let`'s annotation — already honoured by the checker — was silently discarded during
+/// re-inference, so a program `myc check` accepted then failed at `myc run` with an
+/// `ElabError::Residual` for a `wild` that has no synthesizable type.
+pub(crate) fn infer_type_against(
+    env: &Env,
+    scope: &mut Vec<(String, Ty)>,
+    e: &Expr,
+    expected: &Ty,
+) -> Result<Ty, CheckError> {
+    // Re-inference has no cross-nodule imports (the term is already checked and monomorphic; no
+    // glob-ambiguity can arise here — any ambiguity was refused during checking — M-662).
+    let no_imports = NoduleImports::default();
+    let cx = Cx {
+        site: "<elaborate>",
+        types: &env.types,
+        fns: &env.fns,
+        // The trait/instance registries are available for re-inference (a monomorphic body may
+        // call a trait method resolved through a concrete instance — RFC-0019 §4.5).
+        traits: &env.traits,
+        instances: &env.instances,
+        imports: &no_imports,
+        // M-1054: available for uniformity with the other Cx sites. Before Stage 1b, re-inference
+        // over an already-checked v0 term could never actually contain a sugar-rule call site
+        // (Stage 0 never accepted one). Since Stage 1b, `Cx::check_sugar_call` *does* accept a
+        // value-parametric sugar call, rebuilding it as an ordinary `App` node — so a checked term
+        // embedding one (e.g. as a `match` scrutinee re-inferred here, `elab.rs`'s `infer_type`
+        // call sites) reaches `check_app`'s same last-resort `lower_rules` branch again during
+        // re-inference. That is harmless/idempotent (the same accept, the same type, every time —
+        // no coercion exists to drift), not the "never reached" case this comment used to claim;
+        // corrected here rather than left stale (VR-5 — a comment is a claim too).
+        lower_rules: &env.lower_rules,
+        // Re-inference runs over already-checked, monomorphic terms (a generic *instantiation* is
+        // refused at elaboration before re-inference — RFC-0007 §11.3 staging), so no type
+        // parameters / bounds are in scope here.
+        tyvars: &[],
+        bounds: &[],
+        // Re-inference is **post-check**: the `@std-sys` gate (M-661) already passed during checking,
+        // and a `wild` block lowers to an explicit `Residual` in the elaborator *before* any interior
+        // re-inference, so `wild` never reaches here. Setting this `true` keeps re-inference honest
+        // (it would never spuriously refuse a `wild` that the program already validated) without
+        // re-litigating the gate — the gate is the checker's job, done once.
+        std_sys: true,
+        // DN-142 §3.2: re-inference runs over an **already-checked** term, so any `swap`'s
+        // `policy: ambient` was already resolved to a concrete catalog name by the original
+        // `check_fn_body`/`check_swap` pass (never a bare `["ambient"]` `Path` survives checking) —
+        // `check_swap`'s ambient-resolution branch is therefore unreachable here regardless of this
+        // value; `None` is honest, not a functional gap (mirrors the `std_sys: true` comment above:
+        // the gate already ran, this is not re-litigating it).
+        ambient_policy: None,
+        depth: Cell::new(0),
+        // Post-check re-inference over an already-validated term, invoked repeatedly over
+        // partial/overlapping fragments with a scope the elaborator threads itself — not the one
+        // whole-function-body walk, so the affine pass stays inert here (`crate::affine` docs: it
+        // would risk a false positive on a fragment that isn't the original walk, and the term
+        // already passed the real check).
+        affine: Tracker::inert(),
+        // DN-126: post-check re-inference over an already-CHECKED term — there is nothing left to
+        // demote (the program already strict-checked to get here), so always `Strict`.
+        strictness: crate::type_strictness::TypeStrictness::Strict,
+        flags: RefCell::new(Vec::new()),
+        #[cfg(test)]
+        stage3_sabotage_skip_substitution: false,
+    };
+    cx.check(scope, e, Some(expected)).map(|(ty, _)| ty)
 }
 
 /// **Test-only** twin of [`infer_type`] with an **active** affine tracker

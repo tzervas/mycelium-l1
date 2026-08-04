@@ -578,3 +578,133 @@ fn stage1_matched_call_expands_across_arities() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// S-LET-REINFER regression corpus (PKG-INTERP-CORRECTNESS gap b): an annotated `let` binding a
+// `wild` block used to elaborate to `ElabError::Residual` — even though the identical program
+// `myc check`ed clean — because `Expr::Let`'s elaboration arm discarded the surface annotation
+// and forced synthesis-mode re-inference, and `check_wild` refuses to synthesize (it has no
+// synthesizable type by design; only a `check`-mode `expected` type lets it through). These tests
+// pin `elaborate()` returning `Ok` for exactly that shape; a revert of the `Expr::Let` fix (or of
+// the new `infer_type_against`) must fail at least one of them.
+// ---------------------------------------------------------------------------------------------
+
+/// The exact reproduction from the measured defect (hub issue #45 / PKG-INTERP-CORRECTNESS):
+/// `let discard: Binary{64} = wild { time_mono_nanos() } in discard` inside a `!{ffi}` fn body.
+/// Before the fix this failed elaboration with
+/// `ElabError::Residual { what: "could not re-infer `let discard`'s type: ... a `wild` block has
+/// no synthesizable type ..." }` despite `check_nodule` (the `myc check` path) accepting the
+/// program outright.
+#[test]
+fn let_annotated_over_wild_elaborates_ok() {
+    let env = env("nodule proj @std-sys;\n\
+         fn main() => Binary{64} !{ffi} = \
+         let discard: Binary{64} = wild { time_mono_nanos() } in discard;");
+    let node = elaborate(&env, "main")
+        .expect("an annotated `let` over a `wild` block must elaborate (S-LET-REINFER)");
+    // The `let`'s body is just `discard` (a `Var` reference to the bound `wild:` op) and the bound
+    // expression itself must have lowered to the reserved `wild:` host-dispatch `Op` — not a
+    // `Residual` standing in for the whole thing.
+    let Node::Let { bound, body, .. } = &node else {
+        panic!("expected a Node::Let, got {node:?}");
+    };
+    assert!(
+        matches!(body.as_ref(), Node::Var(_)),
+        "the let body (`discard`) must lower to a bare variable reference, got {body:?}"
+    );
+    match bound.as_ref() {
+        Node::Op { prim, args } => {
+            assert_eq!(prim, "wild:time_mono_nanos");
+            assert!(args.is_empty());
+        }
+        other => panic!("expected the let-bound `wild` to lower to a `wild:` Op, got {other:?}"),
+    }
+}
+
+/// Same shape, declared type varied to a **different repr** (`Binary{8}` rather than the
+/// `Binary{64}` used above) — pins that the fix is a general re-inference fix, not accidentally
+/// special-cased to one width/repr.
+#[test]
+fn let_annotated_over_wild_elaborates_ok_binary8() {
+    let env = env("nodule proj @std-sys;\n\
+         fn main() => Binary{8} !{ffi} = \
+         let discard: Binary{8} = wild { time_mono_nanos() } in discard;");
+    elaborate(&env, "main").expect(
+        "an annotated `let` over a `wild` block must elaborate regardless of the declared repr \
+         (S-LET-REINFER is not Binary{64}-specific)",
+    );
+}
+
+/// Same shape again, declared type varied to a `Seq` — a structurally different repr family from
+/// any `Binary` width, to further rule out repr-specific special-casing.
+#[test]
+fn let_annotated_over_wild_elaborates_ok_seq() {
+    let env = env("nodule proj @std-sys;\n\
+         fn main() => Seq{Binary{8}, 4} !{ffi} = \
+         let discard: Seq{Binary{8}, 4} = wild { read_bytes4() } in discard;");
+    elaborate(&env, "main")
+        .expect("an annotated `let` over a `wild` block must elaborate for a `Seq` repr too");
+}
+
+/// A nested `let`-chain of depth >= 3 with `wild` blocks bound at more than one depth (here,
+/// depths 1 and 3 of the chain), each independently ascribed — proves the fix re-infers against
+/// each `let`'s own annotation at every depth of a chain, not just a single top-level `let`.
+#[test]
+fn nested_let_chain_with_wild_at_multiple_depths_elaborates_ok() {
+    let env = env("nodule proj @std-sys;\n\
+         fn main() => Binary{64} !{ffi} =\n\
+         \x20 let a: Binary{64} = wild { time_mono_nanos() } in\n\
+         \x20 let b: Binary{64} = a in\n\
+         \x20 let c: Binary{64} = wild { time_mono_nanos() } in\n\
+         \x20 c;");
+    elaborate(&env, "main").expect(
+        "a nested let-chain (depth >= 3) with `wild` blocks independently ascribed at more than \
+         one depth must elaborate",
+    );
+}
+
+/// **Regression guard**: the documented workaround — ascribing the `wild` block itself rather than
+/// the enclosing `let` (`let discard = (wild { … }) : T in discard`) — went through
+/// `check_ascribe`'s own, independent `expected` derivation (checkty.rs:6891-6898) even before
+/// this fix, and must keep working identically: this path does not touch `Expr::Let`'s `ty` field
+/// at all (`Expr::Ascribe` carries its own `TypeRef`, checked before `Expr::Let` ever sees a
+/// surface `ty` — here `None`, since the *outer* `let` itself is unannotated).
+#[test]
+fn ascribed_wild_workaround_still_elaborates() {
+    let env = env("nodule proj @std-sys;\n\
+         fn main() => Binary{64} !{ffi} = \
+         let discard = (wild { time_mono_nanos() }) : Binary{64} in discard;");
+    let node = elaborate(&env, "main")
+        .expect("the (wild {...}) : T ascription workaround must keep elaborating (regression)");
+    let Node::Let { bound, .. } = &node else {
+        panic!("expected a Node::Let, got {node:?}");
+    };
+    // `Expr::Ascribe` is transparent at L0 (the evaluator never reads the ascribed type — DN-126
+    // §3.1); the bound expression must still lower straight to the `wild:` Op, exactly as before
+    // this fix (the outer `let` here carries no annotation of its own, so it takes the unchanged
+    // `None` fallback branch, never `infer_type_against`).
+    match bound.as_ref() {
+        Node::Op { prim, args } => {
+            assert_eq!(prim, "wild:time_mono_nanos");
+            assert!(args.is_empty());
+        }
+        other => panic!("expected the ascribed `wild` to lower to a `wild:` Op, got {other:?}"),
+    }
+}
+
+/// **Regression guard**: an ordinary, *unannotated* `let` (the overwhelmingly common case) must
+/// still elaborate exactly as before — this pins that the `None` branch of the `Expr::Let` fix is
+/// the original, unmodified `infer_type` call, byte-for-byte (no accidental behavior change for
+/// every currently-passing unannotated-`let` program).
+#[test]
+fn unannotated_let_still_elaborates_and_runs() {
+    let env = env("nodule d;\nfn main() => Binary{8} = let x = 0b0010_1010 in x;");
+    let node = elaborate(&env, "main").expect("an unannotated let must elaborate, unaffected");
+    let v = mycelium_interp::Interpreter::default()
+        .eval(&node)
+        .expect("runs");
+    assert_eq!(
+        v.payload(),
+        &Payload::Bits(vec![false, false, true, false, true, false, true, false])
+    );
+}
