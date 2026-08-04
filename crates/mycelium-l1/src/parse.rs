@@ -194,6 +194,14 @@ impl Parser {
         self.cur() == t
     }
 
+    /// Lookahead `n` tokens past the cursor without consuming (FE-3 method-postfix-call
+    /// disambiguation). Clamped to the last token (mirrors `bump`'s own end-of-stream clamp),
+    /// so peeking past the end is safe and simply keeps returning the final token.
+    fn peek(&self, n: usize) -> &Tok {
+        let idx = (self.i + n).min(self.toks.len() - 1);
+        &self.toks[idx].tok
+    }
+
     fn bump(&mut self) -> Tok {
         let t = self.toks[self.i].tok.clone();
         if self.i + 1 < self.toks.len() {
@@ -1704,8 +1712,15 @@ impl Parser {
             Tok::LBrace => self.parse_ambient_repr().map(BaseType::Ambient),
             // M-826: `(T, U, …)` is a tuple type (arity ≥ 2); a single `(T)` is grouping.
             // A single-element parenthesized type `(T)` stays a bare type (grouping only).
+            // FE-2 (immediate-RParen lookahead): `()` is sugar for the `Unit` prelude type —
+            // parses to the SAME `BaseType::Named("Unit", [])` as hand-writing `Unit` (no new
+            // AST variant; `Unit` is already unconditionally prelude, checkty.rs's
+            // `PRELUDE_UNCONDITIONAL_TYPE_NAMES`).
             Tok::LParen => {
                 self.bump(); // consume `(`
+                if self.eat(&Tok::RParen) {
+                    return Ok(BaseType::Named("Unit".to_owned(), vec![]));
+                }
                 let first = self.parse_type_ref()?;
                 if self.eat(&Tok::Comma) {
                     let mut elems = vec![first];
@@ -2388,13 +2403,35 @@ impl Parser {
 
     fn parse_app(&mut self) -> Result<Expr, ParseError> {
         let mut e = self.parse_primary()?;
-        while self.eat(&Tok::LParen) {
-            let args = self.parse_args_opt()?;
-            self.expect(&Tok::RParen, "`)` to close the call")?;
-            e = Expr::App {
-                head: Box::new(e),
-                args,
-            };
+        loop {
+            if self.eat(&Tok::LParen) {
+                let args = self.parse_args_opt()?;
+                self.expect(&Tok::RParen, "`)` to close the call")?;
+                e = Expr::App {
+                    head: Box::new(e),
+                    args,
+                };
+            } else if self.at(&Tok::Dot)
+                && matches!(self.peek(1), Tok::Ident(_))
+                && matches!(self.peek(2), Tok::LParen)
+            {
+                // FE-3: `recv.name(args)` postfix-call sugar. Desugars, AT PARSE TIME, to
+                // EXACTLY the AST `name(recv, args...)` would produce by hand — no new AST
+                // node, so `mycelium-fmt` reprints this as prefix form (documented non-goal,
+                // not a bug: FE-3's surface freeze is explicitly lossy here).
+                self.bump(); // `.`
+                let name = self.ident()?;
+                self.expect(&Tok::LParen, "`(` to open the method-call argument list")?;
+                let mut call_args = vec![e];
+                call_args.extend(self.parse_args_opt()?);
+                self.expect(&Tok::RParen, "`)` to close the method call")?;
+                e = Expr::App {
+                    head: Box::new(Expr::Path(Path(vec![name]))),
+                    args: call_args,
+                };
+            } else {
+                break;
+            }
         }
         if self.eat(&Tok::Colon) {
             let ty = self.parse_type_ref()?;
@@ -2424,10 +2461,25 @@ impl Parser {
             | Tok::FloatLit(_)
             | Tok::Int(_)
             | Tok::LBracket => Ok(Expr::Lit(self.parse_literal()?)),
-            Tok::Ident(_) => Ok(Expr::Path(self.parse_path()?)),
+            // FE-3: expression-position identifiers use the call-aware path parser so a
+            // trailing `.name(` is left for `parse_app`'s postfix-call loop to desugar as
+            // `recv.name(args)` method-call sugar, instead of being swallowed into the `Path`.
+            Tok::Ident(_) => Ok(Expr::Path(self.parse_path_stop_before_call()?)),
+            // Statement-sequencing block: `{ a; b; …; e }` desugars to nested
+            // `let _ = a in let _ = b in … in e` (KC-3 — zero kernel growth; the nested-let
+            // target already evaluates end-to-end). `{ e }` is identity sugar for `e`.
+            // Empty `{}` and a trailing `;` with no following expression are explicit refusals:
+            // both would need a unit value, and `()` has no surface spelling yet (G2).
+            Tok::LBrace => self.parse_block(),
             Tok::LParen => {
                 // M-826: `(e, e2, …)` is a tuple literal (arity ≥ 2); `(e)` is grouping.
+                // FE-2 (immediate-RParen lookahead): `()` is sugar for the `Unit` prelude value —
+                // parses to the SAME `Expr::Path(Path(["Unit"]))` as hand-writing `Unit` (no new
+                // AST variant).
                 self.bump();
+                if self.eat(&Tok::RParen) {
+                    return Ok(Expr::Path(Path(vec!["Unit".to_owned()])));
+                }
                 let first = self.parse_expr()?;
                 if self.eat(&Tok::Comma) {
                     // At least two elements — a tuple literal.
@@ -2458,6 +2510,73 @@ impl Parser {
             }
             _ => self.err("an expression"),
         }
+    }
+
+    /// `{ stmt; …; expr }` — **statement-sequencing block** (surface sugar only; KC-3).
+    ///
+    /// Desugars **identically** to the already-admissible nested discard chain:
+    ///
+    /// ```text
+    /// { a; b; c }  ≡  let _ = a in let _ = b in c
+    /// { e }        ≡  e
+    /// ```
+    ///
+    /// No new AST node: the sugar leaves the same `Expr::Let { name: "_", ty: None, … }` spine
+    /// that `parse_let` builds for a hand-written `let _ = a in b`, so parse-AST identity is the
+    /// behaviour-neutrality proof (same shape as the `[…]` list-literal desugar).
+    ///
+    /// **Explicit refusals (never silent — G2):**
+    /// - empty `{}` — would need a unit value; `()` has no expression spelling yet
+    /// - trailing `;` before `}` (e.g. `{ a; }`) — same unit gap; the last component must be a
+    ///   value-producing expression, not a discarded statement
+    ///
+    /// `;` remains the *component separator inside a block only*. Outside braces it is still the
+    /// DN-57 item terminator (a bare `a; b` at fn-body position stays a stray top-level item).
+    fn parse_block(&mut self) -> Result<Expr, ParseError> {
+        self.expect(&Tok::LBrace, "`{` to open a block")?;
+        if self.at(&Tok::RBrace) {
+            return Err(ParseError::new(
+                self.pos(),
+                "an empty block `{}` has no value — this is a deliberate refusal, not a missing \
+                 unit spelling (FE-1's block form always requires a value-producing tail); write \
+                 `()` or the explicit `Unit` constructor as the block's sole/final expression \
+                 instead of leaving it empty"
+                    .to_owned(),
+            ));
+        }
+        // Collect discarded prefixes; the final expression (not followed by `;`) is the block value.
+        let mut discarded: Vec<Expr> = Vec::new();
+        let result = loop {
+            let e = self.parse_expr()?;
+            if self.eat(&Tok::Semi) {
+                if self.at(&Tok::RBrace) {
+                    return Err(ParseError::new(
+                        self.pos(),
+                        "a trailing `;` before `}` is a deliberate refusal, not a missing unit \
+                         spelling — omit the final `;` so the last expression is the block's \
+                         value, or end with an explicit `()` or `Unit` constructor"
+                            .to_owned(),
+                    ));
+                }
+                discarded.push(e);
+            } else {
+                break e;
+            }
+        };
+        self.expect(
+            &Tok::RBrace,
+            "`}` to close the block (or `;` and another statement)",
+        )?;
+        // Right-nested `let _ = s in …` so `{ a; b; c }` ≡ `let _ = a in let _ = b in c`.
+        Ok(discarded
+            .into_iter()
+            .rev()
+            .fold(result, |body, bound| Expr::Let {
+                name: "_".to_owned(),
+                ty: None,
+                bound: Box::new(bound),
+                body: Box::new(body),
+            }))
     }
 
     fn parse_literal(&mut self) -> Result<Literal, ParseError> {
@@ -2506,6 +2625,24 @@ impl Parser {
     fn parse_path(&mut self) -> Result<Path, ParseError> {
         let mut segs = vec![self.ident()?];
         while self.eat(&Tok::Dot) {
+            segs.push(self.ident()?);
+        }
+        Ok(Path(segs))
+    }
+
+    /// FE-3: identical to [`Self::parse_path`] except the `.Ident` chain stops the instant the
+    /// next segment is itself the head of a call (i.e. immediately followed by `(`) — that call
+    /// is left unconsumed for `parse_app`'s postfix-call loop to desugar as `recv.name(args)`
+    /// method-call sugar. Used ONLY from `parse_primary`'s `Tok::Ident` arm; every other
+    /// `parse_path()` call site (`use`, `nodule`, `phylum`, pattern parsing, `swap policy:`) is
+    /// untouched, so this cannot change their behaviour.
+    fn parse_path_stop_before_call(&mut self) -> Result<Path, ParseError> {
+        let mut segs = vec![self.ident()?];
+        while self.at(&Tok::Dot) {
+            if matches!(self.peek(1), Tok::Ident(_)) && matches!(self.peek(2), Tok::LParen) {
+                break;
+            }
+            self.bump(); // consume `.`
             segs.push(self.ident()?);
         }
         Ok(Path(segs))
