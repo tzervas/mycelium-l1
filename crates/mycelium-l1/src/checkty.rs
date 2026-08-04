@@ -17,6 +17,11 @@ use crate::ast::{
     Nodule, ObjectDecl, Paradigm, Param, Path, Pattern, Phylum, Scalar, Sparsity, Strength,
     TraitRef, TypeDecl, TypeParam, TypeRef, UsePath, WidthRef,
 };
+// PKG-LINKAGE (mycelium-lang#44) / S-PRIMSIG-SCHEMA: the checked prim-call signature vocabulary,
+// reused verbatim from `mycelium-interp` rather than re-derived (`mycelium_l1::Ty` is deliberately
+// NOT mirrored back upward into `mycelium-interp` — see `mycelium_interp::typed`'s own module doc
+// for why `TySpec` is its own vocabulary, not a re-export of this crate's `Ty`).
+use mycelium_interp::typed::{PrimSig, TySpec, WidthSpec};
 
 /// The checker's **explicit expression-nesting budget** (the "banked guard 4" discipline; A4-02).
 /// Type-checking recurses on the expression AST; rather than rely on the host call stack to bound
@@ -173,6 +178,28 @@ impl core::fmt::Display for Ty {
             Ty::Fn(a, r) if matches!(a.as_ref(), Ty::Fn(_, _)) => write!(f, "({a}) => {r}"),
             Ty::Fn(a, r) => write!(f, "{a} => {r}"),
         }
+    }
+}
+
+/// S-TYPED-PRIM-CALL-CHECK bridge: a registered [`PrimSig`]'s [`TySpec`] to this checker's own
+/// [`Ty`] vocabulary — STRUCTURAL, never coercive (a `TySpec` names a concrete monomorphic shape,
+/// so this is a total, lossless mapping, not an inference). Mirrors [`mycelium_interp::typed`]'s
+/// own scope note: `TySpec::Adt` resolves to a bare `Ty::Data(name, [])` — a `.myc`-nameable
+/// applied type, never a Rust-internal one (`Value`/`Repr`/`Box`/`ErrorOp`/`Emitted` are simply not
+/// expressible here, by construction of `TySpec`'s own variant set).
+fn ty_from_tyspec(spec: &TySpec) -> Ty {
+    match spec {
+        TySpec::Binary(WidthSpec(n)) => Ty::Binary(Width::Lit(*n)),
+        TySpec::Ternary(WidthSpec(n)) => Ty::Ternary(Width::Lit(*n)),
+        TySpec::Bytes => Ty::Bytes,
+        TySpec::Bool => Ty::Data("Bool".to_owned(), vec![]),
+        TySpec::Unit => Ty::Data("Unit".to_owned(), vec![]),
+        // `FloatWidth` is single-variant (F64-only) today, same as `Ty::Float`'s own posture
+        // (ADR-040 FLAG-1) — the width is carried by `TySpec` for forward-compatible mirror
+        // fidelity (see that variant's doc comment) but `Ty::Float` itself stays nullary.
+        TySpec::Float(_) => Ty::Float,
+        TySpec::Seq(elem, n) => Ty::Seq(Box::new(ty_from_tyspec(elem)), *n),
+        TySpec::Adt(name) => Ty::Data(name.clone(), vec![]),
     }
 }
 
@@ -800,6 +827,15 @@ pub struct Env {
     /// `via` clauses. **Guarantee: `Declared`** — recorded metadata, not a checked property (VR-5 —
     /// carried honestly, never upgraded).
     pub via_provenance: BTreeMap<(String, String), (u32, String)>,
+    /// **S-TYPED-PRIM-ENV (PKG-LINKAGE, mycelium-lang#44).** This nodule's resolved typed-prim
+    /// imports ([`NoduleImports::prim_fns`], carried verbatim — a typed prim has no "home nodule"
+    /// body to re-derive from, unlike `fns`/`types`/`traits`, so [`PhylumEnv::link`] simply unions
+    /// every nodule's copy rather than re-deriving from an `own` provenance list). Consulted by
+    /// re-inference ([`infer_type`]/[`infer_type_against`], which seed a synthetic
+    /// [`NoduleImports`] from this field) and by [`crate::elab::Elab::app`] to emit
+    /// `Node::Op{prim: "prim:<qualified>", ..}`. Empty for a phylum with no typed-prim `use`
+    /// (byte-identical to pre-PKG-LINKAGE behavior).
+    pub(crate) prim_fns: BTreeMap<String, PrimSig>,
 }
 
 impl Env {
@@ -1590,6 +1626,9 @@ impl PhylumEnv {
         let mut lower_rules: BTreeMap<String, LowerDecl> = BTreeMap::new();
         let mut derived_provenance: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
         let mut via_provenance: BTreeMap<(String, String), (u32, String)> = BTreeMap::new();
+        // S-TYPED-PRIM-ENV: unioned below (after the per-nodule loop), not inside it — a typed prim
+        // has no `own`-provenance entry to drive the merge (see this field's doc comment on `Env`).
+        let mut prim_fns: BTreeMap<String, PrimSig> = BTreeMap::new();
 
         // A cross-nodule collision on a simple name the flat namespace cannot represent (G2).
         let collide = |kind: &str, name: &str| {
@@ -1691,6 +1730,21 @@ impl PhylumEnv {
                     return Err(collide("via impl", &format!("{}:{}", k.0, k.1)));
                 }
             }
+            // S-TYPED-PRIM-ENV: union every nodule's resolved typed-prim imports by simple name.
+            // No `own`-provenance list drives this (a typed prim has no declaring nodule — see the
+            // field's doc comment on `Env`), so a collision refuses only when two nodules bind the
+            // SAME simple name to a genuinely DIFFERENT [`PrimSig`] (`PartialEq`-checked) — the same
+            // "identical fact is a no-op, a real conflict refuses" discipline the `Vec` prelude-type
+            // merge below already uses, never a silent first-wins.
+            for (name, sig) in &env.prim_fns {
+                match prim_fns.get(name) {
+                    None => {
+                        prim_fns.insert(name.clone(), sig.clone());
+                    }
+                    Some(existing) if existing == sig => {}
+                    Some(_) => return Err(collide("typed prim", name)),
+                }
+            }
         }
 
         // DN-138 §8 WU-2: merge each seeded PRIMITIVE-INSTANCE fact in ONCE, iff *some* nodule
@@ -1744,6 +1798,7 @@ impl PhylumEnv {
             lower_rules,
             derived_provenance,
             via_provenance,
+            prim_fns,
         })
     }
 }
@@ -1864,6 +1919,20 @@ pub(crate) struct NoduleImports {
     /// gives every intra-phylum type a qualified, unambiguous identity in that shared registry).
     pub(crate) cross_phylum_traits: BTreeSet<String>,
     pub(crate) cross_phylum_fns: BTreeSet<String>,
+    /// **S-TYPED-PRIM-ENV / S-TYPED-PRIM-CALL-CHECK (PKG-LINKAGE, mycelium-lang#44).** Typed-prim
+    /// imports resolved by [`resolve_imports`] against a [`TypedPrimEnv`] (a `use dep::a.b.fn;`
+    /// whose `dep` is registered in the `TypedPrimEnv` handed to
+    /// [`check_phylum_with_deps_and_prims`], rather than — or, refused as ambiguous, together with
+    /// — [`Phyla`]), keyed by this nodule's simple (bound) name. `Cx::check_app`'s
+    /// `App{head:Path([name])}` path consults this **after** `fns`/ctors (own decls and ordinary
+    /// imports always shadow a typed prim of the same simple name — RFC-0006 §4.3's existing
+    /// precedence, extended uniformly) to verify a call's arity and per-argument [`Ty`]
+    /// (`ty_from_tyspec`-bridged from the registered [`PrimSig`]) STRUCTURALLY, with no coercion,
+    /// before it elaborates to `Node::Op{prim: "prim:<qualified>", ..}` (`crate::elab`) — never
+    /// through `Expr::Wild`, never gated by `@std-sys`. Empty for a nodule with no typed-prim
+    /// `use` (byte-identical to pre-PKG-LINKAGE behavior — the `TypedPrimEnv::default()` regression
+    /// criterion).
+    pub(crate) prim_fns: BTreeMap<String, PrimSig>,
 }
 
 impl NoduleImports {
@@ -1961,7 +2030,12 @@ impl ResolvedPhylum {
         phylum: &Phylum,
         deps: &Phyla,
     ) -> Result<Self, CheckError> {
-        let (penv, exports) = check_phylum_matured_with_deps_and_exports(phylum, deps, false)?;
+        let (penv, exports) = check_phylum_matured_with_deps_and_exports(
+            phylum,
+            deps,
+            &TypedPrimEnv::default(),
+            false,
+        )?;
         let env = penv.link()?;
         Ok(Self {
             phylum_hash,
@@ -2013,6 +2087,60 @@ impl Phyla {
     #[must_use]
     pub fn deps(&self) -> &BTreeMap<String, ResolvedPhylum> {
         &self.deps
+    }
+}
+
+/// **S-TYPED-PRIM-ENV (PKG-LINKAGE, mycelium-lang#44 — FROZEN, mycelium-lang PR #49).** The typed,
+/// checked twin of [`Phyla`]: dep-local name → nodule-qualified path (within that dependency's own
+/// crate) → registered [`PrimSig`]. Where a [`Phyla`] entry resolves `use dep::a.b.Item` against an
+/// already-checked `.myc` [`ResolvedPhylum`], a `TypedPrimEnv` entry resolves it against a
+/// **Rust-registered** typed prim (`mycelium-std-io`, `mycelium-std-net`, …) — a second resolution
+/// target [`resolve_imports`] consults through the exact same `use` syntax, never a new import form.
+///
+/// `TypedPrimEnv::default()` is empty, so [`check_phylum_with_deps_and_prims`] with a default env is
+/// **byte-identical** to [`check_phylum_with_deps`] — the regression criterion this surface is
+/// pinned on (every existing cross-phylum `use` still resolves only against `Phyla`, exactly as
+/// before; a `dep` present in neither is the same "no such dependency" refusal as today, worded to
+/// additionally name the typed-prim door — see `resolve_imports`'s `Some(dep)` arm).
+#[derive(Debug, Clone, Default)]
+pub struct TypedPrimEnv {
+    /// dep-local name → (nodule-qualified path within that dependency → its [`PrimSig`]).
+    modules: BTreeMap<String, BTreeMap<String, PrimSig>>,
+}
+
+impl TypedPrimEnv {
+    /// An empty typed-prim dependency set — the additive-identity value every zero-typed-prim call
+    /// site uses, and what makes `TypedPrimEnv::default()` byte-identical to today's behavior.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Register one typed prim under `dep_local_name`, at the nodule-qualified `path` WITHIN that
+    /// dependency's own crate (e.g. `"serialize.to_json"` for `mycelium-std-io`'s
+    /// `serialize::to_json`) — the provider-facing constructor a `mycelium-cli` `install_typed_std`
+    /// call site (S-CLI-TYPED-PRIM-WIRING) uses to populate the checker's side of the single
+    /// install call the adversarial checklist requires (version-skew guard against
+    /// [`mycelium_interp::typed::TypedPrimRegistry`] drifting out of sync with this env).
+    pub fn register(&mut self, dep_local_name: &str, path: &str, sig: PrimSig) {
+        self.modules
+            .entry(dep_local_name.to_owned())
+            .or_default()
+            .insert(path.to_owned(), sig);
+    }
+
+    /// Is `dep_local_name` a registered typed-prim dependency? Mirrors [`Phyla::has_dep`] — used by
+    /// [`resolve_imports`] to decide whether a `use dep::…` resolves against this env, [`Phyla`],
+    /// both (refused as ambiguous), or neither (refused as an unknown dependency).
+    #[must_use]
+    pub(crate) fn has_dep(&self, dep_local_name: &str) -> bool {
+        self.modules.contains_key(dep_local_name)
+    }
+
+    /// Look up the registered [`PrimSig`] for `dep_local_name`'s nodule-qualified `path`, if any.
+    #[must_use]
+    pub(crate) fn get(&self, dep_local_name: &str, path: &str) -> Option<&PrimSig> {
+        self.modules.get(dep_local_name).and_then(|m| m.get(path))
     }
 }
 
@@ -2217,6 +2345,27 @@ pub fn check_phylum_with_deps(phylum: &Phylum, deps: &Phyla) -> Result<PhylumEnv
     check_phylum_matured_with_deps(phylum, deps, false)
 }
 
+/// **S-TYPED-PRIM-ENV (PKG-LINKAGE, mycelium-lang#44 — FROZEN, mycelium-lang PR #49).** Like
+/// [`check_phylum_with_deps`], but ALSO resolving cross-phylum-shaped `use dep::a.b.fn` references
+/// against a [`TypedPrimEnv`] (a second resolution target beside `deps`, decided by dep-local name —
+/// see [`resolve_imports`]'s `Some(dep)` arm) — **additive** over [`check_phylum_with_deps`]:
+/// [`TypedPrimEnv::default()`] here is **byte-identical** to [`check_phylum_with_deps`] (the
+/// regression criterion this surface is pinned on — see `typed_prim_default_is_byte_identical_to_
+/// check_phylum_with_deps` in `tests/typed_prim_import.rs`).
+///
+/// # Errors
+/// See [`check_phylum_with_deps`]; additionally a typed-prim call site failing arity/`Ty` structural
+/// verification against its registered [`mycelium_interp::typed::PrimSig`], or a `dep` registered in
+/// BOTH `deps` and `prims` (refused as ambiguous, never a silent preference), is an explicit
+/// [`CheckError`] (S-TYPED-PRIM-ENV / S-TYPED-PRIM-CALL-CHECK; never a silent skip — G2).
+pub fn check_phylum_with_deps_and_prims(
+    phylum: &Phylum,
+    deps: &Phyla,
+    prims: &TypedPrimEnv,
+) -> Result<PhylumEnv, CheckError> {
+    check_phylum_matured_with_deps_and_exports(phylum, deps, prims, false).map(|(penv, _)| penv)
+}
+
 /// [`check_phylum_with_deps`] with the explicit `matured_scope` gate (see [`check_phylum_matured`]).
 ///
 /// # Errors
@@ -2226,7 +2375,15 @@ pub fn check_phylum_matured_with_deps(
     deps: &Phyla,
     matured_scope: bool,
 ) -> Result<PhylumEnv, CheckError> {
-    check_phylum_matured_with_deps_and_exports(phylum, deps, matured_scope).map(|(penv, _)| penv)
+    // TypedPrimEnv::default() here is the regression-pinned identity (S-TYPED-PRIM-ENV) — this
+    // public, FROZEN entry point's own behavior is untouched by PKG-LINKAGE.
+    check_phylum_matured_with_deps_and_exports(
+        phylum,
+        deps,
+        &TypedPrimEnv::default(),
+        matured_scope,
+    )
+    .map(|(penv, _)| penv)
 }
 
 /// Like [`check_phylum_matured_with_deps`], but additionally returns the checked phylum's own
@@ -2235,11 +2392,16 @@ pub fn check_phylum_matured_with_deps(
 /// for a FURTHER consumer up the graph, not just its linked [`Env`]). One registration/check pass
 /// produces both artifacts (DRY — no second pass to keep them in sync).
 ///
+/// Widened (crate-internal, PKG-LINKAGE) to also take a [`TypedPrimEnv`] — every existing caller
+/// passes [`TypedPrimEnv::default()`] (byte-identical); only [`check_phylum_with_deps_and_prims`]
+/// passes a populated one.
+///
 /// # Errors
 /// See [`check_phylum_matured_with_deps`].
 pub(crate) fn check_phylum_matured_with_deps_and_exports(
     phylum: &Phylum,
     deps: &Phyla,
+    prims: &TypedPrimEnv,
     matured_scope: bool,
 ) -> Result<(PhylumEnv, Exports), CheckError> {
     // DN-126 (M-1077): the phylum-wide public surface stays `Strict`-only (byte-identical to
@@ -2249,6 +2411,7 @@ pub(crate) fn check_phylum_matured_with_deps_and_exports(
         check_phylum_inner(
             phylum,
             deps,
+            prims,
             matured_scope,
             crate::type_strictness::TypeStrictness::Strict,
         )
@@ -2259,6 +2422,7 @@ pub(crate) fn check_phylum_matured_with_deps_and_exports(
 fn check_phylum_inner(
     phylum: &Phylum,
     deps: &Phyla,
+    prims: &TypedPrimEnv,
     matured_scope: bool,
     strictness: crate::type_strictness::TypeStrictness,
 ) -> Result<(PhylumEnv, Exports, Vec<crate::type_strictness::TypeFlag>), CheckError> {
@@ -2500,7 +2664,7 @@ fn check_phylum_inner(
                 .cloned()
                 .collect(),
         });
-        let imports = resolve_imports(nodule, &exports, deps)?;
+        let imports = resolve_imports(nodule, &exports, deps, prims)?;
         // Pass this nodule's via_objects (objects with `via` decls) for Phase 0b expansion of
         // delegation impls (DN-53 M-811). The slice is empty for nodules with no `via` clauses.
         let via_objects = &via_objects_per_nodule[i];
@@ -2826,6 +2990,7 @@ pub(crate) fn resolve_imports(
     nodule: &Nodule,
     exports: &Exports,
     deps: &Phyla,
+    prims: &TypedPrimEnv,
 ) -> Result<NoduleImports, CheckError> {
     let site = qualify(&nodule.path, "<use>");
     let mut imp = NoduleImports::default();
@@ -2892,7 +3057,7 @@ pub(crate) fn resolve_imports(
     }
     // Explicit `use a.b.X` (higher precedence than any glob) — or a cross-phylum
     // `use dep::a.b.X` (DN-113 Rank 1 / M-1060; `phylum: Some(dep)`).
-    for item in &nodule.items {
+    'explicit: for item in &nodule.items {
         let Item::Use(UsePath {
             phylum,
             path,
@@ -2912,15 +3077,86 @@ pub(crate) fn resolve_imports(
         };
         let (qual, display_path) = match phylum {
             Some(dep) => {
+                // S-TYPED-PRIM-ENV (PKG-LINKAGE, mycelium-lang#44): a cross-phylum-shaped `use
+                // dep::…` now has TWO possible resolution targets — `deps` (an ordinary checked
+                // `.myc` phylum, DN-113) and `prims` (a Rust-registered typed-prim module,
+                // PKG-LINKAGE) — decided by dep-local name BEFORE either lookup runs, so the three
+                // never-silent outcomes (neither/ambiguous/exactly-one) are total and distinctly
+                // worded (adversarial checklist item: "if a dep name is registered in BOTH Phyla
+                // and TypedPrimEnv simultaneously, is it refused as ambiguous, never a silent
+                // preference for one, and is there a test for it?").
+                let in_phyla = deps.has_dep(dep);
+                let in_prims = prims.has_dep(dep);
+                if in_phyla && in_prims {
+                    return Err(CheckError::new(
+                        &site,
+                        format!(
+                            "`use {dep}::{}`: `{dep}` is registered as BOTH an ordinary phylum \
+                             dependency (`Phyla`) and a typed-prim module (`TypedPrimEnv`) — \
+                             ambiguous which door `use {dep}::…` resolves through; this is refused \
+                             rather than silently preferring one (S-TYPED-PRIM-ENV; never a silent \
+                             pick — G2). Register `{dep}` under only one of the two.",
+                            path.0.join(".")
+                        ),
+                    ));
+                }
+                if in_prims {
+                    // A typed-prim reference must be nodule-qualified WITHIN the provider crate
+                    // (`use dep::mod.fn`, never bare `use dep::fn`) — mirrors the ordinary
+                    // cross-phylum single-segment refusal below, one level up.
+                    if prefix.is_empty() {
+                        return Err(CheckError::new(
+                            &site,
+                            format!(
+                                "`use {dep}::{simple}`: a typed-prim import must be \
+                                 nodule-qualified within the dependency — `{simple}` names no \
+                                 module of `{dep}`. Write `use {dep}::<module>.{simple}` \
+                                 (S-TYPED-PRIM-ENV)"
+                            ),
+                        ));
+                    }
+                    let path_in_dep = format!("{prefix}.{simple}");
+                    let Some(sig) = prims.get(dep, &path_in_dep) else {
+                        return Err(CheckError::new(
+                            &site,
+                            format!(
+                                "`use {dep}::{}`: no such typed prim `{path_in_dep}` registered \
+                                 under dependency `{dep}` (S-TYPED-PRIM-ENV; distinct from an \
+                                 ordinary `.myc` \"no such name\" miss — never a silent skip, G2)",
+                                path.0.join(".")
+                            ),
+                        ));
+                    };
+                    // Duplicate explicit import of the same simple name (ambiguous local binding)
+                    // — mirrors the shared explicit-import dup check below, applied here too since
+                    // a typed-prim import never reaches that shared code path.
+                    if via_explicit.contains(&simple) {
+                        return Err(CheckError::new(
+                            &site,
+                            format!(
+                                "duplicate import of `{simple}` — two `use` declarations bind the \
+                                 same name; import it once (M-662; never a silent shadow — G2)"
+                            ),
+                        ));
+                    }
+                    via_explicit.insert(simple.clone());
+                    imp.ambiguous.remove(&simple);
+                    imp.prim_fns.insert(simple, sig.clone());
+                    continue 'explicit;
+                }
                 // DN-113 §9.5: an undeclared dependency is a never-silent, distinctly-worded refusal
                 // — never conflated with "no such name" (which would misdirect a fix at the wrong
-                // layer: the manifest's `[dependencies]`, not a typo'd item name).
-                if !deps.has_dep(dep) {
+                // layer: the manifest's `[dependencies]`, not a typo'd item name). Now also names
+                // the typed-prim door (S-TYPED-PRIM-ENV) so the message stays honest about BOTH
+                // places `dep` could have been registered.
+                if !in_phyla {
                     return Err(CheckError::new(
                         &site,
                         format!(
                             "`use {dep}::{}`: no such dependency `{dep}` in this phylum's \
-                             `[dependencies]` (DN-113 §9.5; never a silent skip — G2)",
+                             `[dependencies]`, and no such typed-prim module in its \
+                             `TypedPrimEnv` (DN-113 §9.5 / S-TYPED-PRIM-ENV; never a silent \
+                             skip — G2)",
                             path.0.join(".")
                         ),
                     ));
@@ -3172,8 +3408,13 @@ fn check_and_resolve_matured_inner(
     let phylum = Phylum::of_one(resolved.clone());
     // `check_nodule`/`check_nodule_matured` have no `[dependencies]` surface (M-1060 is a
     // phylum-level concept) — always the empty `Phyla` (byte-identical to pre-M-1060 behavior).
-    let (penv, _exports, flags) =
-        check_phylum_inner(&phylum, &Phyla::default(), matured_scope, strictness)?;
+    let (penv, _exports, flags) = check_phylum_inner(
+        &phylum,
+        &Phyla::default(),
+        &TypedPrimEnv::default(),
+        matured_scope,
+        strictness,
+    )?;
     let env = penv
         .single()
         .expect("a phylum-of-one yields exactly one Env")
@@ -3835,7 +4076,13 @@ fn check_nodule_with(
     // fn was already coverage-checked in its home nodule (M-662 — a `use`d fn is checked in its home
     // context, never re-litigated here). The merged `fns`/`traits` give the callee effect lookups.
     // Uses `effective_nodule` so via-generated impl methods' bodies are included in coverage check.
-    check_effect_coverage(&fns, &regs.fns, &traits, effective_nodule)?;
+    check_effect_coverage(
+        &fns,
+        &regs.fns,
+        &traits,
+        &imports.prim_fns,
+        effective_nodule,
+    )?;
 
     // Pass 3d: **guarantee grading** (RFC-0018 §4.3 stage-1a, Design A — guarantee: `Declared`). The
     // guarantee index `@ g` becomes a statically-enforced constraint over the integrity lattice
@@ -3881,6 +4128,11 @@ fn check_nodule_with(
             lower_rules,
             derived_provenance,
             via_provenance,
+            // S-TYPED-PRIM-ENV: carried verbatim from this nodule's resolved imports — a typed
+            // prim has no per-nodule "own" declaration to (re)register (unlike `fns`/`types`, it is
+            // never declared, only imported), so `imports.prim_fns` IS this nodule's whole
+            // contribution (empty for a nodule with no typed-prim `use` — the regression baseline).
+            prim_fns: imports.prim_fns.clone(),
         },
         nodule_flags,
     ))
@@ -4605,12 +4857,20 @@ fn check_effect_coverage(
     fns: &BTreeMap<String, FnDecl>,
     own_fns: &BTreeMap<String, FnDecl>,
     traits: &BTreeMap<String, TraitInfo>,
+    prim_fns: &BTreeMap<String, PrimSig>,
     nodule: &Nodule,
 ) -> Result<(), CheckError> {
     // Only this nodule's **own** fn bodies are coverage-checked (M-662); the callee effect lookups use
     // the merged `fns` (so an own fn calling an imported `pub` fn sees that callee's declared effects).
     for fd in own_fns.values() {
-        check_body_effect_coverage(fns, traits, &fd.sig.name, &fd.sig.effects, &fd.body)?;
+        check_body_effect_coverage(
+            fns,
+            traits,
+            prim_fns,
+            &fd.sig.name,
+            &fd.sig.effects,
+            &fd.body,
+        )?;
     }
     // `impl`-method bodies perform effects too (the RFC-0019 × RFC-0014 surface). Their declared set
     // equals the trait method's (conformance), so a body performing more than that is an undeclared
@@ -4618,7 +4878,14 @@ fn check_effect_coverage(
     for item in &nodule.items {
         if let Item::Impl(id) = item {
             for m in &id.methods {
-                check_body_effect_coverage(fns, traits, &m.sig.name, &m.sig.effects, &m.body)?;
+                check_body_effect_coverage(
+                    fns,
+                    traits,
+                    prim_fns,
+                    &m.sig.name,
+                    &m.sig.effects,
+                    &m.body,
+                )?;
             }
         }
     }
@@ -4627,32 +4894,42 @@ fn check_effect_coverage(
 
 /// What introduced a performed effect, for the coverage diagnostic. `Ord` so the `(effect, source)`
 /// set is deterministic (a stable first-miss). A **`Call`** is a top-level fn or trait-method call
-/// (M-660); **`Wild`** is the `wild` FFI floor (M-661 — `wild` performs `ffi`).
+/// (M-660); **`Wild`** is the `wild` FFI floor (M-661 — `wild` performs `ffi`); **`TypedPrim`** is a
+/// typed-prim call (S-TYPED-PRIM-CALL-CHECK, PKG-LINKAGE) — its `PrimSig.effects` are charged the
+/// same way a callee fn's declared effects are, never hardcoded to `"ffi"` the way `wild` is (a
+/// caller declaring the WRONG effect, e.g. `!{ffi}` for a prim whose signature says `!{net}`, is
+/// refused exactly like an undeclared effect — the effect name comes from the registered signature).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectSource {
     /// A call to a named callee (top-level fn or unqualified trait method) — M-660.
     Call(String),
     /// A `wild` block — the FFI floor; it performs the `ffi` effect (M-661).
     Wild,
+    /// A typed-prim call (S-TYPED-PRIM-CALL-CHECK) — names the imported simple name (mirrors
+    /// `Call`'s callee-naming, so the diagnostic reads the same way for either call form).
+    TypedPrim(String),
 }
 
 /// One body's effect coverage: `declared ⊇ performed`, where *performed* is the union of each
 /// callee's declared effects — a known top-level fn (`fns`), else an unqualified trait method
-/// (`traits`, by name) — **plus the `ffi` effect contributed by any `wild` block** (M-661). Owned-
-/// `String` sets keep lifetimes simple; the structural walk is shared with totality (one traversal,
-/// no bespoke depth-guarded recursion). Deterministic order ⇒ a stable first-miss diagnostic. The
-/// M-353 runtime budget ledger is a separate concern (not consulted here).
+/// (`traits`, by name), else a typed-prim call (`prim_fns`, by name — S-TYPED-PRIM-CALL-CHECK) —
+/// **plus the `ffi` effect contributed by any `wild` block** (M-661). Owned-`String` sets keep
+/// lifetimes simple; the structural walk is shared with totality (one traversal, no bespoke
+/// depth-guarded recursion). Deterministic order ⇒ a stable first-miss diagnostic. The M-353 runtime
+/// budget ledger is a separate concern (not consulted here).
 fn check_body_effect_coverage(
     fns: &BTreeMap<String, FnDecl>,
     traits: &BTreeMap<String, TraitInfo>,
+    prim_fns: &BTreeMap<String, PrimSig>,
     name: &str,
     declared_effs: &[String],
     body: &Expr,
 ) -> Result<(), CheckError> {
     let declared: std::collections::BTreeSet<String> = declared_effs.iter().cloned().collect();
     // Each performed effect is recorded with its **source** so the diagnostic can name it: a
-    // `Source::Call(callee)` (a top-level fn or trait-method call — M-660) or the `Source::Wild`
-    // FFI floor (M-661). The set is `(effect, source)` for a deterministic, de-duplicated first-miss.
+    // `Source::Call(callee)` (a top-level fn or trait-method call — M-660), the `Source::Wild` FFI
+    // floor (M-661), or a `Source::TypedPrim(callee)` (S-TYPED-PRIM-CALL-CHECK). The set is
+    // `(effect, source)` for a deterministic, de-duplicated first-miss.
     let mut performed: std::collections::BTreeSet<(String, EffectSource)> =
         std::collections::BTreeSet::new();
     crate::totality::walk_expr(body, &mut |x| {
@@ -4665,9 +4942,20 @@ fn check_body_effect_coverage(
                             for eff in &g.sig.effects {
                                 performed.insert((eff.clone(), EffectSource::Call(callee.clone())));
                             }
+                        } else if let Some(sig) = prim_fns.get(callee) {
+                            // S-TYPED-PRIM-CALL-CHECK: charge the registered `PrimSig.effects` —
+                            // taken from the signature, never hardcoded (unlike `wild`'s blanket
+                            // `"ffi"`) — so a 0-effect typed prim (e.g. `to_json`) needs no `!{}`
+                            // annotation at all, and an effectful one (e.g. `http_request`,
+                            // `effects:["net"]`) is charged exactly its own declared effect name.
+                            for eff in &sig.effects {
+                                performed
+                                    .insert((eff.clone(), EffectSource::TypedPrim(callee.clone())));
+                            }
                         } else {
-                            // Not a top-level fn ⇒ an unqualified trait-method call: it performs the
-                            // declaring trait method's declared effects (the contract).
+                            // Not a top-level fn or typed prim ⇒ an unqualified trait-method call:
+                            // it performs the declaring trait method's declared effects (the
+                            // contract).
                             for tr in traits.values() {
                                 for s in &tr.sigs {
                                     if &s.name == callee {
@@ -4702,6 +4990,9 @@ fn check_body_effect_coverage(
             let via = match source {
                 EffectSource::Call(callee) => format!("via calling `{callee}`"),
                 EffectSource::Wild => "via a `wild` block (the FFI floor — M-661)".to_owned(),
+                EffectSource::TypedPrim(callee) => {
+                    format!("via calling typed prim `{callee}` (S-TYPED-PRIM-CALL-CHECK)")
+                }
             };
             return Err(CheckError::new(
                 name,
@@ -7110,6 +7401,49 @@ impl Cx<'_> {
             let fields = d.ctors[i].fields.clone();
             return self
                 .check_app_generic_ctor(scope, head, name, dname, params, fields, args, expected);
+        }
+
+        // S-TYPED-PRIM-CALL-CHECK (PKG-LINKAGE, mycelium-lang#44 — FROZEN, mycelium-lang PR #49):
+        // a typed-prim import (`use dep::mod.fn;`, resolved by `resolve_imports` against a
+        // `TypedPrimEnv` into `self.imports.prim_fns`) is verified STRUCTURALLY — arity, then each
+        // argument's `Ty` (bridged from the registered `PrimSig`'s `TySpec` — `ty_from_tyspec`) —
+        // with NO coercion, exactly like an ordinary fn call's parameter check above, before
+        // elaborating to an ordinary `App` (`crate::elab::Elab::app` recognizes `self.env.prim_fns`
+        // and lowers it to `Node::Op{prim: "prim:<qualified>", ..}` — never through `Expr::Wild`,
+        // never gated by `@std-sys`; this branch itself never touches `self.std_sys`). Checked
+        // AFTER `fns`/ctors (own decls and ordinary imports always shadow a typed prim of the same
+        // simple name — RFC-0006 §4.3's existing precedence, extended uniformly here) and BEFORE
+        // the trait-method / builtin-prim fallbacks (a typed prim's simple name is user-chosen at
+        // the `use` site, not a reserved kernel name, so it is checked as soon as the "is this a
+        // real declared thing" question can be answered).
+        if let Some(sig) = self.imports.prim_fns.get(name) {
+            if sig.params.len() != args.len() {
+                return self.err(format!(
+                    "`{name}` (typed prim `{}`) takes {} argument(s), got {} \
+                     (S-TYPED-PRIM-CALL-CHECK: arity is verified structurally against the \
+                     registered signature, never on faith like a `wild` ascription)",
+                    sig.name,
+                    sig.params.len(),
+                    args.len()
+                ));
+            }
+            let mut rebuilt = Vec::with_capacity(args.len());
+            for (i, (want_spec, a)) in sig.params.iter().zip(args).enumerate() {
+                let want = ty_from_tyspec(want_spec);
+                let (got, a2) = self.check(scope, a, Some(&want))?;
+                if got != want {
+                    return self.err(format!(
+                        "`{name}` (typed prim `{}`) argument {}: {} (S-TYPED-PRIM-CALL-CHECK: \
+                         structural match against the registered signature, no coercion)",
+                        sig.name,
+                        i + 1,
+                        edge_mismatch("argument", &want, &got)
+                    ));
+                }
+                rebuilt.push(a2);
+            }
+            let ret = ty_from_tyspec(&sig.ret);
+            return Ok((ret, app_node(head, rebuilt)));
         }
 
         // Unqualified **trait-method** call (RFC-0019 §4.4; RFC-0007 §12.1): if `name` is not a
@@ -10400,8 +10734,16 @@ pub(crate) fn infer_type(
     e: &Expr,
 ) -> Result<Ty, CheckError> {
     // Re-inference has no cross-nodule imports (the term is already checked and monomorphic; no
-    // glob-ambiguity can arise here — any ambiguity was refused during checking — M-662).
-    let no_imports = NoduleImports::default();
+    // glob-ambiguity can arise here — any ambiguity was refused during checking — M-662). It DOES
+    // need typed-prim signatures (S-TYPED-PRIM-CALL-CHECK): a typed-prim call site re-inferred here
+    // (a `let`-bound result, a `match` scrutinee, …) must resolve through `Cx::check_app`'s
+    // `imports.prim_fns` branch exactly as the original check did — seeded from the checked `env`
+    // (which carries every nodule's resolved typed-prim imports, unioned by `PhylumEnv::link`),
+    // never from a per-nodule import context that no longer exists post-link.
+    let no_imports = NoduleImports {
+        prim_fns: env.prim_fns.clone(),
+        ..NoduleImports::default()
+    };
     let cx = Cx {
         site: "<elaborate>",
         types: &env.types,
@@ -10474,8 +10816,16 @@ pub(crate) fn infer_type_against(
     expected: &Ty,
 ) -> Result<Ty, CheckError> {
     // Re-inference has no cross-nodule imports (the term is already checked and monomorphic; no
-    // glob-ambiguity can arise here — any ambiguity was refused during checking — M-662).
-    let no_imports = NoduleImports::default();
+    // glob-ambiguity can arise here — any ambiguity was refused during checking — M-662). It DOES
+    // need typed-prim signatures (S-TYPED-PRIM-CALL-CHECK): a typed-prim call site re-inferred here
+    // (a `let`-bound result, a `match` scrutinee, …) must resolve through `Cx::check_app`'s
+    // `imports.prim_fns` branch exactly as the original check did — seeded from the checked `env`
+    // (which carries every nodule's resolved typed-prim imports, unioned by `PhylumEnv::link`),
+    // never from a per-nodule import context that no longer exists post-link.
+    let no_imports = NoduleImports {
+        prim_fns: env.prim_fns.clone(),
+        ..NoduleImports::default()
+    };
     let cx = Cx {
         site: "<elaborate>",
         types: &env.types,

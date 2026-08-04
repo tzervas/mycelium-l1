@@ -144,8 +144,8 @@ pub use ambient::{
 pub use ast::{Nodule, Phylum, UsePath, Vis};
 pub use checkty::{
     check_and_resolve, check_nodule, check_nodule_matured, check_phylum, check_phylum_matured,
-    check_phylum_matured_with_deps, check_phylum_with_deps, CheckError, Env, Phyla, PhylumEnv,
-    ResolvedPhylum, Ty,
+    check_phylum_matured_with_deps, check_phylum_with_deps, check_phylum_with_deps_and_prims,
+    CheckError, Env, Phyla, PhylumEnv, ResolvedPhylum, Ty, TypedPrimEnv,
 };
 pub use elab::{
     elaborate, elaborate_colony, elaborate_direct, elaborate_lower_rule,

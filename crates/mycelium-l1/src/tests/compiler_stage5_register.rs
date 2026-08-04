@@ -37,7 +37,7 @@ use crate::checkty::{
     collect_tuple_arities, first_duplicate, prelude, register_instances, register_nodule_decls,
     register_traits, register_types, resolve_ctors, resolve_imports, type_head, CoherenceView,
     CtorInfo, DataInfo, Exports, InstanceInfo, NoduleImports, NoduleRegs, Phyla, TraitInfo, Ty,
-    Width,
+    TypedPrimEnv, Width,
 };
 use crate::eval::L1Value;
 use crate::tests::marshal_support::*;
@@ -2664,6 +2664,9 @@ fn decode_nodule_imports(v: &L1Value) -> NoduleImports {
         // decoded value's cross-phylum sets are always empty.
         cross_phylum_traits: std::collections::BTreeSet::new(),
         cross_phylum_fns: std::collections::BTreeSet::new(),
+        // S-TYPED-PRIM-ENV (PKG-LINKAGE): same flagged residual — the `.myc` mirror predates
+        // PKG-LINKAGE entirely, so it carries no typed-prim marker at all.
+        prim_fns: BTreeMap::new(),
     }
 }
 
@@ -2732,8 +2735,11 @@ impl ExportsBuilder {
 fn run_resolve_imports_case(label: &str, nod: &Nodule, exports: &Exports) {
     // M-1060: this differential exercises intra-phylum resolution only (its self-hosted `.myc`
     // mirror predates cross-phylum `use`); the empty `Phyla` makes `resolve_imports` behave
-    // byte-identically to its pre-M-1060 signature.
-    let want = resolve_imports(nod, exports, &Phyla::default()).map_err(|_| ());
+    // byte-identically to its pre-M-1060 signature. PKG-LINKAGE: `TypedPrimEnv::default()` is the
+    // same additive-identity for the `.myc` mirror's still-3-arg call below (self-hosting-transpile
+    // extension is out of this package's scope — see PKG-LINKAGE's non-goals).
+    let want =
+        resolve_imports(nod, exports, &Phyla::default(), &TypedPrimEnv::default()).map_err(|_| ());
     assert_l1_marshal(
         label,
         &format!(

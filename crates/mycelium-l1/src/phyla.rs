@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use crate::ast::Phylum;
 use crate::checkty::{
     check_phylum_matured_with_deps_and_exports, CheckError, Phyla, PhylumEnv, ResolvedPhylum,
+    TypedPrimEnv,
 };
 use mycelium_core::ContentHash;
 
@@ -88,7 +89,15 @@ pub fn build_phyla_graph(
         }
         let phyla = Phyla::from_deps(deps);
         let (penv, exports) =
-            check_phylum_matured_with_deps_and_exports(&node.phylum, &phyla, false)?;
+            // Out of PKG-LINKAGE's scope (this package's non-goals: does not wire typed-prim
+            // resolution into the multi-phylum graph builder) — TypedPrimEnv::default() keeps this
+            // byte-identical to pre-PKG-LINKAGE behavior.
+            check_phylum_matured_with_deps_and_exports(
+                &node.phylum,
+                &phyla,
+                &TypedPrimEnv::default(),
+                false,
+            )?;
         let env = penv.link()?;
         linked.insert(
             key.clone(),
