@@ -2464,6 +2464,27 @@ impl Elab<'_> {
             });
         }
 
+        // S-TYPED-PRIM-CALL-CHECK (PKG-LINKAGE, mycelium-lang#44 — FROZEN, mycelium-lang PR #49):
+        // a checked typed-prim call site (`Cx::check_app`'s `imports.prim_fns` branch, checkty.rs)
+        // lowers here to `Node::Op{prim: "prim:<qualified>", ..}` — parallel to `elab_wild`'s
+        // documented `Node::Op{prim: "wild:name", ..}` convention, but reached through the ORDINARY
+        // checked-App path (never through `Expr::Wild`, so never through `elab_wild`'s
+        // trusted/opaque, unchecked-body escape) and dispatched under the disjoint
+        // `mycelium_interp::typed::PRIM_PREFIX` namespace, never `crate::host::WILD_PREFIX`. Tried
+        // after the ctor/kernel-prim checks above (mirroring `Cx::check_app`'s own precedence: own
+        // decls/ctors/kernel-prims never reach this branch) so a real declared name is never
+        // shadowed by an imported typed prim of the same simple name.
+        if let Some(sig) = self.env.prim_fns.get(name) {
+            let mut kargs = Vec::with_capacity(args.len());
+            for a in args {
+                kargs.push(self.expr(stack, scope, a)?);
+            }
+            return Ok(Node::Op {
+                prim: format!("{}{}", mycelium_interp::typed::PRIM_PREFIX, sig.name),
+                args: kargs,
+            });
+        }
+
         // An **unqualified trait-method call** (RFC-0019 §4.4) type-checks (the checker resolved the
         // instance / bound), but its L0 lowering is **dictionary-passing**, staged identically to a
         // generic instantiation — RFC-0007 §12.3. Refuse with an explicit `Residual` (never a silent

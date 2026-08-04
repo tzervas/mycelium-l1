@@ -232,6 +232,9 @@ fn check_laws_over_domain(
         // added `via_provenance` similarly — the scratch env has no `via` delegation either.
         derived_provenance: BTreeMap::new(),
         via_provenance: BTreeMap::new(),
+        // S-TYPED-PRIM-ENV (PKG-LINKAGE): this law-probe scratch env has no typed-prim imports
+        // (mirrors the `lower_rules`/`via_provenance` empties above).
+        prim_fns: BTreeMap::new(),
     };
     let evaluator = Evaluator::new(&scratch);
     let site = format!("impl Fuse[{for_ty}] for {for_ty}");

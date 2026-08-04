@@ -443,6 +443,8 @@ fn an_ungranted_wild_host_op_is_an_explicit_refusal() {
         lower_rules: std::collections::BTreeMap::new(),
         derived_provenance: std::collections::BTreeMap::new(),
         via_provenance: std::collections::BTreeMap::new(),
+        // S-TYPED-PRIM-ENV (PKG-LINKAGE): this hand-built env has no typed-prim imports.
+        prim_fns: std::collections::BTreeMap::new(),
     };
     let err = Evaluator::new(&env).call("main", vec![]).unwrap_err();
     assert!(

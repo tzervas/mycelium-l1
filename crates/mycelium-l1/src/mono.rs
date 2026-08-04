@@ -604,6 +604,13 @@ impl<'e> Mono<'e> {
             lower_rules: BTreeMap::new(),
             derived_provenance: BTreeMap::new(),
             via_provenance: BTreeMap::new(),
+            // S-TYPED-PRIM-ENV (PKG-LINKAGE): a typed prim has no type parameters to specialize
+            // (`PrimSig` is already monomorphic — RFC-0028's own v0 scope note), so it carries
+            // through VERBATIM, unlike `types`/`fns` (which are the mangled/specialized forms) —
+            // required so `crate::elab::Elab::app`'s `self.env.prim_fns` lookup (which runs over
+            // THIS specialized env, not `self.src`) can still resolve a typed-prim call site after
+            // `monomorphize` runs (every real `elaborate()` call goes through this pass first).
+            prim_fns: self.src.prim_fns.clone(),
         };
         Ok((
             env,
