@@ -40,8 +40,8 @@ use mycelium_core::{
 
 use crate::ast::{Arm, BaseType, Expr, Literal, Path, Scalar, Sparsity, TypeRef, WidthRef};
 use crate::checkty::{
-    infer_type, lookup_data_home_checked, normalize_pattern, prim_kernel_name, resolve_ty,
-    DataInfo, Env, Ty,
+    infer_type, infer_type_against, lookup_data_home_checked, normalize_pattern, prim_kernel_name,
+    resolve_ty, DataInfo, Env, Ty,
 };
 use crate::decision::{self, Head, Tree};
 
@@ -1798,7 +1798,7 @@ impl Elab<'_> {
             }
             Expr::Let {
                 name,
-                ty: _,
+                ty,
                 bound,
                 body,
             } => {
@@ -1806,13 +1806,39 @@ impl Elab<'_> {
                 // form) — see [`elab_prelude`]. The type part is handled by re-inference below.
                 let kbound = self.expr(stack, scope, bound)?;
                 // The bound's type (re-inferred) goes into scope so a later `match` on this binding
-                // can lower its patterns.
-                let bty = infer_type(self.env, &mut Self::ty_scope(scope), bound).map_err(|e| {
-                    ElabError::Residual {
-                        site: site.to_owned(),
-                        what: format!("could not re-infer `let {name}`'s type: {e}"),
+                // can lower its patterns. S-LET-REINFER: when the surface `let` itself carried a type
+                // annotation, re-infer AGAINST it (bidirectional `Cx::check`, same as
+                // `check_ascribe`'s independent path — checkty.rs:6891-6898) instead of discarding it
+                // and forcing synthesis mode — synthesis is exactly what `check_wild` refuses (a
+                // `wild` block has no synthesizable type), so a checked, annotated
+                // `let v: T = wild { … } in …` used to fail here at elaboration time even though
+                // `myc check` had already accepted it. No annotation: unchanged synthesis fallback.
+                let bty = match ty {
+                    Some(t) => {
+                        let (want, _) =
+                            resolve_ty(site, &self.env.types, &[], t).map_err(|e| {
+                                ElabError::Residual {
+                                    site: site.to_owned(),
+                                    what: format!(
+                                        "could not resolve `let {name}`'s annotated type: {e}"
+                                    ),
+                                }
+                            })?;
+                        infer_type_against(self.env, &mut Self::ty_scope(scope), bound, &want)
+                            .map_err(|e| ElabError::Residual {
+                                site: site.to_owned(),
+                                what: format!("could not re-infer `let {name}`'s type: {e}"),
+                            })?
                     }
-                })?;
+                    None => {
+                        infer_type(self.env, &mut Self::ty_scope(scope), bound).map_err(|e| {
+                            ElabError::Residual {
+                                site: site.to_owned(),
+                                what: format!("could not re-infer `let {name}`'s type: {e}"),
+                            }
+                        })?
+                    }
+                };
                 let kvar = self.fresh(name);
                 let mut inner = scope.to_vec();
                 inner.push((name.clone(), kvar.clone(), bty));
