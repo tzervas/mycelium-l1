@@ -255,6 +255,9 @@ base_type      ::= 'Binary'  '{' Int '}'
                  | '(' type_ref ',' type_ref (',' type_ref)* ')'  /* tuple/product type (M-826, arity >= 2);
                                                                    * desugars to a synthetic single-ctor data
                                                                    * type (KC-3 — no new L0 node) */
+                 | '(' ')'                                    /* FE-2: `Unit` sugar — parses to the SAME
+                                                               * `BaseType::Named("Unit", [])` as writing
+                                                               * `Unit` by hand (KC-3 — no new AST variant) */
                  | Ident type_args?                           /* named type or type variable */
                  | '{' ambient_params '}'                     /* paradigm-less repr (RFC-0012 §4.2) */
 /* A paradigm-less repr writes the size/shape only; the enclosing ambient supplies the paradigm.
@@ -368,9 +371,12 @@ block          ::= '{' expr '}'
 /* Statement-sequencing block (surface sugar; KC-3). Desugars to nested discard lets:
  *   { a; b; c }  ≡  let _ = a in let _ = b in c
  *   { e }        ≡  e
- * Empty `{}` and a trailing `;` before `}` are explicit parse refusals (both would need a unit
- * value; `()` has no surface spelling yet). Outside braces, `;` remains the DN-57 item terminator
- * — a bare `a; b` at fn-body position is still a stray top-level item, not sequencing. */
+ * Empty `{}` and a trailing `;` before `}` are explicit parse refusals — a deliberate design
+ * choice (a block always needs a value-producing tail), NOT a missing unit spelling: `()` DOES
+ * have a surface spelling (FE-2, see `primary` above); write it (or `Unit`) explicitly as the
+ * block's sole/final expression instead of leaving the block empty or trailing-`;`. Outside
+ * braces, `;` remains the DN-57 item terminator — a bare `a; b` at fn-body position is still a
+ * stray top-level item, not sequencing. */
 block_expr     ::= '{' expr (';' expr)* '}'
 
 /* Operator-expression layer (RFC-0025 / M-705). Symbolic infix/prefix operators are FRONTEND-ONLY
@@ -407,15 +413,30 @@ mul_expr       ::= unary_expr (('*' | '/' | '%') unary_expr)*
 unary_expr     ::= ('-' | '!') unary_expr
                  | app_expr
 
-/* Application / primary. Calls and atoms; ascription binds loosest. */
-app_expr       ::= primary ('(' args? ')')* (':' type_ref)?
+/* Application / primary. Calls and atoms; ascription binds loosest.
+ * FE-3 (method-postfix-call sugar): after each `(' args? ')' call/`.name(args)' method-call step,
+ * the loop may continue — `recv.name(args)` desugars, AT PARSE TIME, to EXACTLY `name(recv, args...)`
+ * (KC-3 — no new AST node), so it chains identically to ordinary nested calls
+ * (`a.b().c()` ≡ `c(b(a))`). The `.name(` step is only recognized with `(` immediately following
+ * the `Ident` — a non-call `.name` stays part of `path` below, unaffected. */
+app_expr       ::= primary (call_step | method_step)* (':' type_ref)?
+call_step      ::= '(' args? ')'
+method_step    ::= '.' Ident '(' args? ')'                  /* FE-3; desugars to `Ident(<lhs>, args...)` */
 args           ::= expr (',' expr)*
 primary        ::= literal
                  | path
                  | '(' expr ',' expr (',' expr)* ')'  /* tuple literal (M-826, arity >= 2); the comma
                                                         * distinguishes it from the grouping form below */
+                 | '(' ')'                             /* FE-2: `Unit` sugar — parses to the SAME
+                                                        * `Expr::Path(Path(["Unit"]))` as writing `Unit`
+                                                        * by hand (KC-3 — no new AST variant) */
                  | '(' expr ')'
 
+/* `path` is used from every OTHER call site unchanged (`use`, `nodule`/`phylum` headers, pattern
+ * parsing, `swap policy:`) — FE-3's call-aware stop rule lives ONLY in the `primary` production
+ * above (via a separate parser function, `parse_path_stop_before_call`), so a non-call dotted
+ * chain like `d.g` still parses here to the same 2-segment `path` it always has (and is still
+ * refused at check time — the pre-existing, unconditional M-662 multi-segment-path refusal). */
 path           ::= Ident ('.' Ident)*
 
 /* Literals — representation-typed, universal-until-elaboration. A tagged literal (BinLit/TritLit)

@@ -9,11 +9,14 @@
 //!    to `Node::Construct { args: [] }`. Nothing in the IR is missing.
 //! 2. The **block surface is landed**: `{ a; b }` is a primary expression that desugars **identically**
 //!    (parse-AST equality) to `let _ = a in b`. Empty `{}` and trailing-`;` blocks still refuse
-//!    explicitly (they would need a unit value; `()` has no surface spelling yet).
+//!    explicitly — a deliberate FE-1 design choice (a block always needs a value-producing tail),
+//!    not a missing unit spelling: `()` now HAS a surface spelling (FE-2, `tests/unit_paren_sugar.rs`),
+//!    but the empty-block/trailing-`;` refusals were not widened to auto-desugar to it.
 //! 3. The remaining refusals pin honesty guarantees that must not regress:
 //!    - bare `a; b` at fn-body position (no braces) is still a stray top-level item (DN-57);
-//!    - `let y = e;` without `in` is still refused at the missing `in`;
-//!    - `()` has no expression or type spelling.
+//!    - `let y = e;` without `in` is still refused at the missing `in`.
+//!
+//! `()` expression/type-spelling coverage moved to `tests/unit_paren_sugar.rs` once FE-2 landed.
 //!
 //! Guarantee: `Empirical` (every claim here is an executed assertion, not a reading of the code).
 
@@ -108,29 +111,23 @@ fn a_statement_let_without_in_is_refused_at_the_missing_in() {
     assert!(msg.contains("found Semi"), "unexpected refusal: {msg}");
 }
 
-/// **Refusal site D(expr)** — `parse_primary`'s `Tok::LParen` arm reaches `parse_expr` on the
-/// immediately-following `)`. `()` has no expression spelling, even though the `Unit` *value*
-/// exists (see [`the_desugar_target_already_works_end_to_end`]). The arm carries the standing FLAG:
-/// "unit `()` and 1-tuples are deferred surface decisions" (M-826).
+/// **Superseded refusal site D(expr)** — before FE-2, `parse_primary`'s `Tok::LParen` arm reached
+/// `parse_expr` on the immediately-following `)` and refused ("expected an expression, found
+/// RParen"). FE-2 gives `()` a surface spelling, so this now pins the POSITIVE outcome instead of
+/// the refusal; full AST-identity + end-to-end coverage lives in `tests/unit_paren_sugar.rs`.
 #[test]
-fn unit_has_no_expression_spelling() {
-    let msg = parse_err(&format!("{PRE}fn f() => Unit = ();\n"));
-    assert!(
-        msg.contains("expected an expression") && msg.contains("found RParen"),
-        "unexpected refusal: {msg}"
-    );
+fn unit_expression_spelling_now_parses_via_fe2() {
+    let src = format!("{PRE}fn f() => Unit = ();\n");
+    parse(&src).unwrap_or_else(|e| panic!("expected FE-2 `()` to parse, got: {e}\n{src}"));
 }
 
-/// **Refusal site D(type)** — `src/parse.rs::Parser::parse_base_type`'s `Tok::LParen` arm reaches
-/// `parse_type_ref` on the immediately-following `)` and falls through to `_ => self.err("a type")`.
-/// `()` has no *type* spelling either.
+/// **Superseded refusal site D(type)** — before FE-2, `parse_base_type`'s `Tok::LParen` arm reached
+/// `parse_type_ref` on the immediately-following `)` and refused ("expected a type, found RParen").
+/// FE-2 gives `()` a type-position spelling too; full coverage in `tests/unit_paren_sugar.rs`.
 #[test]
-fn unit_has_no_type_spelling() {
-    let msg = parse_err(&format!("{PRE}fn f() => () = 0b0000_0001;\n"));
-    assert!(
-        msg.contains("expected a type") && msg.contains("found RParen"),
-        "unexpected refusal: {msg}"
-    );
+fn unit_type_spelling_now_parses_via_fe2() {
+    let src = format!("{PRE}fn f() => () = 0b0000_0001;\n");
+    parse(&src).unwrap_or_else(|e| panic!("expected FE-2 `()` to parse, got: {e}\n{src}"));
 }
 
 // ---------------------------------------------------------------------------------------------
